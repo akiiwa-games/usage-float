@@ -6,6 +6,10 @@ A borderless Windows **AI subscription quota HUD**, **headless CLI rate-limit mo
 - **One-Click Rate-Limit Reset Redemption**: Inspects and redeems **Claude weekly rate-limit resets (`cedar_ember`)**, **Claude 5-hour session wall resets (`juniper_tide`)**, and **ChatGPT / Codex rate-limit reset credits (`/backend-api/wham/rate-limit-reset-credits`)** directly from the HUD.
 - **Headless CLI & JSON Cache for Agents**: Run `python usage_float.py once` (or read `~/.usage-float/usage-cache.json`) from scripts, routers, or coding agents to query remaining subscription percentages and reset timestamps programmatically.
 
+## AgentCompass integration
+
+[AgentCompass](https://github.com/akiiwa-games/AgentCompass) uses Usage Float as its subscription quota collector and optional floating HUD. Usage Float also runs independently; AgentCompass adds task routing, quota scheduling, and a Windows management panel.
+
 ## Screenshots
 
 Dedicated auxiliary-screen usage dashboard:
