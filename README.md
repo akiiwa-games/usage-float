@@ -225,3 +225,8 @@ python -m unittest discover -p "test_*.py"
 ## License
 
 MIT License. `mpv` is distributed under the GPL: the source repository does not include the binary (`install-mpv.ps1` downloads it on demand); release archives bundle `mpv` alongside [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+## Related Projects
+
+- [AgentCompass](https://github.com/akiiwa-games/AgentCompass) — task routing and quota scheduling across your AI subscriptions.
+- [lark-mbti-jev](https://github.com/akiiwa-games/lark-mbti-jev) — a local Feishu/Lark MBTI and anime persona overlay powered by Jev.
