@@ -1,0 +1,42 @@
+__pycache__/
+*.py[cod]
+*.bak
+*.lnk
+
+# Local helpers / probes (never publish)
+_tmp_*.py
+_probe_*.py
+
+# User runtime
+.usage-float/
+usage-cache.json
+
+# Local credentials and machine-specific configuration
+.env
+.env.*
+!.env.example
+.secrets/
+auth.json
+.credentials.json
+credentials.json
+config.local.json
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Captured private desktops
+docs/screenshots/_raw/
+docs/screenshots/_shot_root/
+docs/screenshots/panel_printwindow.png
+docs/screenshots/_shot_log.txt
+
+# mpv is downloaded by install-mpv.ps1
+vendor/mpv/*.exe
+vendor/mpv/*.dll
+vendor/mpv/LICENSE.GPL
+vendor/mpv/Copyright
+
+# PyInstaller
+build/
+dist/
