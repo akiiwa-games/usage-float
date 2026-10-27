@@ -1,6 +1,10 @@
 # usage-float
 
-A borderless Windows subscription quota HUD and auxiliary-screen dashboard that displays live usage windows for **Claude**, **Codex**, **Grok**, **Antigravity**, and optional **LiteLLM / OpenAI-compatible API proxies**, and switches to a folder-based **live wallpaper player** (`mpv` or embedded borderless web view) with a double-tap of `Ctrl`. No title bar and no taskbar entry.
+A borderless Windows **AI subscription quota HUD**, **headless CLI rate-limit monitor**, and **auxiliary-screen dashboard** that tracks live 5-hour and 7-day usage windows across **Claude Code** (Claude Max / Pro), **OpenAI Codex CLI** / **ChatGPT Pro**, **Grok**, **Google Antigravity** (`agy` / Gemini CLI), **Magpie**, and **LiteLLM / OpenAI-compatible API proxies** — and switches to a folder-based **live wallpaper player** (`mpv` or embedded borderless web view) with a double-tap of `Ctrl`. No title bar and no taskbar entry.
+
+- **Multi-Account Local Quota Discovery**: Reads multiple local credentials (`~/.claude`, `~/.claude-2`, `~/.claude-*`, `~/.codex`, `~/.codex-2`, `~/.codex-*`, `~/.grok`, `agy`, Paseo provider directories, and remote Magpie `/v1/magpie/quotas`) directly on your machine without rotating OAuth tokens.
+- **One-Click Rate-Limit Reset Redemption**: Inspects and redeems **Claude weekly rate-limit resets (`cedar_ember`)**, **Claude 5-hour session wall resets (`juniper_tide`)**, and **ChatGPT / Codex rate-limit reset credits (`/backend-api/wham/rate-limit-reset-credits`)** directly from the HUD.
+- **Headless CLI & JSON Cache for Agents**: Run `python usage_float.py once` (or read `~/.usage-float/usage-cache.json`) from scripts, routers, or coding agents to query remaining subscription percentages and reset timestamps programmatically.
 
 ## Screenshots
 
