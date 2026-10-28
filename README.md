@@ -56,6 +56,7 @@ All credentials stay on your local machine and are read directly without third-p
 | **Codex** | `~/.codex/auth.json` |
 | **Additional Codex Accounts** | `~/.codex-2/auth.json` (`CODEX_HOME_2`), `~/.codex-*`, or Paseo provider `CODEX_HOME` bindings |
 | **Grok** | `~/.grok` login state |
+| **Grok Bot** | Official desktop's current-account `weekly-usage.cache` (no credentials read) |
 | **Antigravity** | Official `agy` CLI (`1.1.11+`) login state via `PATH`, `%LOCALAPPDATA%\agy\bin\agy.exe`, or `ANTIGRAVITY_CLI_PATH` |
 | **LiteLLM / API Proxy** | Environment variables `LLM_PROXY_API_KEY` + `LLM_PROXY_ENDPOINT`, or `llm_proxy_api_key` / `llm_proxy_endpoint` in `~/.usage-float/config.json` |
 
@@ -64,6 +65,38 @@ All credentials stay on your local machine and are read directly without third-p
 ```powershell
 $env:CODEX_HOME="$env:USERPROFILE\.codex-2"; codex login
 ```
+
+### Grok Bot's native weekly meter
+
+Grok Bot is discovered automatically after desktop sign-in. Usage Float reads only
+`desktop-status.json`, the `client-meta.account-slot` metadata slice, and that
+account's `weekly-usage.cache` slice under `sand-client-persistence` in the official
+app data directory. It does not read chats, `sand-secrets.json`, gateway credentials,
+or another Cursor/Grok account. No extra login, poller, or dependency is installed.
+
+The desktop 0.77.0 writes schema v2 from
+`aiserver.v1.DashboardService/GetSandUsageStatus` (weekly percentage/reset) and
+`GetCurrentPeriodUsage` (optional on-demand spend in USD cents). Usage Float retains
+the native `readAtMs`, `nextResetMs`, expiry and account/team scope. Its existing
+refresh re-reads the native file; **only the official app refreshes the network
+reading**. Open Grok Bot's account menu or Settings → Usage & Billing to update it.
+If the app is closed, parked, or has not refreshed, cache metadata is marked stale
+after five minutes. The row uses the same styling as the other providers, without
+an extra badge. It keeps the last observed percentage even after the scheduled reset;
+it never assumes a refill. Missing percentage or reset remains unknown, and signing
+out or switching accounts prevents reuse of the previous account's meter.
+
+The cache's `usage_details` records percent used/remaining, source timestamps, and
+optional on-demand cents separately from capacity windows. The native
+`unifiedPlanName` is preserved as plan metadata only. The snapshot supplies no
+pool identifier linking it to the separate Grok Build account. Grok Bot remains
+an independent data source; this addition does not merge it with `grok`, enable
+automatic router scoring, or sum its capacity with other providers. See the official
+[plans and billing](https://cursor.com/help/grok-bot/plans) and
+[settings documentation](https://docs.x.ai/grok-bot/settings-and-notifications).
+
+Verified source schema: Grok Bot 0.77.0 native `weekly-usage.cache`, schema v2;
+unknown future schemas are reported as a refresh failure, never guessed.
 
 ### Remote Magpie Subscription Quotas
 

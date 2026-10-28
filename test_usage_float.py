@@ -993,11 +993,11 @@ class CodexMultiAccountTests(unittest.TestCase):
 
         self.assertEqual(
             config["providers"],
-            ["claude:fable", "claude:7d", "claude:5h", "codex", "codex-2", "grok", "api-proxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS],
+            ["claude:fable", "claude:7d", "claude:5h", "codex", "codex-2", "grok", "api-proxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS, "grok-bot"],
         )
         self.assertEqual(
             config["provider_order"],
-            ["claude:fable", "claude:7d", "claude:5h", "codex", "codex-2", "grok", "api-proxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS],
+            ["claude:fable", "claude:7d", "claude:5h", "codex", "codex-2", "grok", "api-proxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS, "grok-bot"],
         )
         self.assertEqual(config["disabled_providers"], [])
 
@@ -1553,8 +1553,8 @@ class ProviderConfigTests(unittest.TestCase):
             [],
             ["claude", "codex", "grok"],
         )
-        self.assertEqual(order, ["claude:fable", "claude:7d", "claude:5h", "codex", "codex-2", "grok", "api-proxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS])
-        self.assertEqual(enabled, ["claude:fable", "claude:7d", "claude:5h", "codex", "codex-2", "grok", "api-proxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS])
+        self.assertEqual(order, ["claude:fable", "claude:7d", "claude:5h", "codex", "codex-2", "grok", "api-proxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS, "grok-bot"])
+        self.assertEqual(enabled, ["claude:fable", "claude:7d", "claude:5h", "codex", "codex-2", "grok", "api-proxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS, "grok-bot"])
         self.assertEqual(disabled, [])
 
     def test_disabled_providers_keep_order_and_stay_hidden(self) -> None:
@@ -1563,8 +1563,8 @@ class ProviderConfigTests(unittest.TestCase):
             ["claude"],
             ["grok", "codex", "claude"],
         )
-        self.assertEqual(order, ["grok", "codex", "codex-2", "claude:fable", "claude:7d", "claude:5h", "api-proxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS])
-        self.assertEqual(enabled, ["grok", "codex", "codex-2", "api-proxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS])
+        self.assertEqual(order, ["grok", "codex", "codex-2", "claude:fable", "claude:7d", "claude:5h", "api-proxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS, "grok-bot"])
+        self.assertEqual(enabled, ["grok", "codex", "codex-2", "api-proxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS, "grok-bot"])
         self.assertEqual(disabled, ["claude:fable", "claude:7d", "claude:5h"])
 
     def test_unchecking_every_row_stays_empty(self) -> None:
@@ -1609,9 +1609,9 @@ class ProviderConfigTests(unittest.TestCase):
 
         self.assertEqual(
             config["provider_order"],
-            ["grok", "codex", "codex-2", "claude:fable", "claude:7d", "claude:5h", "api-proxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS],
+            ["grok", "codex", "codex-2", "claude:fable", "claude:7d", "claude:5h", "api-proxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS, "grok-bot"],
         )
-        self.assertEqual(config["providers"], ["grok", "codex", "codex-2", "api-proxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS])
+        self.assertEqual(config["providers"], ["grok", "codex", "codex-2", "api-proxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS, "grok-bot"])
         self.assertEqual(config["disabled_providers"], ["claude:fable", "claude:7d", "claude:5h"])
 
     def test_scan_providers_reports_login_state_in_saved_order(self) -> None:
@@ -1636,7 +1636,7 @@ class ProviderConfigTests(unittest.TestCase):
 
         self.assertEqual(
             [row["id"] for row in rows],
-            ["grok", "codex", "codex-2", "claude:fable", "claude:7d", "claude:5h", "api-proxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS],
+            ["grok", "codex", "codex-2", "claude:fable", "claude:7d", "claude:5h", "api-proxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS, "grok-bot"],
         )
         self.assertEqual(rows[0]["label"], "Grok")
         self.assertEqual(rows[3]["label"], "fable 7d")

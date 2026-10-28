@@ -42,6 +42,7 @@ from zoneinfo import ZoneInfo
 
 from usage_lock import file_lock
 import magpie_usage
+import grok_bot_usage
 
 # ---------------------------------------------------------------------------
 # Paths / constants
@@ -250,11 +251,13 @@ DEFAULT_PROVIDERS: tuple[str, ...] = (
     *CLAUDE_DISPLAY_ITEMS,
     "api-proxy",
     *ANTIGRAVITY_DISPLAY_ITEMS,
+    "grok-bot",
 )
 PROVIDER_LABELS: dict[str, str] = {
     "codex": "Codex",
     "codex-2": "Codex 2",
     "grok": "Grok",
+    "grok-bot": "Grok Bot",
     "claude": "Claude",
     "claude:fable": "fable 7d",
     "claude:7d": "claude 7d",
@@ -4710,6 +4713,8 @@ class ProviderUsage:
     backend_kind: str | None = None
     billing: str | None = None
     home: str | None = None
+    # Sanitized native quota provenance/units, never credentials or account IDs.
+    usage_details: dict[str, Any] | None = None
 
 
 def claude_magpie_source(provider_id: str):
@@ -4768,6 +4773,8 @@ def codex_backend_info(provider_id: str = "codex") -> dict[str, str | None]:
 
 
 def provider_credential_key(provider_id: str) -> str | None:
+    if provider_id == "grok-bot":
+        return grok_bot_usage.credential_key()
     remote = claude_magpie_source(provider_id)
     if remote is not None:
         return remote.credential_key
@@ -4812,6 +4819,7 @@ def _provider_to_dict(p: ProviderUsage) -> dict[str, Any]:
         "summary": p.summary,
         "reset_block": p.reset_block,
         "credential_key": p.credential_key,
+        "usage_details": p.usage_details,
     }
     if p.backend_kind:
         out["backend_kind"] = p.backend_kind
@@ -4848,6 +4856,7 @@ def _provider_from_dict(d: dict[str, Any]) -> ProviderUsage:
         backend_kind=d.get("backend_kind"),
         billing=d.get("billing"),
         home=d.get("home"),
+        usage_details=d.get("usage_details") if isinstance(d.get("usage_details"), dict) else None,
     )
 
 
@@ -6883,6 +6892,30 @@ def fetch_api_proxy_usage() -> ProviderUsage:
     return result
 
 
+def fetch_grok_bot_usage() -> ProviderUsage:
+    """Reuse the official desktop's account-scoped quota and authentication lane."""
+    try:
+        reading = grok_bot_usage.read_usage(freshness_seconds=REFRESH_SECONDS)
+    except (OSError, ValueError):
+        return stale_provider_usage('grok-bot', _tr(
+            '请在 Grok Bot 中打开用量页面刷新', 'Open Usage in Grok Bot to refresh'))
+    if reading.fetched_at is None:
+        mark_provider_stale('grok-bot', 'Native usage unknown')
+    elif reading.stale:
+        # The shared cache deliberately skips an equally old stale snapshot.
+        # Propagate its expiry separately without changing the observed values/time.
+        mark_provider_stale('grok-bot', 'Native usage snapshot stale')
+    return ProviderUsage(
+        provider_id='grok-bot', display_name='Grok Bot', plan_label=reading.plan,
+        windows=[UsageWindow('trial' if reading.details.get('isSandTrial') else 'weekly',
+                             'trial %' if reading.details.get('isSandTrial') else '7d %',
+                             reading.used_pct, reading.resets_at)],
+        fetched_at=reading.fetched_at, stale=reading.stale,
+        credential_key=reading.credential_key, backend_kind='native-cache',
+        billing='subscription', usage_details=reading.details,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Fetch all
 # ---------------------------------------------------------------------------
@@ -6908,6 +6941,8 @@ def provider_available(provider_id: str) -> bool:
         return read_claude_oauth(claude_account_home(provider_id))[0] is not None
     if provider_id == "grok":
         return read_grok_token() is not None
+    if provider_id == "grok-bot":
+        return grok_bot_usage.available()
     if provider_id == "api-proxy":
         return read_llm_proxy_credentials()[0] is not None
     if provider_id == "antigravity":
@@ -7059,6 +7094,8 @@ def refresh_local_activity(output: Path | None = None, now: float | None = None)
 
 def provider_poll_seconds(provider_id: str) -> int:
     """Local session activity controls quota polling, not the panel layout."""
+    if provider_id == 'grok-bot':
+        return REFRESH_SECONDS  # Re-read the desktop meter; no network/auth here.
     if claude_magpie_source(provider_id) is not None:
         # Read from the VPS gateway: its usage moves without local sessions.
         return REFRESH_SECONDS
@@ -7109,7 +7146,7 @@ def collect_local_usage(providers: list[str], *, force: bool = False) -> list[Pr
     claude_homes = discover_claude_homes()
     codex_accounts = discover_codex_accounts()
     for pid in dict.fromkeys(provider_fetch_id(item) for item in providers):
-        if pid not in {*PROVIDER_DISPLAY_ITEMS, *claude_homes, *codex_accounts, 'grok', 'api-proxy'}:
+        if pid not in {*PROVIDER_DISPLAY_ITEMS, *claude_homes, *codex_accounts, 'grok', 'grok-bot', 'api-proxy'}:
             continue
         polled[pid] = poll = provider_poll_seconds(pid)
         try:
@@ -7127,7 +7164,7 @@ def collect_local_usage(providers: list[str], *, force: bool = False) -> list[Pr
                 resets = [_iso_epoch(w.resets_at, 0) for w in (cached.windows if cached else []) if w.resets_at]
                 passed = [r for r in resets if observed < r <= now_ts]
                 reset_due = bool(passed) and (last_attempt < max(passed) or now_ts - last_attempt >= REFRESH_SECONDS)
-                if not force and not reset_due and 0 <= age < poll:
+                if pid != 'grok-bot' and not force and not reset_due and 0 <= age < poll:
                     if cached:
                         # Keep exactly the same numbers/titles. Staleness is
                         # metadata for routing, not an extra panel label.
@@ -7146,6 +7183,8 @@ def collect_local_usage(providers: list[str], *, force: bool = False) -> list[Pr
                     item = fetch_codex_usage(codex_accounts[pid])
                 elif pid == 'grok':
                     item = fetch_grok_usage()
+                elif pid == 'grok-bot':
+                    item = fetch_grok_bot_usage()
                 elif pid == 'api-proxy':
                     item = fetch_api_proxy_usage()
                 elif pid == 'antigravity':
@@ -7312,7 +7351,7 @@ def _expand_display_rows(providers: list[ProviderUsage]) -> list[DisplayRow]:
             fetched = _iso_epoch(p.fetched_at, 0)
             for w in shown[:5]:
                 used_pct, resets_at = w.used_pct, w.resets_at
-                if resets_at and 0 < fetched < _iso_epoch(resets_at, 0) <= time.time():
+                if p.provider_id != 'grok-bot' and resets_at and 0 < fetched < _iso_epoch(resets_at, 0) <= time.time():
                     # Read before a reset that has since passed: the window refilled.
                     used_pct, resets_at = 0.0, None
                 # "claude 5h" / "claude 7d" / "fable 7d" (scoped rows omit provider prefix)
