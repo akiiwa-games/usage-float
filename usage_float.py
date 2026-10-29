@@ -9,11 +9,12 @@ usage-float — light translucent usage HUD for Claude / Codex / Grok / Antigrav
   • Compact floating rows or a full-screen auxiliary-display instrument grid
   • Bottom bar: one clickable relative-time + refresh control
   • Auto refresh every 5 minutes; click the whole control to refresh now
-  • On failure, that model line becomes「更新失败」
+  • On failure, keep the last usage reading when one is available
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import html
 import json
@@ -42,7 +43,6 @@ from zoneinfo import ZoneInfo
 
 from usage_lock import file_lock
 import magpie_usage
-import grok_bot_usage
 
 # ---------------------------------------------------------------------------
 # Paths / constants
@@ -249,15 +249,12 @@ DEFAULT_PROVIDERS: tuple[str, ...] = (
     "codex-2",
     "grok",
     *CLAUDE_DISPLAY_ITEMS,
-    "api-proxy",
     *ANTIGRAVITY_DISPLAY_ITEMS,
-    "grok-bot",
 )
 PROVIDER_LABELS: dict[str, str] = {
     "codex": "Codex",
     "codex-2": "Codex 2",
     "grok": "Grok",
-    "grok-bot": "Grok Bot",
     "claude": "Claude",
     "claude:fable": "fable 7d",
     "claude:7d": "claude 7d",
@@ -266,7 +263,8 @@ PROVIDER_LABELS: dict[str, str] = {
     "claude-2:fable": "Claude 2 fable 7d",
     "claude-2:7d": "Claude 2 7d",
     "claude-2:5h": "Claude 2 5h",
-    "api-proxy": "LLM Proxy",
+    "pi": "Pi",
+    "opencode": "OpenCode",
     "antigravity": "Antigravity",
     "antigravity:gemini-weekly": "agy gemini 7d",
     "antigravity:gemini-5h": "agy gemini 5h",
@@ -389,6 +387,8 @@ def discover_codex_accounts() -> dict[str, CodexAccount]:
 
 def provider_fetch_id(item: str) -> str:
     """The provider a display item is fetched from ("claude:5h" -> "claude")."""
+    if item == 'grok-bot':
+        return 'grok'  # Saved runner selection uses the ordinary Grok meter.
     provider, sep, _ = item.partition(":")
     if sep and (provider in PROVIDER_DISPLAY_ITEMS or is_claude_provider(provider)):
         _register_claude_display_items(provider)
@@ -4078,6 +4078,8 @@ def _unique_provider_ids(values: Any) -> list[str]:
     for item in values or []:
         if isinstance(item, str):
             pid = item.strip()
+            if pid == "grok-bot":
+                continue  # Retired duplicate meter; Grok includes Bot consumption.
             if pid and ":" not in pid and is_claude_provider(pid):
                 _register_claude_display_items(pid)
             # Legacy group entries stand for all their rows, including an
@@ -4100,6 +4102,10 @@ def resolve_provider_config(
     """
     enabled_in = _unique_provider_ids(providers)
     disabled_list = _unique_provider_ids(disabled)
+    if 'grok-bot' in (providers or []) and 'grok-bot' not in (disabled or []):
+        if 'grok' not in enabled_in:
+            enabled_in.append('grok')
+        disabled_list = [pid for pid in disabled_list if pid != 'grok']
     disabled_in = set(disabled_list)
     known = _unique_provider_ids(list(order or []) + enabled_in + disabled_list)
     if not known:
@@ -4215,10 +4221,13 @@ def scan_providers(
 ) -> list[dict[str, Any]]:
     """Scan known provider slots and report which ones have credentials."""
     known, _enabled, _disabled = resolve_provider_config(
-        configured if configured is not None else list(DEFAULT_PROVIDERS),
+        configured if configured is not None else discovered_default_providers(),
         [],
         order,
     )
+    for extra in discovered_default_providers():
+        if extra not in known and (configured is None or provider_available(extra)):
+            known.append(extra)
     return [
         {
             "id": pid,
@@ -4543,13 +4552,17 @@ def _set_language(cfg: dict[str, Any], state: dict[str, Any], language: str) -> 
     save_config(cfg)
 
 
-def load_usage_cache() -> dict[str, Any]:
+def load_usage_cache(*, strict: bool = False) -> dict[str, Any]:
     try:
-        if CACHE_PATH.exists():
-            data = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                return data
+        data = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+        raise ValueError("Invalid usage cache")
+    except FileNotFoundError:
+        pass
     except Exception:
+        if strict:
+            raise
         pass
     return {"providers": {}, "claude_backoff_until": None}
 
@@ -4567,7 +4580,9 @@ def save_usage_cache(cache: dict[str, Any]) -> None:
 
 def update_usage_cache(update: Callable[[dict[str, Any]], None]) -> None:
     with file_lock(CACHE_PATH.with_suffix('.lock')):
-        cache = load_usage_cache()
+        # A transient read failure must not turn a read/modify/write into an
+        # empty-cache publication that destroys all display history.
+        cache = load_usage_cache(strict=True)
         update(cache)
         save_usage_cache(cache)
 
@@ -4773,8 +4788,6 @@ def codex_backend_info(provider_id: str = "codex") -> dict[str, str | None]:
 
 
 def provider_credential_key(provider_id: str) -> str | None:
-    if provider_id == "grok-bot":
-        return grok_bot_usage.credential_key()
     remote = claude_magpie_source(provider_id)
     if remote is not None:
         return remote.credential_key
@@ -5515,15 +5528,46 @@ def claim_claude_session_reset(provider_id: str = "claude") -> ClaudeResetClaim:
     )
 
 
-def stale_provider_usage(provider_id: str, error: str) -> ProviderUsage:
-    mark_provider_stale(provider_id, error)
-    cached = cache_get_provider(provider_id) or display_snapshot(provider_id)
-    if cached is not None and 0 <= time.time() - _iso_epoch(cached.fetched_at, 0.0):
+def display_fallback(
+    provider_id: str, error: str, previous: Iterable[ProviderUsage] = (),
+) -> ProviderUsage:
+    """Recover presentation history without writing it into the quota cache."""
+    candidates = [p for p in previous if isinstance(p, ProviderUsage)
+                  and p.provider_id == provider_id and (p.windows or p.summary)]
+    try:
+        key = provider_credential_key(provider_id)
+        # Do not attribute a known previous login's quota to a new login.
+        if key is not None:
+            candidates = [p for p in candidates if p.credential_key in (None, key)]
+    except Exception:
+        pass  # Discovery/read failures must not erase the UI's last reading.
+    for reader in (cache_get_provider, display_snapshot):
+        try:
+            item = reader(provider_id)
+            if item is not None:
+                candidates.append(item)
+        except Exception:
+            continue
+    if candidates:
+        cached = max(candidates, key=lambda p: _iso_epoch(p.fetched_at, 0))
+        # Copy before marking stale: the UI may still be rendering this object.
+        cached = _provider_from_dict(_provider_to_dict(cached))
         cached.stale = True
         cached.error = error
         return cached
     return ProviderUsage(provider_id=provider_id, display_name=provider_id,
                          available=False, error=error, stale=True)
+
+
+def stale_provider_usage(
+    provider_id: str, error: str, previous: Iterable[ProviderUsage] = (),
+) -> ProviderUsage:
+    cached = display_fallback(provider_id, error, previous)
+    try:
+        mark_provider_stale(provider_id, error)
+    except Exception:
+        pass  # Cache contention must not defeat presentation fallback.
+    return cached
 
 
 def _claude_rate_limited_usage(provider_id: str = "claude") -> ProviderUsage:
@@ -6490,6 +6534,18 @@ def fetch_antigravity_usage() -> ProviderUsage:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class LiteLLMProxyConfig:
+    provider_id: str
+    display_name: str
+    api_key: str
+    openai_base: str
+    embed_model: str = LLM_PROXY_EMBED_MODEL
+    chat_model: str = LLM_PROXY_CHAT_FALLBACK_MODEL
+    budget_duration: str | None = None
+    timezone_name: str | None = None
+
+
 def _llm_proxy_openai_base(endpoint: str) -> str:
     base = (endpoint or LLM_PROXY_DEFAULT_ENDPOINT).strip().rstrip("/")
     if not base:
@@ -6499,8 +6555,147 @@ def _llm_proxy_openai_base(endpoint: str) -> str:
     return base
 
 
-def read_llm_proxy_credentials() -> tuple[str, str] | tuple[None, None]:
-    """Return (api_key, openai_base) from env or usage-float config."""
+def _extract_litellm_proxy_entry(pid: str, spec: dict[str, Any]) -> LiteLLMProxyConfig | None:
+    if not isinstance(spec, dict) or spec.get("enabled") is False:
+        return None
+    sub = spec.get("litellm") if isinstance(spec.get("litellm"), dict) else spec
+    kind = str(spec.get("backend_kind") or sub.get("backend_kind") or spec.get("probe") or "").strip().lower()
+    endpoint = str(
+        sub.get("endpoint")
+        or sub.get("base_url")
+        or spec.get("endpoint")
+        or spec.get("base_url")
+        or ""
+    ).strip()
+    key = str(sub.get("api_key") or spec.get("api_key") or "").strip()
+    key_env = str(sub.get("api_key_env") or spec.get("api_key_env") or "").strip()
+    if not key and key_env:
+        key = str(os.environ.get(key_env) or "").strip()
+    endpoint_env = str(sub.get("endpoint_env") or spec.get("endpoint_env") or "").strip()
+    if not endpoint and endpoint_env:
+        endpoint = str(os.environ.get(endpoint_env) or "").strip()
+    if not endpoint and kind not in {"litellm", "proxy", "api-proxy"} and not isinstance(spec.get("litellm"), dict):
+        return None
+    base = _llm_proxy_openai_base(endpoint)
+    if not key or not base:
+        return None
+    label = str(spec.get("label") or sub.get("label") or pid).strip() or pid
+    PROVIDER_LABELS.setdefault(pid, label)
+    return LiteLLMProxyConfig(
+        provider_id=pid,
+        display_name=pid,
+        api_key=key,
+        openai_base=base,
+        embed_model=str(sub.get("embed_model") or spec.get("embed_model") or LLM_PROXY_EMBED_MODEL).strip() or LLM_PROXY_EMBED_MODEL,
+        chat_model=str(sub.get("chat_model") or sub.get("probe_model") or spec.get("chat_model") or spec.get("probe_model") or LLM_PROXY_CHAT_FALLBACK_MODEL).strip() or LLM_PROXY_CHAT_FALLBACK_MODEL,
+        budget_duration=str(sub.get("budget_duration") or spec.get("budget_duration") or "").strip() or None,
+        timezone_name=str(sub.get("timezone") or spec.get("timezone") or "").strip() or None,
+    )
+
+
+def discover_litellm_proxies() -> dict[str, LiteLLMProxyConfig]:
+    """Discover LiteLLM/OpenAI-compatible proxy accounts configured in Router, Paseo, or Usage Float."""
+    proxies: dict[str, LiteLLMProxyConfig] = {}
+    router_files = [
+        Path(os.environ.get("ROUTE_MANAGER_ACCOUNTS_OVERRIDE") or HOME / ".route-manager" / "accounts-override.json"),
+        HOME / ".route-manager" / "provider-inventory.json",
+        Path(__file__).resolve().parent.parent / "skills" / "route-agent-work" / "references" / "accounts.json",
+    ]
+    for path in router_files:
+        try:
+            if not path.is_file():
+                continue
+            doc = json.loads(path.read_text(encoding="utf-8-sig"))
+            if not isinstance(doc, dict):
+                continue
+            for section in ("litellm_proxies", "accounts"):
+                block = doc.get(section)
+                if not isinstance(block, dict):
+                    continue
+                for pid, spec in block.items():
+                    if pid in proxies or not isinstance(pid, str):
+                        continue
+                    entry = _extract_litellm_proxy_entry(pid, spec)
+                    if entry is not None:
+                        proxies[pid] = entry
+        except Exception:
+            continue
+
+    for pid, spec in _read_paseo_providers().items():
+        if pid in proxies or spec.get("enabled") is False:
+            continue
+        if is_claude_provider(pid) and claude_magpie_source(pid) is not None:
+            continue
+        env = spec.get("env") if isinstance(spec.get("env"), dict) else {}
+        endpoint = str(
+            env.get("LLM_PROXY_ENDPOINT")
+            or env.get("LITELLM_BASE_URL")
+            or env.get("OPENAI_BASE_URL")
+            or ""
+        ).strip()
+        key = str(
+            env.get("LLM_PROXY_API_KEY")
+            or env.get("LITELLM_API_KEY")
+            or env.get("OPENAI_API_KEY")
+            or ""
+        ).strip()
+        if endpoint and key and "api.openai.com" not in endpoint.lower():
+            entry = _extract_litellm_proxy_entry(
+                pid,
+                {
+                    "backend_kind": "litellm",
+                    "endpoint": endpoint,
+                    "api_key": key,
+                    "label": spec.get("label") or pid,
+                },
+            )
+            if entry is not None:
+                proxies[pid] = entry
+
+    env_key = str(os.environ.get("LLM_PROXY_API_KEY") or "").strip()
+    env_endpoint = str(os.environ.get("LLM_PROXY_ENDPOINT") or "").strip()
+    cfg_key = ""
+    cfg_endpoint = ""
+    cfg_pid = str(os.environ.get("LLM_PROXY_PROVIDER_ID") or "").strip()
+    try:
+        if CONFIG_PATH.exists():
+            cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(cfg, dict):
+                cfg_key = str(cfg.get("llm_proxy_api_key") or "").strip()
+                cfg_endpoint = str(cfg.get("llm_proxy_endpoint") or "").strip()
+                cfg_pid = cfg_pid or str(cfg.get("llm_proxy_provider_id") or "").strip()
+                extra_proxies = cfg.get("litellm_proxies")
+                if isinstance(extra_proxies, dict):
+                    for pid, spec in extra_proxies.items():
+                        if isinstance(pid, str) and pid not in proxies and isinstance(spec, dict):
+                            entry = _extract_litellm_proxy_entry(pid, spec)
+                            if entry is not None:
+                                proxies[pid] = entry
+    except Exception:
+        pass
+    legacy_key = env_key or cfg_key
+    legacy_endpoint = env_endpoint or cfg_endpoint
+    if legacy_key and legacy_endpoint:
+        target_pid = cfg_pid or "api-proxy"
+        if target_pid not in proxies:
+            base = _llm_proxy_openai_base(legacy_endpoint)
+            if base:
+                PROVIDER_LABELS.setdefault(target_pid, "LLM Proxy" if target_pid == "api-proxy" else target_pid)
+                proxies[target_pid] = LiteLLMProxyConfig(
+                    provider_id=target_pid,
+                    display_name=target_pid,
+                    api_key=legacy_key,
+                    openai_base=base,
+                )
+    return proxies
+
+
+def read_llm_proxy_credentials(provider_id: str = "api-proxy") -> tuple[str, str] | tuple[None, None]:
+    """Return (api_key, openai_base) from router/Paseo discovery, env, or usage-float config."""
+    discovered = discover_litellm_proxies()
+    if provider_id in discovered:
+        proxy = discovered[provider_id]
+        return proxy.api_key, proxy.openai_base
     key = str(os.environ.get("LLM_PROXY_API_KEY") or "").strip()
     endpoint = str(os.environ.get("LLM_PROXY_ENDPOINT") or "").strip()
     if not key or not endpoint:
@@ -6807,19 +7002,23 @@ def _llm_proxy_probe(
     return status, resp_headers
 
 
-def fetch_api_proxy_usage() -> ProviderUsage:
-    creds = read_llm_proxy_credentials()
+def fetch_api_proxy_usage(provider_id: str = "api-proxy") -> ProviderUsage:
+    proxy = discover_litellm_proxies().get(provider_id)
+    creds = read_llm_proxy_credentials(provider_id) if proxy is None else (proxy.api_key, proxy.openai_base)
+    display_name = proxy.display_name if proxy is not None else provider_id
     if creds[0] is None:
         return ProviderUsage(
-            provider_id="api-proxy",
-            display_name="api-proxy",
+            provider_id=provider_id,
+            display_name=display_name,
             available=False,
             error="更新失败",
         )
     key, base = creds
+    embed_model = proxy.embed_model if proxy is not None else LLM_PROXY_EMBED_MODEL
+    chat_model = proxy.chat_model if proxy is not None else LLM_PROXY_CHAT_FALLBACK_MODEL
     probes = (
-        ("embeddings", LLM_PROXY_EMBED_MODEL),
-        ("chat", LLM_PROXY_CHAT_FALLBACK_MODEL),
+        ("embeddings", embed_model),
+        ("chat", chat_model),
     )
     spend: float | None = None
     budget: float | None = None
@@ -6837,13 +7036,18 @@ def fetch_api_proxy_usage() -> ProviderUsage:
             break
     if spend is None:
         return ProviderUsage(
-            provider_id="api-proxy",
-            display_name="api-proxy",
+            provider_id=provider_id,
+            display_name=display_name,
             available=False,
             error="更新失败",
         )
 
     duration, timezone_name = _llm_proxy_budget_settings()
+    if proxy is not None:
+        if proxy.budget_duration:
+            duration = proxy.budget_duration
+        if proxy.timezone_name:
+            timezone_name = _normalize_llm_proxy_timezone(proxy.timezone_name)
     resets_at = resolve_llm_proxy_resets_at(
         headers,
         duration=duration,
@@ -6852,8 +7056,8 @@ def fetch_api_proxy_usage() -> ProviderUsage:
 
     if budget is None or budget <= 0:
         result = ProviderUsage(
-            provider_id="api-proxy",
-            display_name="api-proxy",
+            provider_id=provider_id,
+            display_name=display_name,
             summary=format_llm_proxy_spend(spend),
             windows=[
                 UsageWindow(
@@ -6867,14 +7071,16 @@ def fetch_api_proxy_usage() -> ProviderUsage:
             else [],
             available=True,
             fetched_at=datetime.now(timezone.utc).isoformat(),
+            backend_kind="litellm",
+            billing="metered",
         )
         cache_put_provider(result)
         return result
 
     used_pct = max(0.0, min(100.0, (spend / budget) * 100.0))
     result = ProviderUsage(
-        provider_id="api-proxy",
-        display_name="api-proxy",
+        provider_id=provider_id,
+        display_name=display_name,
         plan_label=f"${budget:.0f}",
         summary=format_llm_proxy_spend(spend, budget),
         windows=[
@@ -6887,33 +7093,141 @@ def fetch_api_proxy_usage() -> ProviderUsage:
         ],
         available=True,
         fetched_at=datetime.now(timezone.utc).isoformat(),
+        backend_kind="litellm",
+        billing="metered",
     )
     cache_put_provider(result)
     return result
 
 
-def fetch_grok_bot_usage() -> ProviderUsage:
-    """Reuse the official desktop's account-scoped quota and authentication lane."""
+def _pi_agent_home() -> Path:
+    return Path(os.environ.get("PI_CODING_AGENT_DIR") or HOME / ".pi" / "agent")
+
+
+def read_pi_codex_auth(pi_home: Path | None = None) -> tuple[dict[str, Any] | None, Path | None]:
+    """Read openai-codex OAuth credentials from ~/.pi/agent/auth.json."""
+    home = pi_home if pi_home is not None else _pi_agent_home()
+    auth_path = home / "auth.json"
+    if not auth_path.is_file():
+        return None, None
     try:
-        reading = grok_bot_usage.read_usage(freshness_seconds=REFRESH_SECONDS)
-    except (OSError, ValueError):
-        return stale_provider_usage('grok-bot', _tr(
-            '请在 Grok Bot 中打开用量页面刷新', 'Open Usage in Grok Bot to refresh'))
-    if reading.fetched_at is None:
-        mark_provider_stale('grok-bot', 'Native usage unknown')
-    elif reading.stale:
-        # The shared cache deliberately skips an equally old stale snapshot.
-        # Propagate its expiry separately without changing the observed values/time.
-        mark_provider_stale('grok-bot', 'Native usage snapshot stale')
-    return ProviderUsage(
-        provider_id='grok-bot', display_name='Grok Bot', plan_label=reading.plan,
-        windows=[UsageWindow('trial' if reading.details.get('isSandTrial') else 'weekly',
-                             'trial %' if reading.details.get('isSandTrial') else '7d %',
-                             reading.used_pct, reading.resets_at)],
-        fetched_at=reading.fetched_at, stale=reading.stale,
-        credential_key=reading.credential_key, backend_kind='native-cache',
-        billing='subscription', usage_details=reading.details,
+        doc = json.loads(auth_path.read_text(encoding="utf-8-sig"))
+        if not isinstance(doc, dict):
+            return None, None
+        codex_oauth = doc.get("openai-codex")
+        if isinstance(codex_oauth, dict) and str(codex_oauth.get("access") or "").strip():
+            return {
+                "tokens": {
+                    "access_token": str(codex_oauth.get("access")).strip(),
+                    "refresh_token": str(codex_oauth.get("refresh") or "").strip(),
+                    "account_id": str(codex_oauth.get("accountId") or "").strip(),
+                }
+            }, auth_path
+    except Exception:
+        return None, None
+    return None, None
+
+
+def pi_linked_codex_provider(pi_home: Path | None = None) -> str | None:
+    """Return the codex provider_id sharing the same OpenAI accountId as pi, if any."""
+    pi_auth, _ = read_pi_codex_auth(pi_home)
+    if not pi_auth:
+        return None
+    pi_account_id = str((pi_auth.get("tokens") or {}).get("account_id") or "").strip()
+    if not pi_account_id:
+        return None
+    for pid, acc in discover_codex_accounts().items():
+        cauth, _ = read_codex_auth(acc.home)
+        if not cauth:
+            continue
+        cid = str((cauth.get("tokens") or {}).get("account_id") or "").strip()
+        if cid and cid == pi_account_id:
+            return pid
+    return None
+
+
+def fetch_pi_usage(provider_id: str = "pi") -> ProviderUsage:
+    """Fetch quota usage for pi when signed in via openai-codex OAuth."""
+    home = _pi_agent_home()
+    pi_auth, auth_path = read_pi_codex_auth(home)
+    if not pi_auth:
+        return ProviderUsage(provider_id, provider_id, available=False, error="更新失败")
+    tokens = pi_auth.get("tokens") or {}
+    access_token = str(tokens.get("access_token") or "").strip()
+    account_id = str(tokens.get("account_id") or "").strip()
+    if not access_token:
+        return ProviderUsage(provider_id, provider_id, available=False, error="更新失败")
+    headers = {"Authorization": f"Bearer {access_token}"}
+    if account_id:
+        headers["ChatGPT-Account-Id"] = account_id
+    status, data = http_json(CODEX_USAGE_URL, headers=headers)
+    if status == 401 and tokens.get("refresh_token") and auth_path is not None:
+        refreshed = refresh_codex_token(str(tokens["refresh_token"]))
+        if refreshed and refreshed.get("access_token"):
+            access_token = str(refreshed["access_token"])
+            try:
+                raw_doc = json.loads(auth_path.read_text(encoding="utf-8-sig"))
+                if isinstance(raw_doc, dict) and isinstance(raw_doc.get("openai-codex"), dict):
+                    raw_doc["openai-codex"]["access"] = access_token
+                    if refreshed.get("refresh_token"):
+                        raw_doc["openai-codex"]["refresh"] = refreshed["refresh_token"]
+                    auth_path.write_text(json.dumps(raw_doc, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+            headers["Authorization"] = f"Bearer {access_token}"
+            status, data = http_json(CODEX_USAGE_URL, headers=headers)
+    if status != 200 or not isinstance(data, dict):
+        cached = cache_get_provider(provider_id)
+        if cached is not None:
+            return cached
+        return ProviderUsage(provider_id, provider_id, available=False, error="更新失败")
+    rl = data.get("rate_limit") or {}
+    windows: list[UsageWindow] = []
+    if isinstance(rl.get("secondary_window"), dict):
+        w = rl["secondary_window"]
+        windows.append(
+            UsageWindow(
+                id="secondary",
+                label="7d",
+                used_pct=float(w.get("used_percent", 0)),
+                resets_at=_epoch_to_iso(w.get("reset_at")),
+            )
+        )
+    if isinstance(rl.get("primary_window"), dict):
+        w = rl["primary_window"]
+        windows.append(
+            UsageWindow(
+                id="primary",
+                label="5h",
+                used_pct=float(w.get("used_percent", 0)),
+                resets_at=_epoch_to_iso(w.get("reset_at")),
+            )
+        )
+    result = ProviderUsage(
+        provider_id=provider_id,
+        display_name=provider_id,
+        plan_label=data.get("plan_type"),
+        windows=windows,
+        fetched_at=datetime.now(timezone.utc).isoformat(),
+        backend_kind="subscription",
+        billing="subscription",
+        home=str(home),
     )
+    cache_put_provider(result)
+    return result
+
+
+def read_opencode_auth() -> dict[str, Any]:
+    """Read configured credentials from ~/.local/share/opencode/auth.json."""
+    auth_path = HOME / ".local" / "share" / "opencode" / "auth.json"
+    try:
+        if auth_path.is_file():
+            doc = json.loads(auth_path.read_text(encoding="utf-8-sig"))
+            if isinstance(doc, dict):
+                return doc
+    except Exception:
+        pass
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -6941,10 +7255,12 @@ def provider_available(provider_id: str) -> bool:
         return read_claude_oauth(claude_account_home(provider_id))[0] is not None
     if provider_id == "grok":
         return read_grok_token() is not None
-    if provider_id == "grok-bot":
-        return grok_bot_usage.available()
-    if provider_id == "api-proxy":
-        return read_llm_proxy_credentials()[0] is not None
+    if provider_id in discover_litellm_proxies() or provider_id == "api-proxy":
+        return read_llm_proxy_credentials(provider_id)[0] is not None
+    if provider_id == "pi":
+        return read_pi_codex_auth()[0] is not None
+    if provider_id == "opencode":
+        return bool(read_opencode_auth())
     if provider_id == "antigravity":
         return find_antigravity_cli() is not None
     return False
@@ -6961,6 +7277,12 @@ def discovered_default_providers() -> list[str]:
         for sub in PROVIDER_DISPLAY_ITEMS.get(pid, (f"{pid}:fable", f"{pid}:7d", f"{pid}:5h")):
             if sub not in items:
                 items.append(sub)
+    for pid in discover_litellm_proxies():
+        if pid not in items:
+            items.append(pid)
+    if read_pi_codex_auth()[0] is not None and pi_linked_codex_provider() is None:
+        if "pi" not in items:
+            items.append("pi")
     return items
 
 
@@ -6980,6 +7302,7 @@ def active_providers(
             for extra in discovered_default_providers():
                 if extra not in DEFAULT_PROVIDERS and extra not in dis and extra not in selected:
                     selected.append(extra)
+    selected = list(dict.fromkeys('grok' if pid == 'grok-bot' else pid for pid in selected))
     return [pid for pid in selected if provider_available(pid)]
 
 
@@ -7069,6 +7392,40 @@ def refresh_local_activity(output: Path | None = None, now: float | None = None)
     if grok_count > 0:
         active_workers["grok"] = {"count": grok_count}
 
+    pi_home = _pi_agent_home()
+    if pi_home.is_dir() or paseo_counts.get("pi", 0) > 0:
+        pi_count = max(paseo_counts.get("pi", 0), _recent_files(pi_home / "sessions", ".jsonl"))
+        accounts["pi"] = {
+            "state": "active" if pi_count > 0 else ("idle" if pi_home.is_dir() else "unknown"),
+            "source": "usage-float",
+            "observed_at": iso_now,
+        }
+        if pi_count > 0:
+            active_workers["pi"] = {"count": pi_count}
+
+    oc_dir = HOME / ".local" / "share" / "opencode"
+    if oc_dir.is_dir() or paseo_counts.get("opencode", 0) > 0:
+        oc_count = max(paseo_counts.get("opencode", 0), _recent_files(oc_dir, ".db"))
+        accounts["opencode"] = {
+            "state": "active" if oc_count > 0 else ("idle" if oc_dir.is_dir() else "unknown"),
+            "source": "usage-float",
+            "observed_at": iso_now,
+        }
+        if oc_count > 0:
+            active_workers["opencode"] = {"count": oc_count}
+
+    for pid in discover_litellm_proxies():
+        if pid in accounts:
+            continue
+        pcount = paseo_counts.get(pid, 0)
+        accounts[pid] = {
+            "state": "active" if pcount > 0 else "idle",
+            "source": "usage-float",
+            "observed_at": iso_now,
+        }
+        if pcount > 0:
+            active_workers[pid] = {"count": pcount}
+
     payload = {
         "schema": "route-manager.activity.v1",
         "generated_at": iso_now,
@@ -7094,8 +7451,6 @@ def refresh_local_activity(output: Path | None = None, now: float | None = None)
 
 def provider_poll_seconds(provider_id: str) -> int:
     """Local session activity controls quota polling, not the panel layout."""
-    if provider_id == 'grok-bot':
-        return REFRESH_SECONDS  # Re-read the desktop meter; no network/auth here.
     if claude_magpie_source(provider_id) is not None:
         # Read from the VPS gateway: its usage moves without local sessions.
         return REFRESH_SECONDS
@@ -7110,7 +7465,15 @@ def provider_poll_seconds(provider_id: str) -> int:
         if (activity.get('schema') != 'route-manager.activity.v1'
                 or not 0 <= age <= 180 or not isinstance(workers, dict)):
             return UNKNOWN_ACTIVITY_REFRESH_SECONDS
-        tracked = {*discover_claude_homes(), *discover_codex_accounts(), 'grok', 'antigravity'}
+        tracked = {
+            *discover_claude_homes(),
+            *discover_codex_accounts(),
+            *discover_litellm_proxies(),
+            'pi',
+            'opencode',
+            'grok',
+            'antigravity',
+        }
         state = account.get('state')
         if provider_id not in tracked or state not in ('active', 'idle'):
             return UNKNOWN_ACTIVITY_REFRESH_SECONDS
@@ -7139,16 +7502,45 @@ def fetch_all(providers: list[str], *, force: bool = False) -> list[ProviderUsag
     return collect_local_usage(providers, force=force)
 
 
+def merge_display_usage(
+    observations: Any, previous: list[ProviderUsage], selected: list[str],
+    error: str = '更新失败',
+) -> list[ProviderUsage]:
+    """Complete partial/failed refreshes using UI memory and disk history."""
+    incoming = {p.provider_id: p for p in observations if isinstance(p, ProviderUsage)} \
+        if isinstance(observations, (list, tuple)) else {}
+    result = []
+    for pid in dict.fromkeys(provider_fetch_id(name) for name in selected):
+        item = incoming.get(pid)
+        if item is None or not (item.windows or item.summary):
+            item = display_fallback(pid, (item.error if item else None) or error, previous)
+        result.append(item)
+    return result
+
+
+def fetch_display_usage(
+    selected: list[str], previous: list[ProviderUsage], *, force: bool = False,
+) -> list[ProviderUsage]:
+    """UI collection boundary, including exceptions from subprocess adapters."""
+    try:
+        observations = fetch_all(selected, force=force)
+    except Exception as error:
+        return merge_display_usage(None, previous, selected, f'更新失败 ({type(error).__name__})')
+    return merge_display_usage(observations, previous, selected)
+
+
 def collect_local_usage(providers: list[str], *, force: bool = False) -> list[ProviderUsage]:
     """One account-scoped collection/cache lane owned directly by Usage Float."""
     out = []
     polled = {}
     claude_homes = discover_claude_homes()
     codex_accounts = discover_codex_accounts()
+    litellm_proxies = discover_litellm_proxies()
     for pid in dict.fromkeys(provider_fetch_id(item) for item in providers):
-        if pid not in {*PROVIDER_DISPLAY_ITEMS, *claude_homes, *codex_accounts, 'grok', 'grok-bot', 'api-proxy'}:
+        if pid not in {*PROVIDER_DISPLAY_ITEMS, *claude_homes, *codex_accounts, *litellm_proxies, 'pi', 'grok', 'api-proxy'}:
             continue
         polled[pid] = poll = provider_poll_seconds(pid)
+        cached = item = None
         try:
             with file_lock(CACHE_PATH.with_name(f'{CACHE_PATH.name}.{pid}.fetch.lock'), timeout=1):
                 key = provider_credential_key(pid)
@@ -7164,7 +7556,7 @@ def collect_local_usage(providers: list[str], *, force: bool = False) -> list[Pr
                 resets = [_iso_epoch(w.resets_at, 0) for w in (cached.windows if cached else []) if w.resets_at]
                 passed = [r for r in resets if observed < r <= now_ts]
                 reset_due = bool(passed) and (last_attempt < max(passed) or now_ts - last_attempt >= REFRESH_SECONDS)
-                if pid != 'grok-bot' and not force and not reset_due and 0 <= age < poll:
+                if not force and not reset_due and 0 <= age < poll:
                     if cached:
                         # Keep exactly the same numbers/titles. Staleness is
                         # metadata for routing, not an extra panel label.
@@ -7181,12 +7573,14 @@ def collect_local_usage(providers: list[str], *, force: bool = False) -> list[Pr
                     item = fetch_claude_usage(force=force, provider_id=pid)
                 elif pid in codex_accounts:
                     item = fetch_codex_usage(codex_accounts[pid])
+                elif pid == 'pi':
+                    item = fetch_pi_usage('pi')
                 elif pid == 'grok':
                     item = fetch_grok_usage()
-                elif pid == 'grok-bot':
-                    item = fetch_grok_bot_usage()
                 elif pid == 'api-proxy':
                     item = fetch_api_proxy_usage()
+                elif pid in litellm_proxies:
+                    item = fetch_api_proxy_usage(pid)
                 elif pid == 'antigravity':
                     item = fetch_antigravity_usage()
                 else:
@@ -7198,18 +7592,15 @@ def collect_local_usage(providers: list[str], *, force: bool = False) -> list[Pr
                     # freshness bound); that is a real reading, not a failure.
                     item.credential_key = key
                     cache_put_provider(item)
-                elif item.stale or not item.available:
-                    item = stale_provider_usage(pid, item.error or '更新失败')
+                elif item.error or item.stale or not item.available:
+                    item = stale_provider_usage(pid, item.error or '更新失败', [item, cached])
                 out.append(item)
         except TimeoutError:
             # The other process owns this fetch; don't overwrite its result.
-            item = cache_get_provider(pid) or display_snapshot(pid)
-            if not item or not 0 <= time.time() - _iso_epoch(item.fetched_at, 0):
-                item = ProviderUsage(provider_id=pid, display_name=pid, available=False,
-                                     stale=True, error=_tr('正在由其他采集器更新', 'Another collector is updating usage'))
-            out.append(item)
+            out.append(display_fallback(pid, _tr('正在由其他采集器更新', 'Another collector is updating usage'),
+                                        [item, cached]))
         except Exception:
-            out.append(stale_provider_usage(pid, '更新失败'))
+            out.append(stale_provider_usage(pid, '更新失败', [item, cached]))
     if polled:
         # Publish the cadence chosen this tick: an idle account is read every
         # IDLE_REFRESH_SECONDS, so its reading stays current that long. The router
@@ -7320,7 +7711,7 @@ def _expand_display_rows(providers: list[ProviderUsage]) -> list[DisplayRow]:
     for p in providers:
         name = (p.display_name or p.provider_id).lower()
 
-        if not p.available or (p.error == "更新失败" and not p.windows and not p.summary):
+        if not p.windows and not p.summary:
             rows.append(
                 DisplayRow(
                     title=name,
@@ -7351,7 +7742,7 @@ def _expand_display_rows(providers: list[ProviderUsage]) -> list[DisplayRow]:
             fetched = _iso_epoch(p.fetched_at, 0)
             for w in shown[:5]:
                 used_pct, resets_at = w.used_pct, w.resets_at
-                if p.provider_id != 'grok-bot' and resets_at and 0 < fetched < _iso_epoch(resets_at, 0) <= time.time():
+                if resets_at and 0 < fetched < _iso_epoch(resets_at, 0) <= time.time():
                     # Read before a reset that has since passed: the window refilled.
                     used_pct, resets_at = 0.0, None
                 # "claude 5h" / "claude 7d" / "fable 7d" (scoped rows omit provider prefix)
@@ -10447,32 +10838,27 @@ def run_ui() -> None:
             return
         state["refreshing"] = True
         render_footer()
+        previous = list(state["providers"])
 
         def work() -> None:
-            selected = active_providers(list(cfg.get("providers") or DEFAULT_PROVIDERS), include_discovered=True, disabled=list(cfg.get("disabled_providers") or []))
             try:
-                providers = fetch_all(selected, force=force)
-                root.after(0, lambda p=providers: apply_data(p))
-            except Exception:
-                root.after(
-                    0,
-                    lambda: apply_data(
-                        [
-                            ProviderUsage(
-                                provider_id=pid,
-                                display_name=pid,
-                                available=False,
-                                error="更新失败",
-                            )
-                            for pid in selected
-                        ]
-                    ),
-                )
+                selected = active_providers(list(cfg.get("providers") or DEFAULT_PROVIDERS), include_discovered=True, disabled=list(cfg.get("disabled_providers") or []))
+                configured = {provider_fetch_id(pid) for pid in cfg.get("providers") or DEFAULT_PROVIDERS}
+                # Credential discovery can temporarily return no accounts while
+                # login files are being replaced. Keep enabled UI history.
+                selected += [p.provider_id for p in previous if p.provider_id in configured]
+                providers = fetch_display_usage(selected, previous, force=force)
+            except Exception as error:
+                # Discovery itself can fail before collection starts.
+                selected = [p.provider_id for p in previous] or list(cfg.get("providers") or DEFAULT_PROVIDERS)
+                providers = merge_display_usage(None, previous, selected, f'更新失败 ({type(error).__name__})')
+            root.after(0, lambda p=providers: apply_data(p))
 
         threading.Thread(target=work, daemon=True).start()
 
     def apply_data(providers: list[ProviderUsage]) -> None:
         state["refreshing"] = False
+        providers = merge_display_usage(providers, state["providers"], [p.provider_id for p in providers])
         state["providers"] = providers
         # Mark successful overall refresh time if at least one provider is OK
         fresh_times = [_iso_epoch(p.fetched_at, 0) for p in providers if p.available and not p.stale]
@@ -10572,7 +10958,10 @@ def run_ui() -> None:
         except Exception:
             pass
 
-    def open_settings() -> None:
+    def open_settings(
+        initial_tab: str = "用量",
+        initial_wallpaper_tab: str = "目录",
+    ) -> None:
         existing = state.get("settings_win")
         if existing is not None:
             try:
@@ -10783,7 +11172,7 @@ def run_ui() -> None:
             clear_lines()
             rebuild_menu()
             render()
-            open_settings()
+            open_settings(initial_tab=main_tab, initial_wallpaper_tab=wallpaper_tab)
             reopened = state.get("settings_win")
             if reopened is not None:
                 reopened._select_settings_tab(main_tab)
@@ -10865,6 +11254,33 @@ def run_ui() -> None:
         wallpaper_tab = tk.Frame(content_host, bg=S_PAGE_BG)
         floating_tab = tk.Frame(content_host, bg=S_PAGE_BG)
 
+        @contextlib.contextmanager
+        def _freeze_redraw(widget: tk.Misc | None):
+            hwnd = 0
+            user32 = None
+            try:
+                if sys.platform == "win32" and widget is not None and widget.winfo_ismapped():
+                    import ctypes
+
+                    user32 = ctypes.windll.user32
+                    hwnd = int(widget.winfo_id())
+                    if hwnd:
+                        user32.SendMessageW(hwnd, 0x000B, 0, 0)
+            except Exception:
+                hwnd = 0
+            try:
+                yield
+                if hwnd and widget is not None:
+                    widget.update_idletasks()
+            finally:
+                if hwnd and user32 is not None:
+                    try:
+                        user32.SendMessageW(hwnd, 0x000B, 1, 0)
+                        # RDW_INVALIDATE (0x1) | RDW_ALLCHILDREN (0x80) | RDW_UPDATENOW (0x100) — no RDW_ERASE (0x4)
+                        user32.RedrawWindow(hwnd, None, None, 0x0181)
+                    except Exception:
+                        pass
+
         main_tabs: list[tuple[str, tk.Frame]] = [
             ("用量", providers_tab),
             ("副屏", display_tab),
@@ -10872,28 +11288,32 @@ def run_ui() -> None:
             ("悬浮窗", floating_tab),
         ]
         main_tab_btns: dict[str, tk.Label] = {}
-        active_main_tab = {"title": "用量"}
+        active_main_tab: dict[str, Any] = {"title": initial_tab, "initialized": False}
 
         def select_main_tab(title: str) -> None:
+            if active_main_tab.get("initialized") and active_main_tab["title"] == title:
+                return
             active_main_tab["title"] = title
-            for tab_title, frame in main_tabs:
-                btn = main_tab_btns.get(tab_title)
-                if tab_title == title:
-                    frame.pack(fill="both", expand=True)
-                    if btn is not None:
-                        btn.configure(
-                            bg=S_TAB_ACTIVE_BG,
-                            fg=S_ACCENT,
-                            font=settings_font_section,
-                        )
-                else:
-                    frame.pack_forget()
-                    if btn is not None:
-                        btn.configure(
-                            bg=S_TAB_TRACK_BG,
-                            fg=S_MUTED,
-                            font=settings_font,
-                        )
+            active_main_tab["initialized"] = True
+            with _freeze_redraw(content_host):
+                for tab_title, frame in main_tabs:
+                    btn = main_tab_btns.get(tab_title)
+                    if tab_title == title:
+                        frame.pack(fill="both", expand=True)
+                        if btn is not None:
+                            btn.configure(
+                                bg=S_TAB_ACTIVE_BG,
+                                fg=S_ACCENT,
+                                font=settings_font_section,
+                            )
+                    else:
+                        frame.pack_forget()
+                        if btn is not None:
+                            btn.configure(
+                                bg=S_TAB_TRACK_BG,
+                                fg=S_MUTED,
+                                font=settings_font,
+                            )
 
         for tab_title, _frame in main_tabs:
             pill = tk.Label(
@@ -10944,31 +11364,36 @@ def run_ui() -> None:
         ]
         wp_subtab_btns: dict[str, tk.Label] = {}
         wp_subtab_state: dict[str, Any] = {
-            "active": "目录",
+            "active": initial_wallpaper_tab,
+            "initialized": False,
             "weights_dirty": True,
             "refresh_weights": None,
         }
 
         def select_wallpaper_subtab(title: str) -> None:
+            already_active = wp_subtab_state.get("initialized") and wp_subtab_state.get("active") == title
             wp_subtab_state["active"] = title
-            for sub_title, frame in wp_subtabs:
-                btn = wp_subtab_btns.get(sub_title)
-                if sub_title == title:
-                    frame.pack(fill="both", expand=True)
-                    if btn is not None:
-                        btn.configure(
-                            bg=S_TAB_ACTIVE_BG,
-                            fg=S_ACCENT_BLUE,
-                            font=settings_font_section,
-                        )
-                else:
-                    frame.pack_forget()
-                    if btn is not None:
-                        btn.configure(
-                            bg=S_TAB_TRACK_BG,
-                            fg=S_MUTED,
-                            font=settings_font_small,
-                        )
+            wp_subtab_state["initialized"] = True
+            if not already_active:
+                with _freeze_redraw(wp_content_host):
+                    for sub_title, frame in wp_subtabs:
+                        btn = wp_subtab_btns.get(sub_title)
+                        if sub_title == title:
+                            frame.pack(fill="both", expand=True)
+                            if btn is not None:
+                                btn.configure(
+                                    bg=S_TAB_ACTIVE_BG,
+                                    fg=S_ACCENT_BLUE,
+                                    font=settings_font_section,
+                                )
+                        else:
+                            frame.pack_forget()
+                            if btn is not None:
+                                btn.configure(
+                                    bg=S_TAB_TRACK_BG,
+                                    fg=S_MUTED,
+                                    font=settings_font_small,
+                                )
             if (
                 title == "随机权重"
                 and wp_subtab_state.get("weights_dirty")
@@ -10996,10 +11421,75 @@ def run_ui() -> None:
         weights_pad = tk.Frame(weights_tab, bg=S_PAGE_BG)
         weights_pad.pack(fill="both", expand=True)
 
-        select_main_tab("用量")
-        select_wallpaper_subtab("目录")
+        select_main_tab(initial_tab)
+        select_wallpaper_subtab(initial_wallpaper_tab)
         setattr(win, "_select_settings_tab", select_main_tab)
         setattr(win, "_select_wallpaper_tab", select_wallpaper_subtab)
+
+        def _bind_scrollable_canvas(
+            canvas: tk.Canvas,
+            rows_frame: tk.Frame,
+            window_id: int,
+        ) -> tuple[Callable[[], None], Callable[[Any], str]]:
+            scroll_state: dict[str, Any] = {
+                "width": -1,
+                "scrollregion": None,
+            }
+
+            def sync_scrollregion() -> None:
+                try:
+                    if not canvas.winfo_exists() or not rows_frame.winfo_exists():
+                        return
+                    canvas_w = max(1, int(canvas.winfo_width()))
+                    canvas_h = max(1, int(canvas.winfo_height()))
+                    req_h = max(0, int(rows_frame.winfo_reqheight()))
+                    region_h = max(req_h, canvas_h)
+                    region = (0, 0, canvas_w, region_h)
+                    if region != scroll_state["scrollregion"]:
+                        scroll_state["scrollregion"] = region
+                        canvas.configure(scrollregion=region)
+                    if req_h <= canvas_h:
+                        y0, _y1 = canvas.yview()
+                        if y0 != 0.0:
+                            canvas.yview_moveto(0.0)
+                except Exception:
+                    pass
+
+            def on_rows_configure(_event: Any = None) -> None:
+                sync_scrollregion()
+
+            def on_canvas_configure(event: Any = None) -> None:
+                try:
+                    w = int(getattr(event, "width", 0) or canvas.winfo_width())
+                    if w > 1 and w != scroll_state["width"]:
+                        scroll_state["width"] = w
+                        canvas.itemconfigure(window_id, width=w)
+                except Exception:
+                    pass
+                sync_scrollregion()
+
+            def on_mousewheel(event: Any) -> str:
+                try:
+                    req_h = int(rows_frame.winfo_reqheight())
+                    canvas_h = int(canvas.winfo_height())
+                    if req_h <= canvas_h:
+                        y0, _y1 = canvas.yview()
+                        if y0 != 0.0:
+                            canvas.yview_moveto(0.0)
+                        return "break"
+                    delta = int(getattr(event, "delta", 0) or 0)
+                    if delta:
+                        steps = -int(delta / 120)
+                        if steps == 0:
+                            steps = -1 if delta > 0 else 1
+                        canvas.yview_scroll(steps, "units")
+                except Exception:
+                    pass
+                return "break"
+
+            rows_frame.bind("<Configure>", on_rows_configure)
+            canvas.bind("<Configure>", on_canvas_configure)
+            return sync_scrollregion, on_mousewheel
 
         # ── Tab 1: 用量 (Two-column flat draggable bar grid) ──
         provider_order = list(cfg.get("provider_order") or DEFAULT_PROVIDERS)
@@ -11064,7 +11554,7 @@ def run_ui() -> None:
             justify="left",
         ).pack(fill="x", pady=(0, 8))
 
-        # Two-column board container (flat surface, direct grid children on board_inner)
+        # Two-column board container (scrollable list area, direct grid children on board_inner)
         board_wrap = tk.Frame(
             providers_card,
             bg=S_COL_BG,
@@ -11073,8 +11563,37 @@ def run_ui() -> None:
         )
         board_wrap.pack(fill="both", expand=True)
 
-        board_inner = tk.Frame(board_wrap, bg=S_COL_BG, padx=8, pady=8)
-        board_inner.pack(fill="both", expand=True)
+        board_canvas = tk.Canvas(
+            board_wrap,
+            bg=S_COL_BG,
+            highlightthickness=0,
+            bd=0,
+            height=220,
+        )
+        board_scrollbar = ttk.Scrollbar(
+            board_wrap,
+            orient="vertical",
+            command=board_canvas.yview,
+            style="Vertical.TScrollbar",
+        )
+        board_scrollbar.pack(side="right", fill="y")
+        board_canvas.pack(side="left", fill="both", expand=True)
+        board_canvas.configure(yscrollcommand=board_scrollbar.set)
+        board_inner = tk.Frame(board_canvas, bg=S_COL_BG, padx=8, pady=8)
+        board_canvas_window = board_canvas.create_window(
+            (0, 0), window=board_inner, anchor="nw"
+        )
+        sync_board_scrollregion, scroll_board_list = _bind_scrollable_canvas(
+            board_canvas,
+            board_inner,
+            board_canvas_window,
+        )
+
+        def bind_board_list_wheel(widget: Any) -> None:
+            widget.bind("<MouseWheel>", scroll_board_list)
+            for child in widget.winfo_children():
+                bind_board_list_wheel(child)
+
         board_inner.grid_columnconfigure(0, weight=1, uniform="prov_col")
         board_inner.grid_columnconfigure(1, weight=1, uniform="prov_col")
 
@@ -11124,6 +11643,7 @@ def run_ui() -> None:
                 font=settings_font_small,
             ).pack()
             empty_boxes.append(eb)
+        bind_board_list_wheel(board_wrap)
 
         provider_drag: dict[str, Any] = {
             "item": None,
@@ -11176,15 +11696,15 @@ def run_ui() -> None:
                 if need_network:
                     refresh_async(force=force_fetch)
 
-        def _refresh_slot_bounds() -> None:
+        def _refresh_slot_bounds(*, redraw: bool = False) -> None:
             try:
                 board_inner.update_idletasks()
-                if sys.platform == "win32":
+                if redraw and sys.platform == "win32" and board_wrap.winfo_ismapped():
                     import ctypes
 
-                    # RDW_INVALIDATE (0x1) | RDW_ERASE (0x4) | RDW_ALLCHILDREN (0x80) | RDW_UPDATENOW (0x100)
+                    # RDW_INVALIDATE (0x1) | RDW_ALLCHILDREN (0x80) | RDW_UPDATENOW (0x100) — no RDW_ERASE (0x4)
                     ctypes.windll.user32.RedrawWindow(
-                        int(board_wrap.winfo_id()), None, None, 0x0185
+                        int(board_wrap.winfo_id()), None, None, 0x0181
                     )
             except Exception:
                 pass
@@ -11390,6 +11910,7 @@ def run_ui() -> None:
                 "sig": None,
                 "cell": None,
             }
+            bind_board_list_wheel(bar)
             bar_records[pid] = rec
             bar_widgets_by_id[pid] = bar
             return rec
@@ -11494,30 +12015,32 @@ def run_ui() -> None:
                 last_packed_cols[0] = cols_now[0]
                 last_packed_cols[1] = cols_now[1]
                 active_ids = set(left_col_items) | set(right_col_items)
-                for pid, rec in bar_records.items():
-                    if pid not in active_ids and rec.get("cell") is not None:
-                        rec["bar"].grid_forget()
-                        rec["cell"] = None
-                for col_idx, col_list in enumerate((left_col_items, right_col_items)):
-                    if not col_list:
-                        empty_boxes[col_idx].grid(
-                            row=1, column=col_idx, sticky="ew", padx=4, pady=3
-                        )
-                    else:
-                        empty_boxes[col_idx].grid_forget()
-                        for row_idx, pid in enumerate(col_list):
-                            rec = bar_records[pid]
-                            target_cell = (row_idx + 1, col_idx)
-                            if rec.get("cell") != target_cell:
-                                rec["bar"].grid(
-                                    row=row_idx + 1,
-                                    column=col_idx,
-                                    sticky="ew",
-                                    padx=4,
-                                    pady=3,
-                                )
-                                rec["cell"] = target_cell
-                _refresh_slot_bounds()
+                with _freeze_redraw(board_inner):
+                    for pid, rec in bar_records.items():
+                        if pid not in active_ids and rec.get("cell") is not None:
+                            rec["bar"].grid_forget()
+                            rec["cell"] = None
+                    for col_idx, col_list in enumerate((left_col_items, right_col_items)):
+                        if not col_list:
+                            empty_boxes[col_idx].grid(
+                                row=1, column=col_idx, sticky="ew", padx=4, pady=3
+                            )
+                        else:
+                            empty_boxes[col_idx].grid_forget()
+                            for row_idx, pid in enumerate(col_list):
+                                rec = bar_records[pid]
+                                target_cell = (row_idx + 1, col_idx)
+                                if rec.get("cell") != target_cell:
+                                    rec["bar"].grid(
+                                        row=row_idx + 1,
+                                        column=col_idx,
+                                        sticky="ew",
+                                        padx=4,
+                                        pady=3,
+                                    )
+                                    rec["cell"] = target_cell
+                    sync_board_scrollregion()
+                _refresh_slot_bounds(redraw=False)
 
             available_count = sum(1 for row in scanned_cache.values() if row.get("available"))
             text = (
@@ -12135,71 +12658,6 @@ def run_ui() -> None:
         folder_canvas_window = folder_canvas.create_window(
             (0, 0), window=folder_rows, anchor="nw"
         )
-        def _bind_scrollable_canvas(
-            canvas: tk.Canvas,
-            rows_frame: tk.Frame,
-            window_id: int,
-        ) -> tuple[Callable[[], None], Callable[[Any], str]]:
-            scroll_state: dict[str, Any] = {
-                "width": -1,
-                "scrollregion": None,
-            }
-
-            def sync_scrollregion() -> None:
-                try:
-                    if not canvas.winfo_exists() or not rows_frame.winfo_exists():
-                        return
-                    canvas_w = max(1, int(canvas.winfo_width()))
-                    canvas_h = max(1, int(canvas.winfo_height()))
-                    req_h = max(0, int(rows_frame.winfo_reqheight()))
-                    region_h = max(req_h, canvas_h)
-                    region = (0, 0, canvas_w, region_h)
-                    if region != scroll_state["scrollregion"]:
-                        scroll_state["scrollregion"] = region
-                        canvas.configure(scrollregion=region)
-                    if req_h <= canvas_h:
-                        y0, _y1 = canvas.yview()
-                        if y0 != 0.0:
-                            canvas.yview_moveto(0.0)
-                except Exception:
-                    pass
-
-            def on_rows_configure(_event: Any = None) -> None:
-                sync_scrollregion()
-
-            def on_canvas_configure(event: Any = None) -> None:
-                try:
-                    w = int(getattr(event, "width", 0) or canvas.winfo_width())
-                    if w > 1 and w != scroll_state["width"]:
-                        scroll_state["width"] = w
-                        canvas.itemconfigure(window_id, width=w)
-                except Exception:
-                    pass
-                sync_scrollregion()
-
-            def on_mousewheel(event: Any) -> str:
-                try:
-                    req_h = int(rows_frame.winfo_reqheight())
-                    canvas_h = int(canvas.winfo_height())
-                    if req_h <= canvas_h:
-                        y0, _y1 = canvas.yview()
-                        if y0 != 0.0:
-                            canvas.yview_moveto(0.0)
-                        return "break"
-                    delta = int(getattr(event, "delta", 0) or 0)
-                    if delta:
-                        steps = -int(delta / 120)
-                        if steps == 0:
-                            steps = -1 if delta > 0 else 1
-                        canvas.yview_scroll(steps, "units")
-                except Exception:
-                    pass
-                return "break"
-
-            rows_frame.bind("<Configure>", on_rows_configure)
-            canvas.bind("<Configure>", on_canvas_configure)
-            return sync_scrollregion, on_mousewheel
-
         sync_folder_scrollregion, scroll_folder_list = _bind_scrollable_canvas(
             folder_canvas,
             folder_rows,

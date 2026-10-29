@@ -993,11 +993,11 @@ class CodexMultiAccountTests(unittest.TestCase):
 
         self.assertEqual(
             config["providers"],
-            ["claude:fable", "claude:7d", "claude:5h", "codex", "codex-2", "grok", "api-proxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS, "grok-bot"],
+            ["claude:fable", "claude:7d", "claude:5h", "codex", "codex-2", "grok", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS],
         )
         self.assertEqual(
             config["provider_order"],
-            ["claude:fable", "claude:7d", "claude:5h", "codex", "codex-2", "grok", "api-proxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS, "grok-bot"],
+            ["claude:fable", "claude:7d", "claude:5h", "codex", "codex-2", "grok", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS],
         )
         self.assertEqual(config["disabled_providers"], [])
 
@@ -1553,8 +1553,8 @@ class ProviderConfigTests(unittest.TestCase):
             [],
             ["claude", "codex", "grok"],
         )
-        self.assertEqual(order, ["claude:fable", "claude:7d", "claude:5h", "codex", "codex-2", "grok", "api-proxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS, "grok-bot"])
-        self.assertEqual(enabled, ["claude:fable", "claude:7d", "claude:5h", "codex", "codex-2", "grok", "api-proxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS, "grok-bot"])
+        self.assertEqual(order, ["claude:fable", "claude:7d", "claude:5h", "codex", "codex-2", "grok", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS])
+        self.assertEqual(enabled, ["claude:fable", "claude:7d", "claude:5h", "codex", "codex-2", "grok", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS])
         self.assertEqual(disabled, [])
 
     def test_disabled_providers_keep_order_and_stay_hidden(self) -> None:
@@ -1563,8 +1563,8 @@ class ProviderConfigTests(unittest.TestCase):
             ["claude"],
             ["grok", "codex", "claude"],
         )
-        self.assertEqual(order, ["grok", "codex", "codex-2", "claude:fable", "claude:7d", "claude:5h", "api-proxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS, "grok-bot"])
-        self.assertEqual(enabled, ["grok", "codex", "codex-2", "api-proxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS, "grok-bot"])
+        self.assertEqual(order, ["grok", "codex", "codex-2", "claude:fable", "claude:7d", "claude:5h", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS])
+        self.assertEqual(enabled, ["grok", "codex", "codex-2", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS])
         self.assertEqual(disabled, ["claude:fable", "claude:7d", "claude:5h"])
 
     def test_unchecking_every_row_stays_empty(self) -> None:
@@ -1609,9 +1609,9 @@ class ProviderConfigTests(unittest.TestCase):
 
         self.assertEqual(
             config["provider_order"],
-            ["grok", "codex", "codex-2", "claude:fable", "claude:7d", "claude:5h", "api-proxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS, "grok-bot"],
+            ["grok", "codex", "codex-2", "claude:fable", "claude:7d", "claude:5h", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS],
         )
-        self.assertEqual(config["providers"], ["grok", "codex", "codex-2", "api-proxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS, "grok-bot"])
+        self.assertEqual(config["providers"], ["grok", "codex", "codex-2", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS])
         self.assertEqual(config["disabled_providers"], ["claude:fable", "claude:7d", "claude:5h"])
 
     def test_scan_providers_reports_login_state_in_saved_order(self) -> None:
@@ -1620,7 +1620,6 @@ class ProviderConfigTests(unittest.TestCase):
             "codex-2": False,
             "grok": True,
             "claude": False,
-            "api-proxy": True,
         }
         with patch.object(
             usage_float_module,
@@ -1628,6 +1627,10 @@ class ProviderConfigTests(unittest.TestCase):
             side_effect=lambda pid: availability.get(
                 usage_float_module.provider_fetch_id(pid), False
             ),
+        ), patch.object(
+            usage_float_module,
+            "discovered_default_providers",
+            return_value=list(DEFAULT_PROVIDERS),
         ):
             rows = usage_float_module.scan_providers(
                 ["grok", "codex"],
@@ -1636,12 +1639,67 @@ class ProviderConfigTests(unittest.TestCase):
 
         self.assertEqual(
             [row["id"] for row in rows],
-            ["grok", "codex", "codex-2", "claude:fable", "claude:7d", "claude:5h", "api-proxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS, "grok-bot"],
+            ["grok", "codex", "codex-2", "claude:fable", "claude:7d", "claude:5h", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS],
         )
         self.assertEqual(rows[0]["label"], "Grok")
         self.assertEqual(rows[3]["label"], "fable 7d")
         self.assertTrue(rows[0]["available"])
         self.assertFalse(rows[3]["available"])
+
+    def test_discover_litellm_proxies_from_router_override_and_pi_usage(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            override = Path(temp_dir) / "accounts-override.json"
+            override.write_text(
+                json.dumps(
+                    {
+                        "accounts": {
+                            "team-proxy": {
+                                "backend_kind": "litellm",
+                                "endpoint": "https://proxy.example.test",
+                                "api_key": "sk-team-proxy",
+                                "label": "Team Proxy",
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            pi_home = Path(temp_dir) / "pi-agent"
+            pi_home.mkdir()
+            (pi_home / "auth.json").write_text(
+                json.dumps(
+                    {
+                        "openai-codex": {
+                            "type": "oauth",
+                            "access": "pi-access-tok",
+                            "refresh": "pi-refresh-tok",
+                            "accountId": "distinct-pi-account",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(
+                usage_float_module.os.environ,
+                {
+                    "ROUTE_MANAGER_ACCOUNTS_OVERRIDE": str(override),
+                    "PI_CODING_AGENT_DIR": str(pi_home),
+                },
+                clear=False,
+            ), patch.object(usage_float_module, "HOME", Path(temp_dir)), patch.object(
+                usage_float_module, "CONFIG_PATH", Path(temp_dir) / "config.json"
+            ):
+                proxies = usage_float_module.discover_litellm_proxies()
+                self.assertIn("team-proxy", proxies)
+                self.assertEqual(
+                    usage_float_module.read_llm_proxy_credentials("team-proxy"),
+                    ("sk-team-proxy", "https://proxy.example.test/v1"),
+                )
+                self.assertTrue(usage_float_module.provider_available("team-proxy"))
+                self.assertTrue(usage_float_module.provider_available("pi"))
+                discovered = usage_float_module.discovered_default_providers()
+                self.assertIn("team-proxy", discovered)
+                self.assertIn("pi", discovered)
 
 
 
@@ -2133,14 +2191,14 @@ class ProviderColumnTests(unittest.TestCase):
 
     def test_resolve_provider_columns_respects_saved_two_column_assignment(self) -> None:
         all_ids = list(DEFAULT_PROVIDERS)
-        enabled = ["claude:7d", "codex", "api-proxy"]
+        enabled = ["claude:7d", "codex", "grok"]
         disabled = [pid for pid in all_ids if pid not in set(enabled)]
-        saved_cols = [["codex"], ["claude:7d", "api-proxy", *disabled]]
+        saved_cols = [["codex"], ["claude:7d", "grok", *disabled]]
         left, right = usage_float_module.resolve_provider_columns(
             enabled, disabled, all_ids, saved_cols
         )
         self.assertEqual(left, ["codex"])
-        self.assertEqual(right[:2], ["claude:7d", "api-proxy"])
+        self.assertEqual(right[:2], ["claude:7d", "grok"])
         self.assertEqual(set(left + right), set(all_ids))
 
     def test_move_provider_in_columns_moves_across_and_within_columns(self) -> None:
@@ -2622,6 +2680,41 @@ class FloatingMenuStackingTests(unittest.TestCase):
                 if hwnd in hud_hwnds and ia == -1
             ]
             self.assertEqual(topmost_hud_calls, [])
+
+
+class SharedGrokDisplayTests(unittest.TestCase):
+    def test_retired_bot_meter_is_removed_from_saved_settings(self):
+        order, enabled, disabled = usage_float_module.resolve_provider_config(
+            ['grok', 'grok-bot'], ['grok-bot'], ['grok-bot', 'grok'])
+        self.assertNotIn('grok-bot', order + enabled + disabled)
+        self.assertIn('grok', enabled)
+
+    def test_either_runner_keeps_one_ordinary_grok_meter_and_one_fetch(self):
+        native = usage_float_module
+        reset = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+        for selected, disabled in ((['grok'], ['grok-bot']), (['grok-bot'], ['grok']),
+                                   (['grok', 'grok-bot'], [])):
+            with self.subTest(selected=selected):
+                _, enabled, _ = native.resolve_provider_config(selected, disabled, selected)
+                with patch.object(native, 'provider_available', side_effect=lambda name: name == 'grok'):
+                    active = native.active_providers(enabled)
+                self.assertEqual(active, ['grok'])
+                item = native.ProviderUsage(provider_id='grok', display_name='grok',
+                    fetched_at=datetime.now(timezone.utc).isoformat(),
+                    windows=[native.UsageWindow('credits', 'Quota', 56, reset)])
+                with TemporaryDirectory() as directory, \
+                     patch.object(native, 'CACHE_PATH', Path(directory) / 'usage.json'), \
+                     patch.object(native, 'discover_claude_homes', return_value={}), \
+                     patch.object(native, 'discover_codex_accounts', return_value={}), \
+                     patch.object(native, 'discover_litellm_proxies', return_value={}), \
+                     patch.object(native, 'provider_poll_seconds', return_value=300), \
+                     patch.object(native, 'provider_credential_key', return_value=None), \
+                     patch.object(native, 'fetch_grok_usage', return_value=item) as fetch:
+                    observations = native.collect_local_usage(selected, force=True)
+                fetch.assert_called_once()
+                rows = native.iter_display_rows(observations, enabled)
+                self.assertEqual([(r.provider_id, r.title, r.used_pct, r.resets_at) for r in rows],
+                                 [('grok', 'grok', 56, reset)])
 
 
 if __name__ == "__main__":
