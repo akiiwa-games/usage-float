@@ -6214,6 +6214,19 @@ def _parse_grok_billing_payload(data: bytes, now_secs: int) -> tuple[float, str 
 
 def fetch_grok_usage() -> ProviderUsage:
     """SuperGrok credit window via grok.com gRPC-web (same as CC Switch)."""
+    try:
+        import grok_billing
+        payload = grok_billing.fetch(GROK_HOME)
+        if payload is not None:
+            pct, reset, plan = grok_billing.parse(payload)
+            result = ProviderUsage(provider_id='grok', display_name='grok', plan_label=plan,
+                windows=[UsageWindow(id='credits', label=_tr('订阅额度', 'Subscription quota'), used_pct=pct, resets_at=reset)],
+                available=True, fetched_at=datetime.now(timezone.utc).isoformat())
+            cache_put_provider(result)
+            return result
+    except Exception:
+        return ProviderUsage(provider_id='grok', display_name='grok', available=False,
+                             error=_tr('额度读取失败，请检查 Grok 登录状态', 'Quota unavailable; check Grok login'))
     token = read_grok_token()
     if not token:
         return ProviderUsage(
