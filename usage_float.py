@@ -6597,9 +6597,9 @@ def discover_litellm_proxies() -> dict[str, LiteLLMProxyConfig]:
     """Discover LiteLLM/OpenAI-compatible proxy accounts configured in Router, Paseo, or Usage Float."""
     proxies: dict[str, LiteLLMProxyConfig] = {}
     router_files = [
-        Path(os.environ.get("ROUTE_MANAGER_ACCOUNTS_OVERRIDE") or HOME / ".route-manager" / "accounts-override.json"),
-        HOME / ".route-manager" / "provider-inventory.json",
-        Path(__file__).resolve().parent.parent / "skills" / "route-agent-work" / "references" / "accounts.json",
+        Path(os.environ.get("ROUTE_MANAGER_ACCOUNTS_OVERRIDE") or HOME / ".agent-compass" / "accounts-override.json"),
+        HOME / ".agent-compass" / "provider-inventory.json",
+        Path(__file__).resolve().parent.parent / "skills" / "agent-compass" / "references" / "accounts.json",
     ]
     for path in router_files:
         try:
@@ -7437,7 +7437,7 @@ def refresh_local_activity(output: Path | None = None, now: float | None = None)
         if env_out:
             output = Path(env_out)
         elif CACHE_PATH == HOME / ".usage-float" / "usage-cache.json":
-            output = HOME / ".route-manager" / "usage-activity.json"
+            output = HOME / ".agent-compass" / "usage-activity.json"
     if output is not None:
         try:
             output.parent.mkdir(parents=True, exist_ok=True)
@@ -7454,7 +7454,7 @@ def provider_poll_seconds(provider_id: str) -> int:
     if claude_magpie_source(provider_id) is not None:
         # Read from the VPS gateway: its usage moves without local sessions.
         return REFRESH_SECONDS
-    path = Path(os.environ.get('ROUTE_MANAGER_ACTIVITY_FILE') or HOME / '.route-manager' / 'usage-activity.json')
+    path = Path(os.environ.get('ROUTE_MANAGER_ACTIVITY_FILE') or HOME / '.agent-compass' / 'usage-activity.json')
     try:
         if path.stat().st_size > 1024 * 1024:
             return UNKNOWN_ACTIVITY_REFRESH_SECONDS

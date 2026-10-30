@@ -9,7 +9,7 @@ Read the live remaining quota of every subscription you have signed in to (Claud
 
 ## What it does
 
-[usage-float](https://github.com/akiiwa-games/usage-float) is a headless quota collector plus an optional Windows HUD. For each account it records one or more rate-limit windows (for example `5h`, `7d`) with a used percentage and a reset timestamp, and writes them to a local JSON cache. Hosts such as Claude Code, Codex, Antigravity and Paseo, and routers such as [AgentCompass](https://github.com/akiiwa-games/AgentCompass) (`route-agent-work`), use it to decide which account and model to dispatch to.
+[usage-float](https://github.com/akiiwa-games/usage-float) is a headless quota collector plus an optional Windows HUD. For each account it records one or more rate-limit windows (for example `5h`, `7d`) with a used percentage and a reset timestamp, and writes them to a local JSON cache. Hosts such as Claude Code, Codex, Antigravity and Paseo, and routers such as [AgentCompass](https://github.com/akiiwa-games/AgentCompass) (`agent-compass`), use it to decide which account and model to dispatch to.
 
 ## Installation & prerequisites
 

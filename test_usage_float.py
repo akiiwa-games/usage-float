@@ -2174,7 +2174,7 @@ class UnifiedInterfaceTests(unittest.TestCase):
             self.assertEqual(info['backend_kind'], 'gateway')
             self.assertEqual(info['billing'], 'metered')
             usage_float_module.refresh_local_activity()
-            self.assertTrue((self.temp_dir / '.route-manager' / 'usage-activity.json').is_file())
+            self.assertTrue((self.temp_dir / '.agent-compass' / 'usage-activity.json').is_file())
 
 
 class ProviderColumnTests(unittest.TestCase):

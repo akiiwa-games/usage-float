@@ -48,7 +48,7 @@ A headless multi-subscription quota collector for coding-agent routing workflows
 
 The cache also holds bookkeeping keys (`display_snapshots`, `attempts`, `poll`, per-provider `*_backoff_until`) that consumers can ignore.
 
-**With AgentCompass**: [AgentCompass](https://github.com/akiiwa-games/AgentCompass) (`route-agent-work`) reads `~/.usage-float/usage-cache.json` to score task difficulty against live quota windows and pick the best-fit account, model and effort. Usage Float also runs on its own with no AgentCompass installed.
+**With AgentCompass**: [AgentCompass](https://github.com/akiiwa-games/AgentCompass) (`agent-compass`) reads `~/.usage-float/usage-cache.json` to score task difficulty against live quota windows and pick the best-fit account, model and effort. Usage Float also runs on its own with no AgentCompass installed.
 
 ## AgentCompass integration
 
