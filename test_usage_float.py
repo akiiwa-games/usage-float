@@ -1084,6 +1084,24 @@ class AntigravityUsageTests(unittest.TestCase):
                     with patch.dict(os.environ, {"ANTIGRAVITY_CLI_PATH": override}):
                         self.assertIsNone(usage_float_module.find_antigravity_cli())
 
+    def test_cli_receives_the_system_proxy_unless_a_proxy_variable_is_set(self) -> None:
+        system = {"http": "http://127.0.0.1:7897", "https": "http://127.0.0.1:7897"}
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            usage_float_module.urllib.request, "getproxies", return_value=system
+        ):
+            env = usage_float_module._antigravity_env()
+            self.assertEqual((env["HTTPS_PROXY"], env["HTTP_PROXY"]), (system["https"], system["http"]))
+        with patch.dict(os.environ, {"HTTPS_PROXY": "http://own:1"}, clear=True), patch.object(
+            usage_float_module.urllib.request, "getproxies", return_value=system
+        ):
+            env = usage_float_module._antigravity_env()
+            self.assertEqual(env["HTTPS_PROXY"], "http://own:1")
+            self.assertNotIn("HTTP_PROXY", env)
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            usage_float_module.urllib.request, "getproxies", return_value={}
+        ):
+            self.assertNotIn("HTTPS_PROXY", usage_float_module._antigravity_env())
+
     def test_old_or_unknown_cli_never_receives_usage_as_a_prompt(self) -> None:
         for version in ("1.1.10", "1.0.99", "unknown"):
             with self.subTest(version=version), patch.object(

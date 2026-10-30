@@ -6388,6 +6388,19 @@ def _close_antigravity_windows_job(kernel: Any, job: Any) -> None:
         kernel.CloseHandle(job)
 
 
+def _antigravity_env() -> dict[str, str]:
+    """agy (Go) ignores the Windows system proxy; pass it on when no proxy variable is set."""
+    env = os.environ.copy()
+    if any(env.get(name) for name in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")):
+        return env
+    proxies = urllib.request.getproxies()
+    proxy = proxies.get("https") or proxies.get("http")
+    if proxy:
+        env["HTTPS_PROXY"] = proxy
+        env.setdefault("HTTP_PROXY", proxies.get("http") or proxy)
+    return env
+
+
 def _run_antigravity_cli(binary: Path, arguments: list[str], *, timeout: float) -> str:
     """Bound runtime/output and close this query's process tree on every exit."""
     process = None
@@ -6402,7 +6415,7 @@ def _run_antigravity_cli(binary: Path, arguments: list[str], *, timeout: float) 
         directory = directory_resource.name
         output = resources.enter_context(tempfile.TemporaryFile())
         process = subprocess.Popen(
-            [str(binary), *arguments], cwd=directory,
+            [str(binary), *arguments], cwd=directory, env=_antigravity_env(),
             stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.DEVNULL,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             start_new_session=os.name != "nt",
