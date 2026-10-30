@@ -1,10 +1,54 @@
 # usage-float
 
-A borderless Windows **AI subscription quota HUD**, **headless CLI rate-limit monitor**, and **auxiliary-screen dashboard** that tracks live 5-hour and 7-day usage windows across **Claude Code** (Claude Max / Pro), **OpenAI Codex CLI** / **ChatGPT Pro**, **Grok**, **Google Antigravity** (`agy` / Gemini CLI), **Magpie**, and **LiteLLM / OpenAI-compatible API proxies** — and switches to a folder-based **live wallpaper player** (`mpv` or embedded borderless web view) with a double-tap of `Ctrl`. No title bar and no taskbar entry.
+A headless multi-subscription quota collector for coding-agent routing workflows: a CLI (`python usage_float.py once`), a local JSON telemetry cache (`~/.usage-float/usage-cache.json`) and a [`check-quota` Agent Skill](skills/check-quota/SKILL.md) that let Claude Code, Codex, Antigravity, Paseo and routers read live 5-hour and 7-day rate-limit windows and reset timers across **Claude Code** (Claude Max / Pro), **OpenAI Codex CLI** / **ChatGPT Pro**, **Grok**, **Google Antigravity** (`agy` / Gemini CLI), **Magpie**, and **LiteLLM / OpenAI-compatible API proxies**. It also ships a borderless Windows desktop quota HUD (no title bar, no taskbar entry), an auxiliary-screen dashboard, and an optional live-wallpaper player toggled with a double-tap of `Ctrl`.
 
 - **Multi-Account Local Quota Discovery**: Reads multiple local credentials (`~/.claude`, `~/.claude-2`, `~/.claude-*`, `~/.codex`, `~/.codex-2`, `~/.codex-*`, `~/.grok`, `agy`, Paseo provider directories, and remote Magpie `/v1/magpie/quotas`) directly on your machine without rotating OAuth tokens.
 - **One-Click Rate-Limit Reset Redemption**: Inspects and redeems **Claude weekly rate-limit resets (`cedar_ember`)**, **Claude 5-hour session wall resets (`juniper_tide`)**, and **ChatGPT / Codex rate-limit reset credits (`/backend-api/wham/rate-limit-reset-credits`)** directly from the HUD.
 - **Headless CLI & JSON Cache for Agents**: Run `python usage_float.py once` (or read `~/.usage-float/usage-cache.json`) from scripts, routers, or coding agents to query remaining subscription percentages and reset timestamps programmatically.
+
+## For Coding Agents (Skill & JSON Cache Schema)
+
+**Skill**: [`skills/check-quota/SKILL.md`](skills/check-quota/SKILL.md) teaches an agent to check subscription headroom before dispatching a sub-agent or starting long work. Copy or link the `skills/check-quota` folder into your host's skills directory (for example `~/.claude/skills/check-quota`, `~/.codex/skills/check-quota`).
+
+**Headless CLI**: `python usage_float.py once` (release binary: `UsageFloat.exe once`) queries each signed-in provider once and prints one line per window with usage and time to reset. No UI is opened.
+
+**JSON cache**: the same readings are persisted to `~/.usage-float/usage-cache.json` (atomic writes under a file lock), so an agent can read quota without any network call. Abbreviated example (illustrative values):
+
+```json
+{
+  "providers": {
+    "claude": {
+      "provider_id": "claude",
+      "display_name": "claude",
+      "plan_label": "max",
+      "windows": [
+        {"id": "seven_day", "label": "7d", "used_pct": 42.0, "resets_at": "2026-11-05T21:00:00+00:00"},
+        {"id": "five_hour", "label": "5h", "used_pct": 8.0, "resets_at": "2026-10-30T08:00:00+00:00"}
+      ],
+      "error": null,
+      "available": true,
+      "stale": false,
+      "fetched_at": "2026-10-30T03:21:28+00:00",
+      "summary": null
+    },
+    "codex": {"provider_id": "codex", "plan_label": "pro", "windows": [{"id": "usage", "label": "7d", "used_pct": 93.0, "resets_at": "2026-11-04T06:35:27+00:00"}], "stale": false}
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `providers.<id>` | One entry per account (`claude`, `claude-2`, `codex`, `codex-2`, `grok`, `antigravity`, `llmproxy`, ...) |
+| `windows[].id` / `label` | Window identifier and display label, for example `seven_day` / `7d`, `five_hour` / `5h`, `weekly_fable` / `fable 7d`, `gemini-weekly` / `gemini 7d` |
+| `windows[].used_pct` | Percent of the window already used (0-100); remaining headroom is `100 - used_pct` |
+| `windows[].resets_at` | ISO-8601 time the window resets |
+| `plan_label` | Subscription tier when known (for example `max`, `pro`) |
+| `fetched_at`, `stale`, `error` | Freshness of the reading; `stale: true` or a non-null `error` means the last refresh failed and the numbers are older |
+| `summary` | Free-text figure for budget-style rows such as the LiteLLM proxy |
+
+The cache also holds bookkeeping keys (`display_snapshots`, `attempts`, `poll`, per-provider `*_backoff_until`) that consumers can ignore.
+
+**With AgentCompass**: [AgentCompass](https://github.com/akiiwa-games/AgentCompass) (`route-agent-work`) reads `~/.usage-float/usage-cache.json` to score task difficulty against live quota windows and pick the best-fit account, model and effort. Usage Float also runs on its own with no AgentCompass installed.
 
 ## AgentCompass integration
 
