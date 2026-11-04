@@ -155,5 +155,22 @@ class MagpiePoolTests(unittest.TestCase):
         self.assertEqual(titles(ultra), ['fable 7d', 'claude'])
         self.assertEqual(titles(pro), ['claude 7d', 'claude 5h'])
 
+    def test_auto_discovered_gateway_passes_force_to_magpie_refresh(self):
+        with TemporaryDirectory() as folder:
+            home = Path(folder)
+            (home / 'settings.json').write_text(json.dumps({'env': {
+                'ANTHROPIC_BASE_URL': self.source.url,
+                'ANTHROPIC_AUTH_TOKEN': self.source.token}}), encoding='utf-8')
+            calls = []
+            def fake_http(url, *, method='GET', **kwargs):
+                calls.append((method, url))
+                return 200, {'data': [self.a, self.b]}
+            with patch.object(usage, 'CLAUDE_HOME_2', home), \
+                    patch.object(usage, 'CACHE_PATH', home / 'cache.json'), \
+                    patch.object(usage, 'http_json', side_effect=fake_http):
+                usage.fetch_claude_usage(provider_id='claude-2', force=True)
+            post_urls = [url for method, url in calls if method == 'POST']
+            self.assertEqual(len(post_urls), 2)
+
 if __name__ == '__main__':
     unittest.main()

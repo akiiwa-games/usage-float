@@ -44,6 +44,19 @@ from zoneinfo import ZoneInfo
 from usage_lock import file_lock
 import magpie_usage
 
+
+def _ensure_tcl_tk_library() -> None:
+    if getattr(sys, "frozen", False):
+        return
+    tcl_root = Path(sys.base_prefix) / "tcl"
+    if (tcl_root / "tcl8.6").is_dir():
+        os.environ.setdefault("TCL_LIBRARY", str(tcl_root / "tcl8.6"))
+    if (tcl_root / "tk8.6").is_dir():
+        os.environ.setdefault("TK_LIBRARY", str(tcl_root / "tk8.6"))
+
+
+_ensure_tcl_tk_library()
+
 # ---------------------------------------------------------------------------
 # Paths / constants
 # ---------------------------------------------------------------------------
@@ -5637,7 +5650,7 @@ def fetch_claude_usage(*, force: bool = False, provider_id: str = "claude") -> P
     if remote is not None:
         if remote.explicit:
             return fetch_magpie_claude_usage(remote, provider_id, force=force)
-        probed = fetch_magpie_claude_usage(remote, provider_id, probe_only=True)
+        probed = fetch_magpie_claude_usage(remote, provider_id, probe_only=True, force=force)
         if probed is not None:
             return probed
     home = None if provider_id == "claude" else claude_account_home(provider_id)
