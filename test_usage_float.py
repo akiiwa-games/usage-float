@@ -2005,6 +2005,35 @@ class ClaudeResetTests(unittest.TestCase):
         self.assertEqual(restored.reset_block, block)
         self.assertEqual(claude_reset_status(restored).resets_left, 1)
 
+    def test_weekly_scoped_claude_windows_declare_provider_models(self) -> None:
+        payload = {
+            "limits": [
+                {
+                    "kind": "weekly_scoped",
+                    "scope": {"model": {"display_name": "Fable"}},
+                    "percent": 66.0,
+                    "resets_at": "2026-11-08T00:00:00Z",
+                },
+            ],
+            "five_hour": {"utilization": 16.0, "resets_at": "2026-11-04T06:00:00Z"},
+        }
+        with TemporaryDirectory() as temp_dir, patch.object(
+            usage_float_module, "CACHE_PATH", Path(temp_dir) / "cache.json"
+        ), patch.object(
+            usage_float_module, "read_claude_oauth", return_value=({"accessToken": "t"}, None)
+        ), patch.object(
+            usage_float_module, "claude_authorized_json", return_value=(200, payload)
+        ):
+            result = usage_float_module.fetch_claude_usage(force=True, provider_id="claude")
+        self.assertTrue(result.available)
+        self.assertEqual([w.id for w in result.windows], ["weekly_fable", "five_hour"])
+        self.assertEqual([w.models for w in result.windows], [["Fable"], None])
+        serialized = usage_float_module._provider_to_dict(result)
+        self.assertEqual(serialized["windows"][0].get("models"), ["Fable"])
+        self.assertNotIn("models", serialized["windows"][1])
+        restored = usage_float_module._provider_from_dict(serialized)
+        self.assertEqual([w.models for w in restored.windows], [["Fable"], None])
+
     def test_the_usage_request_identifies_as_the_installed_cli(self) -> None:
         # Without this the server answers ineligible_reason="surface".
         headers = usage_float_module.claude_request_headers("token")
