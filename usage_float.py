@@ -5586,11 +5586,20 @@ def _claude_rate_limited_usage(provider_id: str = "claude") -> ProviderUsage:
     return stale_provider_usage(provider_id, _tr("限流退避中", 'Rate limit cooldown'))
 
 
-def fetch_magpie_claude_usage(source, provider_id: str, *, probe_only: bool = False) -> ProviderUsage | None:
+def fetch_magpie_claude_usage(source, provider_id: str, *, probe_only: bool = False,
+                              force: bool = False) -> ProviderUsage | None:
     if not source.valid:
         return None if probe_only else stale_provider_usage(provider_id, _tr("Magpie HTTPS 用量来源配置不完整", 'Magpie HTTPS usage source is not fully configured'))
-    status, payload = http_json(source.url + "/v1/magpie/quotas",
-                               headers={"Authorization": "Bearer " + source.token})
+    auth = {"Authorization": "Bearer " + source.token}
+    status, payload = http_json(source.url + "/v1/magpie/quotas", headers=auth)
+    # Magpie reads a Claude account only when asked, so its readings age by hours; have it read the old ones
+    # (or all, on a manual refresh) once more, then take the list again.
+    targets = magpie_usage.reread_targets(payload, source, time.time(), REFRESH_SECONDS * 2, force) if status == 200 else []
+    for vendor, user in targets:
+        http_json(source.url + "/v1/magpie/quotas/refresh?" + urllib.parse.urlencode({"provider": vendor, "user": user}),
+                  method="POST", headers=auth, timeout=60.0)
+    if targets:
+        status, payload = http_json(source.url + "/v1/magpie/quotas", headers=auth)
     if status != 200:
         if probe_only and status in (0, 400, 404, 405, 501):
             update_usage_cache(lambda c: c.setdefault("non_magpie_gateways", {})
@@ -5627,7 +5636,7 @@ def fetch_claude_usage(*, force: bool = False, provider_id: str = "claude") -> P
     remote = claude_magpie_source(provider_id)
     if remote is not None:
         if remote.explicit:
-            return fetch_magpie_claude_usage(remote, provider_id)
+            return fetch_magpie_claude_usage(remote, provider_id, force=force)
         probed = fetch_magpie_claude_usage(remote, provider_id, probe_only=True)
         if probed is not None:
             return probed
@@ -7746,6 +7755,7 @@ class DisplayRow:
     provider_id: str = ""
     window_id: str = ""
     accounts: int = 1  # a Magpie pool of N same-plan accounts: used_pct is their mean
+    detail: str | None = None  # hover text: a Magpie pool's per-account readings
 
     @property
     def left_pct(self) -> float | None:
@@ -7789,6 +7799,23 @@ def display_item(row: DisplayRow) -> str | None:
         return f"{row.provider_id}:fable"
     item = CLAUDE_WINDOW_ITEMS.get(row.window_id)
     return item.replace("claude:", f"{row.provider_id}:") if item else None
+
+
+def pool_detail_text(details: dict[str, Any] | None) -> str | None:
+    """Hover text of a Magpie pool: each account's left, one short line each (as AgentCompass's card hover)."""
+    members = (details or {}).get("members") if (details or {}).get("kind") == "magpie_pool" else None
+    if not isinstance(members, list) or len(members) < 2:
+        return None
+    lines = []
+    for member in members:
+        if not isinstance(member, dict):
+            continue
+        windows = member.get("windows") if isinstance(member.get("windows"), dict) else {}
+        parts = [f"{name} {100 - w['used_pct']:.0f}%" for wid, name in (("seven_day", "7d"), ("five_hour", "5h"))
+                 if isinstance(w := windows.get(wid), dict) and isinstance(w.get("used_pct"), (int, float))]
+        note = "" if member.get("counted", True) else " " + _tr("(不计入)", "(not added)")
+        lines.append(f"{member.get('label') or '—'}  {' · '.join(parts)}{note}")
+    return "\n".join(lines)
 
 
 def iter_display_rows(
@@ -7885,6 +7912,7 @@ def _expand_display_rows(providers: list[ProviderUsage]) -> list[DisplayRow]:
                         provider_id=p.provider_id,
                         window_id=w.id,
                         accounts=w.accounts,
+                        detail=pool_detail_text(p.usage_details),
                     )
                 )
             continue
@@ -9929,7 +9957,7 @@ def run_ui() -> None:
 
     def bind_hover_tracking(widget: tk.Misc) -> None:
         widget.bind("<Motion>", track_reset_hover, add="+")
-        widget.bind("<Leave>", lambda _event: set_reset_hover(False), add="+")
+        widget.bind("<Leave>", lambda _event: (set_reset_hover(False), hide_detail_tip()), add="+")
 
     def bind_drag(widget: tk.Misc) -> None:
         widget.bind("<ButtonPress-1>", start_move)
@@ -10094,8 +10122,58 @@ def run_ui() -> None:
 
     def track_reset_hover(event: tk.Event) -> None:
         if state.get("dragging") or state.get("resize_active"):
+            hide_detail_tip()
             return
         set_reset_hover(reset_target_at_event(event) is not None)
+        show_detail_tip(event)
+
+    def detail_at_event(event: tk.Event) -> str | None:
+        point = _event_local_point(event)
+        if point is None:
+            return None
+        for widget, text in state.get("detail_targets") or []:
+            try:
+                if not widget.winfo_exists() or not widget.winfo_ismapped():
+                    continue
+                left = widget.winfo_rootx() - root.winfo_rootx()
+                top = widget.winfo_rooty() - root.winfo_rooty()
+                if _point_in_box(point[0], point[1], (left, top, left + widget.winfo_width(), top + widget.winfo_height())):
+                    return text
+            except Exception:
+                continue
+        return None
+
+    def show_detail_tip(event: tk.Event) -> None:
+        """A Magpie pool row shows its accounts under the pointer, the way AgentCompass's card hover does."""
+        text = detail_at_event(event)
+        if not text:
+            hide_detail_tip()
+            return
+        tip = state.get("detail_tip")
+        try:
+            if tip is None or not tip.winfo_exists():
+                tip = tk.Toplevel(root)
+                tip.overrideredirect(True)
+                tip.attributes("-topmost", True)
+                label = tk.Label(tip, justify="left", bg="#1f2937", fg="#f9fafb", padx=8, pady=6,
+                                 font=(font_main.cget("family"), max(9, int(font_main.cget("size")) - 2)))
+                label.pack()
+                tip._label = label  # type: ignore[attr-defined]
+                state["detail_tip"] = tip
+            if tip._label.cget("text") != text:  # type: ignore[attr-defined]
+                tip._label.configure(text=text)  # type: ignore[attr-defined]
+            tip.geometry(f"+{event.x_root + 14}+{event.y_root + 14}")
+            tip.deiconify()
+        except Exception:
+            pass
+
+    def hide_detail_tip() -> None:
+        tip = state.get("detail_tip")
+        try:
+            if tip is not None and tip.winfo_exists():
+                tip.withdraw()
+        except Exception:
+            pass
 
     def open_reset_ui(provider_id: str) -> None:
         """Send the click to whichever reset UI this provider has."""
@@ -10359,6 +10437,7 @@ def run_ui() -> None:
         half_gap = max(4, metrics.cell_gap // 2)
         panel_items: list[dict[str, Any]] = []
         reset_targets: list[tuple[tk.Misc, str]] = []
+        detail_targets: list[tuple[tk.Misc, str]] = []
         for index, (dr, presentation) in enumerate(zip(rows, presentations)):
             # Column-major placement keeps Claude's related windows together.
             if col_positions is not None:
@@ -10438,6 +10517,8 @@ def run_ui() -> None:
 
             if pct_text and row_opens_reset_ui(dr):
                 reset_targets.append((value_label, reset_target_id(dr)))
+            if dr.detail:
+                detail_targets.append((tile, dr.detail))
 
             if pct_text:
                 bar = tk.Canvas(
@@ -10483,6 +10564,7 @@ def run_ui() -> None:
         state["panel_structure"] = structure
         state["panel_items"] = panel_items
         register_reset_click_targets(reset_targets)
+        state["detail_targets"] = detail_targets
 
     def render_lines() -> None:
         providers: list[ProviderUsage] = state["providers"]
@@ -10510,6 +10592,7 @@ def run_ui() -> None:
             return
 
         reset_targets: list[tuple[tk.Misc, str]] = []
+        detail_targets: list[tuple[tk.Misc, str]] = []
         for dr in iter_display_rows(providers, shown_items()):
             compact_title = dr.title
             if dr.provider_id == "antigravity":
@@ -10571,6 +10654,8 @@ def run_ui() -> None:
                 bind_drag(pct_lbl)
                 if pct_t and row_opens_reset_ui(dr):
                     reset_targets.append((pct_lbl, reset_target_id(dr)))
+                if dr.detail:
+                    detail_targets.append((row, dr.detail))
 
             left = tk.Label(
                 row,
@@ -10608,6 +10693,7 @@ def run_ui() -> None:
         bind_drag(lines_frame)
         bind_drag(body)
         register_reset_click_targets(reset_targets)
+        state["detail_targets"] = detail_targets
 
     def render_footer() -> None:
         def on_refresh() -> None:
