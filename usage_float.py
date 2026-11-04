@@ -7748,9 +7748,11 @@ class DisplayRow:
     accounts: int = 1  # a Magpie pool of N same-plan accounts: used_pct is their mean
 
     @property
-    def shown_pct(self) -> float | None:
-        """Usage summed over the pool's accounts (two full accounts read 200%)."""
-        return None if self.used_pct is None else self.used_pct * self.accounts
+    def left_pct(self) -> float | None:
+        """What is left, in percent of one account: a fresh pool of two reads 200%."""
+        if self.used_pct is None:
+            return None
+        return (100.0 - max(0.0, min(100.0, self.used_pct))) * self.accounts
 
 
 def row_opens_reset_ui(row: DisplayRow) -> bool:
@@ -10142,7 +10144,7 @@ def run_ui() -> None:
             return "", "", _ui(dr.summary or "更新失败")
         if dr.used_pct is not None:
             rem = format_remaining(dr.resets_at)
-            pct_text = _ui(dr.summary) if dr.summary else f"{dr.shown_pct:.0f}%"
+            pct_text = _ui(dr.summary) if dr.summary else f"{dr.left_pct:.0f}%"
             return pct_text, rem, None
         if dr.summary:
             return "", "", _ui(dr.summary)
@@ -10335,7 +10337,7 @@ def run_ui() -> None:
                     meta_label.configure(text=meta_text)
                     bar = item.get("bar")
                     if pct_text and bar is not None and bar.winfo_exists():
-                        bar._usage_pct = float(dr.used_pct or 0)  # type: ignore[attr-defined]
+                        bar._usage_pct = 100.0 - min(100.0, float(dr.used_pct or 0))  # type: ignore[attr-defined]  # bar shows what is left
                         bar._usage_color = value_color  # type: ignore[attr-defined]
                         _paint_panel_bar(bar)
                 # Nothing was removed or remapped: Tk paints the changed values
@@ -10443,7 +10445,7 @@ def run_ui() -> None:
                     highlightthickness=0,
                 )
                 bar.pack(fill="x")
-                bar._usage_pct = float(dr.used_pct or 0)  # type: ignore[attr-defined]
+                bar._usage_pct = 100.0 - min(100.0, float(dr.used_pct or 0))  # type: ignore[attr-defined]  # bar shows what is left
                 bar._usage_color = value_color  # type: ignore[attr-defined]
                 bar.bind(
                     "<Configure>",
@@ -15366,7 +15368,7 @@ def main(argv: list[str] | None = None) -> int:
             right = row.summary or ""
             if row.used_pct is not None:
                 rem = format_remaining(row.resets_at)
-                right = (row.summary or f"{row.shown_pct:.0f}%") + (
+                right = (row.summary or f"{row.left_pct:.0f}%") + (
                     f"  {rem}" if rem else ""
                 )
             print(f"{row.title}  {right}".rstrip())

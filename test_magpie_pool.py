@@ -138,5 +138,12 @@ class MagpiePoolTests(unittest.TestCase):
                 self.assertEqual(cached.usage_details['aggregation'], 'plan_sum')
                 self.assertEqual(cached.windows[0].label, '7d×2')
 
+    def test_rows_show_what_is_left_summed_over_the_pool(self):
+        self.assertEqual(usage.DisplayRow('claude-2 7d×2', used_pct=25.0, accounts=2).left_pct, 150)
+        self.assertEqual(usage.DisplayRow('claude-2 5h×2', used_pct=0.0, accounts=2).left_pct, 200)
+        self.assertEqual(usage.DisplayRow('claude 7d', used_pct=27.0).left_pct, 73)
+        self.assertEqual(usage.DisplayRow('claude 5h', used_pct=101.0).left_pct, 0)
+        self.assertIsNone(usage.DisplayRow('claude').left_pct)
+
 if __name__ == '__main__':
     unittest.main()
