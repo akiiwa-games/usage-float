@@ -7859,6 +7859,9 @@ def _expand_display_rows(providers: list[ProviderUsage]) -> list[DisplayRow]:
                 # Retain one tile, but expose both constraints to the router.
                 shown = [max(shown, key=lambda w: w.used_pct if w.used_pct is not None else -1)]
             multi = len(shown) > 1
+            # Like Codex's single tile, an account whose only general window is the week (Claude Ultra has no 5h)
+            # is titled by its name alone; model-scoped weeks (fable 7d) keep their own label.
+            labelled = len([w for w in shown if not w.id.startswith("weekly_")]) > 1
             # Allow 5h + 7d + scoped model weeks (e.g. fable 7d)
             fetched = _iso_epoch(p.fetched_at, 0)
             for w in shown[:5]:
@@ -7869,7 +7872,7 @@ def _expand_display_rows(providers: list[ProviderUsage]) -> list[DisplayRow]:
                 # "claude 5h" / "claude 7d" / "fable 7d" (scoped rows omit provider prefix)
                 if w.id.startswith("weekly_"):
                     title = f"{name} {w.label}" if p.provider_id != "claude" else w.label
-                elif multi or p.provider_id == "antigravity":
+                elif labelled or p.provider_id == "antigravity":
                     title = f"{name} {w.label}"
                 else:
                     title = name

@@ -145,5 +145,15 @@ class MagpiePoolTests(unittest.TestCase):
         self.assertEqual(usage.DisplayRow('claude 5h', used_pct=101.0).left_pct, 0)
         self.assertIsNone(usage.DisplayRow('claude').left_pct)
 
+    def test_a_week_only_account_is_titled_by_name_like_codex(self):
+        week = lambda wid, label: usage.UsageWindow(id=wid, label=label, used_pct=10.0)
+        ultra = usage.ProviderUsage(provider_id='claude', display_name='claude', plan_label='max',
+                                    windows=[week('weekly_fable', 'fable 7d'), week('seven_day', '7d')])
+        pro = usage.ProviderUsage(provider_id='claude', display_name='claude', plan_label='pro',
+                                  windows=[week('seven_day', '7d'), week('five_hour', '5h')])
+        titles = lambda p: [r.title for r in usage.iter_display_rows([p], ['claude'])]
+        self.assertEqual(titles(ultra), ['fable 7d', 'claude'])
+        self.assertEqual(titles(pro), ['claude 7d', 'claude 5h'])
+
 if __name__ == '__main__':
     unittest.main()
