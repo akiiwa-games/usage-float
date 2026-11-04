@@ -4704,6 +4704,8 @@ class UsageWindow:
     label: str
     used_pct: float | None
     resets_at: str | None = None
+    # A pool of N same-plan subscriptions: used_pct is their mean, so the window holds N accounts' worth.
+    accounts: int = 1
 
 
 @dataclass
@@ -4822,6 +4824,7 @@ def _provider_to_dict(p: ProviderUsage) -> dict[str, Any]:
                 "label": w.label,
                 "used_pct": w.used_pct,
                 "resets_at": w.resets_at,
+                **({"accounts": w.accounts} if w.accounts > 1 else {}),
             }
             for w in p.windows
         ],
@@ -4843,6 +4846,11 @@ def _provider_to_dict(p: ProviderUsage) -> dict[str, Any]:
     return out
 
 
+def pool_accounts(window) -> int:
+    count = window.get("accounts") if isinstance(window, dict) else None
+    return count if isinstance(count, int) and not isinstance(count, bool) and count > 1 else 1
+
+
 def _provider_from_dict(d: dict[str, Any]) -> ProviderUsage:
     windows = [
         UsageWindow(
@@ -4850,6 +4858,7 @@ def _provider_from_dict(d: dict[str, Any]) -> ProviderUsage:
             label=str(w.get("label") or ""),
             used_pct=float(w["used_pct"]) if w.get("used_pct") is not None else None,
             resets_at=w.get("resets_at"),
+            accounts=pool_accounts(w),
         )
         for w in (d.get("windows") or [])
         if isinstance(w, dict)
@@ -4902,7 +4911,10 @@ def cache_put_provider(p: ProviderUsage) -> None:
     def update(cache):
         providers = cache.setdefault("providers", {})
         old = providers.get(p.provider_id) or {}
-        if old.get('credential_key') == key:
+        # A different pool membership or reading rule is a new observation, whatever its vendor time.
+        pool = lambda details: tuple((details or {}).get(k) for k in ('pool_key', 'aggregation'))
+        same_pool = pool(old.get('usage_details')) == pool(p.usage_details)
+        if old.get('credential_key') == key and same_pool:
             new_at, old_at = _iso_epoch(p.fetched_at, 0), _iso_epoch(old.get('fetched_at'), 0)
             # A stale observation (e.g. an old gateway readAt) is kept, still
             # flagged stale, only when it is strictly newer than what we hold.
@@ -5605,6 +5617,7 @@ def fetch_magpie_claude_usage(source, provider_id: str, *, probe_only: bool = Fa
         backend_kind="gateway",
         billing="subscription",
         home=str(claude_account_home(provider_id)),
+        usage_details=quota.get("usage_details"),
     )
     cache_put_provider(result)
     return result
@@ -7732,6 +7745,12 @@ class DisplayRow:
     failed: bool = False
     provider_id: str = ""
     window_id: str = ""
+    accounts: int = 1  # a Magpie pool of N same-plan accounts: used_pct is their mean
+
+    @property
+    def shown_pct(self) -> float | None:
+        """Usage summed over the pool's accounts (two full accounts read 200%)."""
+        return None if self.used_pct is None else self.used_pct * self.accounts
 
 
 def row_opens_reset_ui(row: DisplayRow) -> bool:
@@ -7860,6 +7879,7 @@ def _expand_display_rows(providers: list[ProviderUsage]) -> list[DisplayRow]:
                         summary=p.summary if not multi else None,
                         provider_id=p.provider_id,
                         window_id=w.id,
+                        accounts=w.accounts,
                     )
                 )
             continue
@@ -10122,7 +10142,7 @@ def run_ui() -> None:
             return "", "", _ui(dr.summary or "更新失败")
         if dr.used_pct is not None:
             rem = format_remaining(dr.resets_at)
-            pct_text = _ui(dr.summary) if dr.summary else f"{dr.used_pct:.0f}%"
+            pct_text = _ui(dr.summary) if dr.summary else f"{dr.shown_pct:.0f}%"
             return pct_text, rem, None
         if dr.summary:
             return "", "", _ui(dr.summary)
@@ -15346,7 +15366,7 @@ def main(argv: list[str] | None = None) -> int:
             right = row.summary or ""
             if row.used_pct is not None:
                 rem = format_remaining(row.resets_at)
-                right = (row.summary or f"{row.used_pct:.0f}%") + (
+                right = (row.summary or f"{row.shown_pct:.0f}%") + (
                     f"  {rem}" if rem else ""
                 )
             print(f"{row.title}  {right}".rstrip())
