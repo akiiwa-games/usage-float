@@ -7116,11 +7116,13 @@ def _round_dollars(value: float) -> int:
 
 
 def format_llm_proxy_spend(spend: float, budget: float | None = None) -> str:
-    """Compact dollar readout, e.g. $2/200."""
-    used = _round_dollars(spend)
+    """Compact dollar readout of what is left, e.g. $198/200 after $2 of a $200 budget.
+
+    Every other row reads what is left, so a budgeted key does too; with no budget
+    nothing is known to be left and the spend alone is shown ($12)."""
     if budget is None or budget <= 0:
-        return f"${used}"
-    return f"${used}/{_round_dollars(budget)}"
+        return f"${_round_dollars(spend)}"
+    return f"${_round_dollars(max(0.0, budget - spend))}/{_round_dollars(budget)}"
 
 
 def _llm_proxy_probe(
@@ -7780,6 +7782,7 @@ class DisplayRow:
     window_id: str = ""
     accounts: int = 1  # a Magpie pool of N same-plan accounts: used_pct is their mean
     detail: str | None = None  # hover text: a Magpie pool's per-account readings
+    member_used: tuple[float, ...] = ()  # a Magpie pool's counted accounts, one used_pct each: one panel bar apiece
 
     @property
     def left_pct(self) -> float | None:
@@ -7840,6 +7843,27 @@ def pool_detail_text(details: dict[str, Any] | None) -> str | None:
         note = "" if member.get("counted", True) else " " + _tr("(不计入)", "(not added)")
         lines.append(f"{member.get('label') or '—'}  {' · '.join(parts)}{note}")
     return "\n".join(lines)
+
+
+def pool_member_used(details: dict[str, Any] | None, window_id: str, now: float | None = None) -> tuple[float, ...]:
+    """Each added-up account's used_pct in this window, for a Magpie pool row's own bars (one per account).
+
+    A reading taken before a reset that has since passed counts as refilled, as the pooled row does."""
+    members = (details or {}).get("members") if (details or {}).get("kind") == "magpie_pool" else None
+    if not isinstance(members, list):
+        return ()
+    now = time.time() if now is None else now
+    used = []
+    for member in members:
+        if not isinstance(member, dict) or not member.get("counted", True):
+            continue
+        window = (member.get("windows") or {}).get(window_id) if isinstance(member.get("windows"), dict) else None
+        if not isinstance(window, dict) or not isinstance(window.get("used_pct"), (int, float)):
+            continue
+        read = _iso_epoch(member.get("read_at"), 0)
+        refilled = 0 < read < _iso_epoch(window.get("resets_at"), 0) <= now
+        used.append(0.0 if refilled else max(0.0, min(100.0, float(window["used_pct"]))))
+    return tuple(used) if len(used) > 1 else ()
 
 
 def iter_display_rows(
@@ -7937,6 +7961,7 @@ def _expand_display_rows(providers: list[ProviderUsage]) -> list[DisplayRow]:
                         window_id=w.id,
                         accounts=w.accounts,
                         detail=pool_detail_text(p.usage_details),
+                        member_used=pool_member_used(p.usage_details, w.id),
                     )
                 )
             continue
@@ -8240,12 +8265,20 @@ def _panel_layout_key(
 ) -> tuple[Any, ...]:
     """What forces the panel tiles to be rebuilt instead of updated in place.
 
-    rows holds each tile's (title, has_usage_bar). Values, colors and reset
+    rows holds each tile's (title, usage bar count: 0 for none, N for a Magpie pool of N). Values, colors and reset
     countdowns are written to the existing labels, so they stay out of the
     key: rebuilding destroys every tile and the dedicated screen shows its
     black background for a frame.
     """
     return (columns, grid_rows, cell_gap, bar_height, tuple(rows))
+
+
+def panel_pool_bar_geometry(bar_height: int, count: int) -> tuple[int, int]:
+    """(height of each bar, gap between bars) for a tile with count bars: one keeps the full bar,
+    a Magpie pool's per-account bars are thinner so N of them stay within a short tile."""
+    if count <= 1:
+        return bar_height, 0
+    return max(3, int(round(bar_height * 0.6))), max(2, bar_height // 3)
 
 
 def _panel_metrics(
@@ -8281,7 +8314,7 @@ def _panel_metrics(
 
 
 def _panel_value_slot_width(font: Any, value_text: str) -> int:
-    """Keep 100% stable, but don't clip dollar readouts like $2/200."""
+    """Keep 100% stable, but don't clip dollar readouts like $198/200."""
     sample = value_text or "100%"
     return max(int(font.measure("100%")), int(font.measure(sample)))
 
@@ -10278,29 +10311,26 @@ def run_ui() -> None:
     ) -> None:
         bar_width = max(1, int(width or canvas.winfo_width()))
         bar_height = max(1, int(height or canvas.winfo_height()))
-        pct = float(getattr(canvas, "_usage_pct", 0.0))
-        color = str(getattr(canvas, "_usage_color", PANEL_FG))
-        fill_width = int(round(bar_width * max(0.0, min(100.0, pct)) / 100.0))
+        # A Magpie pool stacks one thin bar per account; any other row has a single bar.
+        bars = list(getattr(canvas, "_usage_bars", None) or [])
+        if not bars:
+            bars = [(float(getattr(canvas, "_usage_pct", 0.0)), str(getattr(canvas, "_usage_color", PANEL_FG)))]
+        gap = int(getattr(canvas, "_usage_gap", 0)) if len(bars) > 1 else 0
+        each = max(1, (bar_height - gap * (len(bars) - 1)) // len(bars))
         canvas.delete("usage-bar")
-        canvas.create_rectangle(
-            0,
-            0,
-            bar_width,
-            bar_height,
-            fill=PANEL_TRACK,
-            outline="",
-            tags="usage-bar",
-        )
-        if fill_width:
-            canvas.create_rectangle(
-                0,
-                0,
-                fill_width,
-                bar_height,
-                fill=color,
-                outline="",
-                tags="usage-bar",
-            )
+        for index, (pct, color) in enumerate(bars):
+            top = index * (each + gap)
+            bottom = bar_height if len(bars) == 1 else top + each
+            fill_width = int(round(bar_width * max(0.0, min(100.0, pct)) / 100.0))
+            canvas.create_rectangle(0, top, bar_width, bottom, fill=PANEL_TRACK, outline="", tags="usage-bar")
+            if fill_width:
+                canvas.create_rectangle(0, top, fill_width, bottom, fill=color, outline="", tags="usage-bar")
+
+    def _set_panel_bar(canvas: tk.Canvas, dr: DisplayRow, color: str) -> None:
+        """What the bar shows: what is left, one bar per account of a Magpie pool, colored by that account."""
+        canvas._usage_pct = 100.0 - min(100.0, float(dr.used_pct or 0))  # type: ignore[attr-defined]
+        canvas._usage_color = color  # type: ignore[attr-defined]
+        canvas._usage_bars = [(100.0 - used, panel_tone_color(used)) for used in dr.member_used]  # type: ignore[attr-defined]
 
     def _render_panel_lines(providers: list[ProviderUsage]) -> None:
         panel: MonitorInfo | None = state.get("panel_monitor")
@@ -10404,7 +10434,7 @@ def run_ui() -> None:
                     f"{col_positions[i][0]}:{col_positions[i][1]}:{dr.title}"
                     if col_positions is not None
                     else dr.title,
-                    bool(presentation[0]),
+                    (len(dr.member_used) or 1) if presentation[0] else 0,
                 )
                 for i, (dr, presentation) in enumerate(zip(rows, presentations))
             ),
@@ -10442,8 +10472,7 @@ def run_ui() -> None:
                     meta_label.configure(text=meta_text)
                     bar = item.get("bar")
                     if pct_text and bar is not None and bar.winfo_exists():
-                        bar._usage_pct = 100.0 - min(100.0, float(dr.used_pct or 0))  # type: ignore[attr-defined]  # bar shows what is left
-                        bar._usage_color = value_color  # type: ignore[attr-defined]
+                        _set_panel_bar(bar, dr, value_color)
                         _paint_panel_bar(bar)
                 # Nothing was removed or remapped: Tk paints the changed values
                 # together after this callback, so the panel never exposes an
@@ -10486,7 +10515,7 @@ def run_ui() -> None:
             value_width = _panel_value_slot_width(font_panel_value, value_text)
             headline.grid_columnconfigure(0, weight=1)
             # Reserve enough room for 100% so percentage changes do not shift
-            # the title. Dollar readouts like $2/200 are wider than 100%.
+            # the title. Dollar readouts like $198/200 are wider than 100%.
             headline.grid_columnconfigure(
                 1,
                 weight=0,
@@ -10545,16 +10574,18 @@ def run_ui() -> None:
                 detail_targets.append((tile, dr.detail))
 
             if pct_text:
+                count = len(dr.member_used) or 1
+                each, gap = panel_pool_bar_geometry(metrics.bar_height, count)
                 bar = tk.Canvas(
                     instrument,
-                    height=metrics.bar_height,
+                    height=each * count + gap * (count - 1),
                     bg=ui_bg,
                     bd=0,
                     highlightthickness=0,
                 )
                 bar.pack(fill="x")
-                bar._usage_pct = 100.0 - min(100.0, float(dr.used_pct or 0))  # type: ignore[attr-defined]  # bar shows what is left
-                bar._usage_color = value_color  # type: ignore[attr-defined]
+                bar._usage_gap = gap  # type: ignore[attr-defined]
+                _set_panel_bar(bar, dr, value_color)
                 bar.bind(
                     "<Configure>",
                     lambda event, canvas=bar: _paint_panel_bar(

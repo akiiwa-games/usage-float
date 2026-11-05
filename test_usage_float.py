@@ -767,6 +767,11 @@ class AuxiliaryPanelTests(unittest.TestCase):
             key,
             _panel_layout_key(2, 3, 21, 8, [("codex", True), ("claude 5h", False), ("api-proxy", True)]),
         )
+        # A Magpie pool that gains an account needs one more bar in its tile.
+        self.assertNotEqual(
+            _panel_layout_key(2, 3, 21, 8, [("claude-2 7d×2", 2)]),
+            _panel_layout_key(2, 3, 21, 8, [("claude-2 7d×2", 3)]),
+        )
 
     def test_monitor_label_and_negative_tk_geometry_are_stable(self) -> None:
         monitor = self.monitor(r"\\.\DISPLAY3", 960, 640, x=-960, dpi=144)
@@ -1387,11 +1392,12 @@ class LlmProxyUsageTests(unittest.TestCase):
         self.assertAlmostEqual(cost or 0, 0.01)
 
     def test_spend_is_shown_as_integer_dollars(self) -> None:
-        self.assertEqual(usage_float_module.format_llm_proxy_spend(2.65, 200), "$3/200")
-        self.assertEqual(usage_float_module.format_llm_proxy_spend(2.5, 200), "$3/200")
-        self.assertEqual(usage_float_module.format_llm_proxy_spend(2.4, 200), "$2/200")
-        self.assertEqual(usage_float_module.format_llm_proxy_spend(2.0, 200), "$2/200")
+        self.assertEqual(usage_float_module.format_llm_proxy_spend(2.65, 200), "$197/200")
+        self.assertEqual(usage_float_module.format_llm_proxy_spend(2.5, 200), "$198/200")
+        self.assertEqual(usage_float_module.format_llm_proxy_spend(2.4, 200), "$198/200")
+        self.assertEqual(usage_float_module.format_llm_proxy_spend(2.0, 200), "$198/200")
         self.assertEqual(usage_float_module.format_llm_proxy_spend(12.3), "$12")
+        self.assertEqual(usage_float_module.format_llm_proxy_spend(230, 200), "$0/200")  # over budget: nothing left
 
     def test_stale_spend_is_the_current_request_cost(self) -> None:
         self.assertTrue(
@@ -1465,11 +1471,11 @@ class LlmProxyUsageTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertTrue(usage.available)
         self.assertAlmostEqual(usage.windows[0].used_pct, 10.0)
-        self.assertEqual(usage.summary, "$20/200")
+        self.assertEqual(usage.summary, "$180/200")
         self.assertIsNotNone(usage.windows[0].resets_at)
         rows = iter_display_rows([usage])
         self.assertEqual(rows[0].title, "api-proxy")
-        self.assertEqual(rows[0].summary, "$20/200")
+        self.assertEqual(rows[0].summary, "$180/200")
         self.assertIsNotNone(rows[0].resets_at)
         self.assertTrue(format_remaining(rows[0].resets_at))
 

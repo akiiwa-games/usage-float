@@ -145,6 +145,33 @@ class MagpiePoolTests(unittest.TestCase):
         self.assertEqual(usage.DisplayRow('claude 5h', used_pct=101.0).left_pct, 0)
         self.assertIsNone(usage.DisplayRow('claude').left_pct)
 
+    def test_pool_rows_carry_one_bar_per_added_account(self):
+        self.a['plan'] = 'max'
+        self.b['plan'] = 'max'
+        small = self.account('c', 10, 10, 2)  # a smaller plan is listed in the hover, not drawn as a bar
+        quota, windows = self.parse(self.a, self.b, small)
+        pool = usage.ProviderUsage(provider_id='claude-2', display_name='claude-2', plan_label=quota['plan'],
+                                   windows=[usage.UsageWindow(**w) for w in windows],
+                                   usage_details=quota['usage_details'], fetched_at=quota['readAt'])
+        rows = {r.window_id: r for r in usage.iter_display_rows([pool], ['claude-2:7d', 'claude-2:5h'])}
+        self.assertEqual(rows['seven_day'].member_used, (50.0, 0.0))
+        self.assertEqual(rows['five_hour'].member_used, (100.0, 0.0))
+        single = usage.ProviderUsage(provider_id='claude', display_name='claude', plan_label='pro',
+                                     windows=[usage.UsageWindow(id='seven_day', label='7d', used_pct=10.0)])
+        self.assertEqual(usage.iter_display_rows([single], ['claude'])[0].member_used, ())
+
+    def test_a_pool_member_read_before_its_reset_counts_as_refilled(self):
+        self.a['readAt'] = (self.now - timedelta(hours=2)).isoformat()
+        self.a['windows'][0]['resetsAt'] = (self.now - timedelta(hours=1)).isoformat()
+        quota, _ = self.parse(self.a, self.b)
+        self.assertEqual(usage.pool_member_used(quota['usage_details'], 'five_hour'), (0.0, 0.0))
+        self.assertEqual(usage.pool_member_used(quota['usage_details'], 'seven_day'), (50.0, 0.0))
+
+    def test_pool_bars_are_thinner_but_stay_visible(self):
+        self.assertEqual(usage.panel_pool_bar_geometry(8, 1), (8, 0))
+        self.assertEqual(usage.panel_pool_bar_geometry(8, 3), (5, 2))
+        self.assertEqual(usage.panel_pool_bar_geometry(6, 4), (4, 2))
+
     def test_a_week_only_account_is_titled_by_name_like_codex(self):
         week = lambda wid, label: usage.UsageWindow(id=wid, label=label, used_pct=10.0)
         ultra = usage.ProviderUsage(provider_id='claude', display_name='claude', plan_label='max',
