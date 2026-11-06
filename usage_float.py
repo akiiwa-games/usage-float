@@ -7783,6 +7783,7 @@ class DisplayRow:
     accounts: int = 1  # a Magpie pool of N same-plan accounts: used_pct is their mean
     detail: str | None = None  # hover text: a Magpie pool's per-account readings
     member_used: tuple[float, ...] = ()  # a Magpie pool's counted accounts, one used_pct each: one panel bar apiece
+    refill: bool = False  # resets_at is a Magpie pool's next partial refill, not when every account is full
 
     @property
     def left_pct(self) -> float | None:
@@ -7828,41 +7829,101 @@ def display_item(row: DisplayRow) -> str | None:
     return item.replace("claude:", f"{row.provider_id}:") if item else None
 
 
-def pool_detail_text(details: dict[str, Any] | None) -> str | None:
-    """Hover text of a Magpie pool: each account's left, one short line each (as AgentCompass's card hover)."""
-    members = (details or {}).get("members") if (details or {}).get("kind") == "magpie_pool" else None
-    if not isinstance(members, list) or len(members) < 2:
-        return None
-    lines = []
-    for member in members:
-        if not isinstance(member, dict):
-            continue
-        windows = member.get("windows") if isinstance(member.get("windows"), dict) else {}
-        parts = [f"{name} {100 - w['used_pct']:.0f}%" for wid, name in (("seven_day", "7d"), ("five_hour", "5h"))
-                 if isinstance(w := windows.get(wid), dict) and isinstance(w.get("used_pct"), (int, float))]
-        note = "" if member.get("counted", True) else " " + _tr("(不计入)", "(not added)")
-        lines.append(f"{member.get('label') or '—'}  {' · '.join(parts)}{note}")
-    return "\n".join(lines)
+# A Magpie account is read only when asked, so a reading this old is marked on its hover line.
+POOL_MEMBER_STALE_SECONDS = 1800
+# An account this little spent gives nothing back when it resets, so its reset is not the pool's next refill.
+POOL_REFILL_MIN_USED_PCT = 5.0
+POOL_WINDOW_NAMES = (("seven_day", "7d"), ("five_hour", "5h"))
 
 
-def pool_member_used(details: dict[str, Any] | None, window_id: str, now: float | None = None) -> tuple[float, ...]:
-    """Each added-up account's used_pct in this window, for a Magpie pool row's own bars (one per account).
+def pool_members_state(details: dict[str, Any] | None, now: float | None = None) -> list[dict[str, Any]]:
+    """A Magpie pool's accounts as bars and hover read them: per window what is used and when it resets.
 
     A reading taken before a reset that has since passed counts as refilled, as the pooled row does."""
     members = (details or {}).get("members") if (details or {}).get("kind") == "magpie_pool" else None
     if not isinstance(members, list):
-        return ()
+        return []
     now = time.time() if now is None else now
-    used = []
+    states = []
     for member in members:
-        if not isinstance(member, dict) or not member.get("counted", True):
-            continue
-        window = (member.get("windows") or {}).get(window_id) if isinstance(member.get("windows"), dict) else None
-        if not isinstance(window, dict) or not isinstance(window.get("used_pct"), (int, float)):
+        if not isinstance(member, dict):
             continue
         read = _iso_epoch(member.get("read_at"), 0)
-        refilled = 0 < read < _iso_epoch(window.get("resets_at"), 0) <= now
-        used.append(0.0 if refilled else max(0.0, min(100.0, float(window["used_pct"]))))
+        windows = {}
+        for wid, window in (member.get("windows") or {}).items() if isinstance(member.get("windows"), dict) else ():
+            if not isinstance(window, dict) or not isinstance(window.get("used_pct"), (int, float)):
+                continue
+            reset = _iso_epoch(window.get("resets_at"), 0)
+            refilled = 0 < read < reset <= now
+            windows[wid] = {"used_pct": 0.0 if refilled else max(0.0, min(100.0, float(window["used_pct"]))),
+                            "refilled": refilled, "resets_at": window.get("resets_at") if reset > now else None}
+        states.append({"label": str(member.get("label") or "—"), "counted": member.get("counted", True) is not False,
+                       "age": now - read if read else None, "windows": windows})
+    return states
+
+
+def pool_next_refill(states: list[dict[str, Any]], window_id: str) -> str | None:
+    """When a pool window next gets quota back: the soonest reset of a counted account that spent some."""
+    counted = [w for s in states if s["counted"] and isinstance(w := s["windows"].get(window_id), dict)]
+    pending = [w["resets_at"] for w in counted if w["resets_at"] and w["used_pct"] >= POOL_REFILL_MIN_USED_PCT]
+    return min(pending, key=lambda at: _iso_epoch(at, 0)) if len(counted) > 1 and pending else None
+
+
+def compact_countdown(seconds: float) -> str:
+    """'3d7h' / '2h8m' / '45m': a table cell's countdown."""
+    seconds = int(seconds)
+    days, rest = divmod(seconds, 86400)
+    hours, minutes = rest // 3600, rest % 3600 // 60
+    if days:
+        return f"{days}d{hours}h" if hours else f"{days}d"
+    return (f"{hours}h{minutes}m" if minutes else f"{hours}h") if hours else f"{max(1, minutes)}m"
+
+
+def format_reading_age(seconds: float) -> str:
+    """'3m' / '5h' / '2d' for how old a reading is."""
+    if seconds < 3600:
+        return f"{max(1, int(seconds // 60))}m"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)}h"
+    return f"{int(seconds // 86400)}d"
+
+
+def pool_detail_text(details: dict[str, Any] | None, now: float | None = None) -> str | None:
+    """Hover text of a Magpie pool, as AgentCompass's card hover: a small table, one row per account, per window
+    what is left and when that account resets."""
+    now = time.time() if now is None else now
+    states = pool_members_state(details, now)
+    if len(states) < 2:
+        return None
+    names = [s["label"] for s in states]
+    short = [n.split("@")[0] for n in names]
+    names = short if len(set(short)) == len(short) else names  # same initials: the domains tell them apart
+    present = [(wid, tag) for wid, tag in POOL_WINDOW_NAMES if any(wid in s["windows"] for s in states)]
+    cells = []
+    for state in states:
+        row = []
+        for wid, _tag in present:
+            w = state["windows"].get(wid)
+            cell = "" if not w else f"{100 - w['used_pct']:.0f}%"
+            if w and w["resets_at"]:
+                cell += " " + compact_countdown(_iso_epoch(w["resets_at"], now) - now)
+            row.append(cell)
+        cells.append(row)
+    name_w = max(len(n) for n in names)
+    widths = [max(len(tag), *(len(r[i]) for r in cells)) for i, (_wid, tag) in enumerate(present)]
+    lines = [(" " * name_w + "".join(f"  {tag.ljust(w)}" for (_wid, tag), w in zip(present, widths))).rstrip()]
+    for name, state, row in zip(names, states, cells):
+        note = "" if state["counted"] else " " + _tr("(不计入)", "(not added)")
+        if state["age"] is not None and state["age"] > POOL_MEMBER_STALE_SECONDS:
+            note += " " + _tr("{0}前读", "read {0} ago").format(format_reading_age(state["age"]))
+        lines.append((name.ljust(name_w) + "".join(f"  {c.ljust(w)}" for c, w in zip(row, widths))).rstrip() + note)
+    return "\n".join(lines)
+
+
+def pool_member_used(details: dict[str, Any] | None, window_id: str, now: float | None = None) -> tuple[float, ...]:
+    """Each added-up account's used_pct in this window, for a Magpie pool row's own bars (one per account)."""
+    used = [w["used_pct"] for s in pool_members_state(details, now)
+            if s["counted"] and isinstance(w := s["windows"].get(window_id), dict)]
     return tuple(used) if len(used) > 1 else ()
 
 
@@ -7951,17 +8012,20 @@ def _expand_display_rows(providers: list[ProviderUsage]) -> list[DisplayRow]:
                     title = f"{name} {w.label}"
                 else:
                     title = name
+                # A pool counts down to its next partial refill; each account's own reset is on the hover.
+                refill = pool_next_refill(pool_members_state(p.usage_details), w.id) if resets_at else None
                 rows.append(
                     DisplayRow(
                         title=title,
                         used_pct=used_pct,
-                        resets_at=resets_at,
+                        resets_at=refill or resets_at,
                         summary=p.summary if not multi else None,
                         provider_id=p.provider_id,
                         window_id=w.id,
                         accounts=w.accounts,
                         detail=pool_detail_text(p.usage_details),
                         member_used=pool_member_used(p.usage_details, w.id),
+                        refill=bool(refill),
                     )
                 )
             continue
@@ -10212,13 +10276,17 @@ def run_ui() -> None:
                 tip = tk.Toplevel(root)
                 tip.overrideredirect(True)
                 tip.attributes("-topmost", True)
-                label = tk.Label(tip, justify="left", bg="#1f2937", fg="#f9fafb", padx=8, pady=6,
-                                 font=(font_main.cget("family"), max(9, int(font_main.cget("size")) - 2)))
+                label = tk.Label(tip, justify="left", bg="#1f2937", fg="#f9fafb", padx=12, pady=8)
                 label.pack()
                 tip._label = label  # type: ignore[attr-defined]
                 state["detail_tip"] = tip
-            if tip._label.cget("text") != text:  # type: ignore[attr-defined]
-                tip._label.configure(text=text)  # type: ignore[attr-defined]
+            # Monospace: a pool's account lines are padded into columns. On the dedicated-screen panel the tip
+            # reads at the size of a tile's reset line; the floating window keeps its own text size.
+            size = abs(int(font_panel_meta.cget("size") if state.get("panel_active") else font_main.cget("size")))
+            font = ("Consolas", max(10, size))
+            if (tip._label.cget("text"), getattr(tip, "_font", None)) != (text, font):  # type: ignore[attr-defined]
+                tip._label.configure(text=text, font=font)  # type: ignore[attr-defined]
+                tip._font = font  # type: ignore[attr-defined]
             tip.geometry(f"+{event.x_root + 14}+{event.y_root + 14}")
             tip.deiconify()
         except Exception:
@@ -15254,6 +15322,11 @@ def run_ui() -> None:
 
     bind_drag(body)
     bind_drag(root)
+    # Every tile widget carries root in its bindtags, so this sees the pointer over any tile: the dedicated-screen
+    # panel has no plate underneath, and a pool tile's account hover would otherwise never show there.
+    root.bind("<Motion>", track_reset_hover, add="+")
+    root.bind("<Leave>", lambda event: (set_reset_hover(False), hide_detail_tip()) if event.widget is root else None,
+              add="+")
     if bg_layer is not None:
         # Transparent pixels in the text window hit the plate underneath.
         # Mirror the normal window interactions there so the HUD never feels

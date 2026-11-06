@@ -167,6 +167,31 @@ class MagpiePoolTests(unittest.TestCase):
         self.assertEqual(usage.pool_member_used(quota['usage_details'], 'five_hour'), (0.0, 0.0))
         self.assertEqual(usage.pool_member_used(quota['usage_details'], 'seven_day'), (50.0, 0.0))
 
+    def test_a_pool_row_counts_down_to_its_next_refill_and_hover_shows_each_reset(self):
+        self.a['plan'] = self.b['plan'] = 'max'
+        self.b['windows'][1]['used'] = 30  # b's week resets in 3 days, a's in 1
+        self.b['readAt'] = (self.now - timedelta(hours=2)).isoformat()
+        quota, windows = self.parse(self.a, self.b)
+        self.assertEqual(windows[0]['resets_at'], self.b['windows'][1]['resetsAt'])  # pooled: every account full
+        pool = usage.ProviderUsage(provider_id='claude-2', display_name='claude-2', plan_label=quota['plan'],
+                                   windows=[usage.UsageWindow(**w) for w in windows],
+                                   usage_details=quota['usage_details'], fetched_at=quota['readAt'])
+        rows = {r.window_id: r for r in usage.iter_display_rows([pool], ['claude-2:7d', 'claude-2:5h'])}
+        week = rows['seven_day']
+        self.assertTrue(week.refill)
+        self.assertEqual(week.resets_at, self.a['windows'][1]['resetsAt'])  # a refills first
+        self.assertEqual(rows['five_hour'].resets_at, self.a['windows'][0]['resetsAt'])  # b's 0% gives nothing back
+        states = usage.pool_members_state(quota['usage_details'])
+        self.assertEqual(usage.pool_next_refill(states, 'seven_day'), self.a['windows'][1]['resetsAt'])
+        lines = usage.pool_detail_text(quota['usage_details'], now=self.now.timestamp()).splitlines()
+        self.assertEqual(lines[0], '      7d      5h')
+        self.assertEqual(lines[1], 'a***  50% 1d  0% 1h')
+        self.assertRegex(lines[2], r'^b\*\*\*  70% 3d  100% 3h (2h前读|read 2h ago)$')  # a full account still shows its reset
+        single = usage.ProviderUsage(provider_id='claude', display_name='claude', plan_label='pro',
+                                     windows=[usage.UsageWindow(id='seven_day', label='7d', used_pct=10.0,
+                                                                resets_at=self.a['windows'][1]['resetsAt'])])
+        self.assertFalse(usage.iter_display_rows([single], ['claude'])[0].refill)
+
     def test_pool_bars_are_thinner_but_stay_visible(self):
         self.assertEqual(usage.panel_pool_bar_geometry(8, 1), (8, 0))
         self.assertEqual(usage.panel_pool_bar_geometry(8, 3), (5, 2))
