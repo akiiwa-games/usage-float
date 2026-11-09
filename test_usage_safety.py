@@ -34,12 +34,22 @@ class UsageSafetyTests(unittest.TestCase):
             home.mkdir()
             (home / '.credentials.json').write_text(json.dumps({
                 'claudeAiOauth': {'accessToken': token, 'refreshToken': 'not-for-monitor'}}))
-        for name, value in (('CACHE_PATH', self.root / 'cache.json'),
-                            ('CLAUDE_HOME', self.first), ('CLAUDE_HOME_2', self.second)):
+        # Account discovery reads HOME, Paseo and AgentCompass files: point all of
+        # them at this sandbox so results never depend on the machine's own logins.
+        codex = tuple(usage.CodexAccount(pid, pid, self.root / f'.{pid}') for pid in ('codex', 'codex-2'))
+        for account in codex:
+            account.home.mkdir()
+        for name, value in (('CACHE_PATH', self.root / 'cache.json'), ('HOME', self.root),
+                            ('__file__', str(self.root / 'app' / 'usage_float.py')),
+                            ('CLAUDE_HOME', self.first), ('CLAUDE_HOME_2', self.second),
+                            ('CODEX_ACCOUNTS', codex),
+                            ('CODEX_ACCOUNT_BY_ID', {a.provider_id: a for a in codex})):
             p = patch.object(usage, name, value)
             p.start()
             self.addCleanup(p.stop)
-        p = patch.dict('os.environ', {'ROUTE_MANAGER_ACTIVITY_FILE': str(self.root / 'capacity.json')})
+        p = patch.dict('os.environ', {'ROUTE_MANAGER_ACTIVITY_FILE': str(self.root / 'capacity.json'),
+                                      'PASEO_CONFIG': str(self.root / 'paseo.json'),
+                                      'ROUTE_MANAGER_ACCOUNTS_OVERRIDE': str(self.root / 'accounts.json')})
         p.start()
         self.addCleanup(p.stop)
         p = patch.object(usage, 'http_json', side_effect=AssertionError('Unexpected network'))
