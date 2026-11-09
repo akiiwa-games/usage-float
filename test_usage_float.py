@@ -998,11 +998,11 @@ class CodexMultiAccountTests(unittest.TestCase):
 
         self.assertEqual(
             config["providers"],
-            ["claude:fable", "claude:7d", "claude:5h", "codex", "codex-2", "grok", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS],
+            ["claude:fable", "claude:7d", "claude:5h", "codex:7d", "codex:5h", "codex-2:7d", "codex-2:5h", "grok", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS],
         )
         self.assertEqual(
             config["provider_order"],
-            ["claude:fable", "claude:7d", "claude:5h", "codex", "codex-2", "grok", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS],
+            ["claude:fable", "claude:7d", "claude:5h", "codex:7d", "codex:5h", "codex-2:7d", "codex-2:5h", "grok", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS],
         )
         self.assertEqual(config["disabled_providers"], [])
 
@@ -1129,7 +1129,7 @@ class AntigravityUsageTests(unittest.TestCase):
             self.assertTrue(fetched[0].available)
             self.assertIsNotNone(usage_float_module.cache_get_provider("antigravity"))
             self.assertEqual(run.call_args_list[-1].args[1], ["-p", "/usage", "--output-format", "json"])
-        providers = [ProviderUsage("codex", "codex", windows=[UsageWindow("primary", "5h", 10)]), *fetched]
+        providers = [ProviderUsage("codex", "codex", windows=[UsageWindow("five_hour", "5h", 10)]), *fetched]
         rows = iter_display_rows(providers, ["antigravity", "codex"])
         self.assertEqual([row.title for row in rows], [
             "agy gemini 7d", "agy gemini 5h", "agy claude 7d", "agy claude 5h", "codex",
@@ -1162,7 +1162,7 @@ class AntigravityUsageTests(unittest.TestCase):
                     ["grok", "codex"] if disabled else ["grok", "antigravity", "codex"],
                     disabled, ["grok", "antigravity", "codex"],
                 )
-                self.assertEqual(order[:6], ["grok", *items, "codex"])
+                self.assertEqual(order[:7], ["grok", *items, "codex:7d", "codex:5h"])
                 self.assertNotIn("antigravity", order)
                 if disabled:
                     self.assertTrue(all(item in hidden and item not in enabled for item in items))
@@ -1171,8 +1171,8 @@ class AntigravityUsageTests(unittest.TestCase):
 
     def test_individual_toggles_and_interleaved_order_survive_reload(self) -> None:
         items = list(usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS)
-        enabled = [items[3], "codex", items[0]]
-        order = [*enabled, items[1], items[2], *[pid for pid in DEFAULT_PROVIDERS if pid not in ["codex", *items]]]
+        enabled = [items[3], "codex:5h", items[0]]
+        order = [*enabled, items[1], items[2], *[pid for pid in DEFAULT_PROVIDERS if pid not in ["codex:5h", *items]]]
         disabled = [pid for pid in order if pid not in enabled]
         with TemporaryDirectory() as directory, patch.object(
             usage_float_module, "CONFIG_PATH", Path(directory) / "config.json"
@@ -1183,7 +1183,7 @@ class AntigravityUsageTests(unittest.TestCase):
         self.assertEqual(config["provider_order"], order)
         self.assertEqual(config["disabled_providers"], disabled)
         provider = ProviderUsage("antigravity", "agy", windows=usage_float_module._parse_antigravity_usage(self.report()))
-        codex = ProviderUsage("codex", "codex", windows=[UsageWindow("primary", "5h", 10)])
+        codex = ProviderUsage("codex", "codex", windows=[UsageWindow("five_hour", "5h", 10)])
         rows = iter_display_rows([codex, provider], config["providers"])
         self.assertEqual([row.title for row in rows], ["agy claude 5h", "codex", "agy gemini 7d"])
         moved = usage_float_module.move_provider(config["providers"], items[0], items[3])
@@ -1193,7 +1193,7 @@ class AntigravityUsageTests(unittest.TestCase):
 
     def test_shared_failure_uses_first_enabled_antigravity_row(self) -> None:
         failed = ProviderUsage("antigravity", "agy", available=False, error="更新失败")
-        codex = ProviderUsage("codex", "codex", windows=[UsageWindow("primary", "5h", 10)])
+        codex = ProviderUsage("codex", "codex", windows=[UsageWindow("five_hour", "5h", 10)])
         rows = iter_display_rows([failed, codex], ["codex", "antigravity:3p-5h", "antigravity:gemini-weekly"])
         self.assertEqual([row.title for row in rows], ["codex", "agy"])
         self.assertTrue(rows[1].failed)
@@ -1577,8 +1577,8 @@ class ProviderConfigTests(unittest.TestCase):
             [],
             ["claude", "codex", "grok"],
         )
-        self.assertEqual(order, ["claude:fable", "claude:7d", "claude:5h", "codex", "codex-2", "grok", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS])
-        self.assertEqual(enabled, ["claude:fable", "claude:7d", "claude:5h", "codex", "codex-2", "grok", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS])
+        self.assertEqual(order, ["claude:fable", "claude:7d", "claude:5h", "codex:7d", "codex:5h", "codex-2:7d", "codex-2:5h", "grok", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS])
+        self.assertEqual(enabled, ["claude:fable", "claude:7d", "claude:5h", "codex:7d", "codex:5h", "codex-2:7d", "codex-2:5h", "grok", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS])
         self.assertEqual(disabled, [])
 
     def test_disabled_providers_keep_order_and_stay_hidden(self) -> None:
@@ -1587,8 +1587,8 @@ class ProviderConfigTests(unittest.TestCase):
             ["claude"],
             ["grok", "codex", "claude"],
         )
-        self.assertEqual(order, ["grok", "codex", "codex-2", "claude:fable", "claude:7d", "claude:5h", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS])
-        self.assertEqual(enabled, ["grok", "codex", "codex-2", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS])
+        self.assertEqual(order, ["grok", "codex:7d", "codex:5h", "codex-2:7d", "codex-2:5h", "claude:fable", "claude:7d", "claude:5h", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS])
+        self.assertEqual(enabled, ["grok", "codex:7d", "codex:5h", "codex-2:7d", "codex-2:5h", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS])
         self.assertEqual(disabled, ["claude:fable", "claude:7d", "claude:5h"])
 
     def test_unchecking_every_row_stays_empty(self) -> None:
@@ -1604,15 +1604,15 @@ class ProviderConfigTests(unittest.TestCase):
     def test_move_provider_places_source_on_target_index(self) -> None:
         self.assertEqual(
             usage_float_module.move_provider(
-                ["codex", "grok", "claude:5h"], "codex", "claude:5h"
+                ["codex:5h", "grok", "claude:5h"], "codex:5h", "claude:5h"
             ),
-            ["grok", "claude:5h", "codex"],
+            ["grok", "claude:5h", "codex:5h"],
         )
         self.assertEqual(
             usage_float_module.move_provider(
-                ["codex", "grok", "claude:5h"], "claude:5h", "codex"
+                ["codex:5h", "grok", "claude:5h"], "claude:5h", "codex:5h"
             ),
-            ["claude:5h", "codex", "grok"],
+            ["claude:5h", "codex:5h", "grok"],
         )
 
     def test_load_config_preserves_explicit_disabled_list(self) -> None:
@@ -1633,9 +1633,9 @@ class ProviderConfigTests(unittest.TestCase):
 
         self.assertEqual(
             config["provider_order"],
-            ["grok", "codex", "codex-2", "claude:fable", "claude:7d", "claude:5h", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS],
+            ["grok", "codex:7d", "codex:5h", "codex-2:7d", "codex-2:5h", "claude:fable", "claude:7d", "claude:5h", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS],
         )
-        self.assertEqual(config["providers"], ["grok", "codex", "codex-2", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS])
+        self.assertEqual(config["providers"], ["grok", "codex:7d", "codex:5h", "codex-2:7d", "codex-2:5h", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS])
         self.assertEqual(config["disabled_providers"], ["claude:fable", "claude:7d", "claude:5h"])
 
     def test_scan_providers_reports_login_state_in_saved_order(self) -> None:
@@ -1663,12 +1663,15 @@ class ProviderConfigTests(unittest.TestCase):
 
         self.assertEqual(
             [row["id"] for row in rows],
-            ["grok", "codex", "codex-2", "claude:fable", "claude:7d", "claude:5h", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS],
+            ["grok", "codex:7d", "codex:5h", "codex-2:7d", "codex-2:5h", "claude:fable", "claude:7d", "claude:5h", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS],
         )
         self.assertEqual(rows[0]["label"], "Grok")
-        self.assertEqual(rows[3]["label"], "fable 7d")
+        self.assertEqual(rows[1]["label"], "Codex 7d")
+        self.assertEqual(rows[5]["label"], "fable 7d")
         self.assertTrue(rows[0]["available"])
+        self.assertTrue(rows[1]["available"])
         self.assertFalse(rows[3]["available"])
+        self.assertFalse(rows[5]["available"])
 
     def test_discover_litellm_proxies_from_router_override_and_pi_usage(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -2244,29 +2247,29 @@ class ProviderColumnTests(unittest.TestCase):
 
     def test_resolve_provider_columns_respects_saved_two_column_assignment(self) -> None:
         all_ids = list(DEFAULT_PROVIDERS)
-        enabled = ["claude:7d", "codex", "grok"]
+        enabled = ["claude:7d", "codex:5h", "grok"]
         disabled = [pid for pid in all_ids if pid not in set(enabled)]
-        saved_cols = [["codex"], ["claude:7d", "grok", *disabled]]
+        saved_cols = [["codex:5h"], ["claude:7d", "grok", *disabled]]
         left, right = usage_float_module.resolve_provider_columns(
             enabled, disabled, all_ids, saved_cols
         )
-        self.assertEqual(left, ["codex"])
+        self.assertEqual(left, ["codex:5h"])
         self.assertEqual(right[:2], ["claude:7d", "grok"])
         self.assertEqual(set(left + right), set(all_ids))
 
     def test_move_provider_in_columns_moves_across_and_within_columns(self) -> None:
         left = ["claude:7d", "claude:5h"]
-        right = ["codex", "api-proxy"]
+        right = ["codex:5h", "api-proxy"]
         new_left, new_right = usage_float_module.move_provider_in_columns(
-            left, right, "codex", 0, 1
+            left, right, "codex:5h", 0, 1
         )
-        self.assertEqual(new_left, ["claude:7d", "codex", "claude:5h"])
+        self.assertEqual(new_left, ["claude:7d", "codex:5h", "claude:5h"])
         self.assertEqual(new_right, ["api-proxy"])
 
         reordered_left, reordered_right = usage_float_module.move_provider_in_columns(
             new_left, new_right, "claude:5h", 1, 0
         )
-        self.assertEqual(reordered_left, ["claude:7d", "codex"])
+        self.assertEqual(reordered_left, ["claude:7d", "codex:5h"])
         self.assertEqual(reordered_right, ["claude:5h", "api-proxy"])
 
 

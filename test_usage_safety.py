@@ -332,18 +332,31 @@ class UsageSafetyTests(unittest.TestCase):
             self.assertFalse(usage.collect_local_usage(['claude'])[0].available)
             direct.assert_not_called()
 
-    def test_codex_keeps_short_and_long_window_for_router_but_one_tile(self):
+    def _codex_reading(self, rate_limit):
         account = usage.CODEX_ACCOUNT_BY_ID['codex']
-        with patch.object(usage, 'codex_authorized_json', return_value=(200, {'rate_limit': {
-            'primary_window': {'used_percent': 10, 'limit_window_seconds': 18000},
-            'secondary_window': {'used_percent': 95, 'limit_window_seconds': 604800}}})), patch.object(
+        with patch.object(usage, 'codex_authorized_json', return_value=(200, {'rate_limit': rate_limit})), patch.object(
             usage, 'provider_credential_key', return_value='test-account'
         ):
-            item = usage.fetch_codex_usage(account)
+            return usage.fetch_codex_usage(account)
+
+    def test_codex_shows_its_5h_and_7d_windows_as_separate_rows(self):
+        item = self._codex_reading({
+            'primary_window': {'used_percent': 10, 'limit_window_seconds': 18000},
+            'secondary_window': {'used_percent': 95, 'limit_window_seconds': 604800}})
         self.assertEqual([(w.id, w.used_pct) for w in item.windows], [('five_hour', 10), ('usage', 95)])
-        rows = usage.iter_display_rows([item], ['codex'])
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0].used_pct, 95)
+        rows = usage.iter_display_rows([item], ['codex:7d', 'codex:5h'])
+        self.assertEqual([(r.title, r.used_pct) for r in rows], [('codex 7d', 95), ('codex 5h', 10)])
+        # A saved config from before the split still names the account alone and shows both rows.
+        self.assertEqual(len(usage.iter_display_rows([item], ['codex'])), 2)
+        self.assertEqual([r.title for r in usage.iter_display_rows([item], ['codex:5h'])], ['codex 5h'])
+
+    def test_codex_account_without_a_5h_window_shows_only_its_week(self):
+        # Like Claude Ultra: a plan whose only window is the week has no 5h row at all.
+        item = self._codex_reading({'primary_window': {'used_percent': 30, 'limit_window_seconds': 604800}})
+        self.assertEqual([(w.id, w.label) for w in item.windows], [('usage', '7d')])
+        rows = usage.iter_display_rows([item], ['codex:7d', 'codex:5h'])
+        self.assertEqual([(r.title, r.used_pct) for r in rows], [('codex', 30)])
+        self.assertEqual(usage.iter_display_rows([item], ['codex:5h']), [])
 
 
 if __name__ == '__main__':

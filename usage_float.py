@@ -236,11 +236,16 @@ CODEX_ACCOUNT_BY_ID: dict[str, CodexAccount] = {
     account.provider_id: account for account in CODEX_ACCOUNTS
 }
 
-# Claude and Antigravity share a login across several independently configurable rows.
+# Claude, Codex and Antigravity share a login across several independently configurable rows.
 CLAUDE_DISPLAY_ITEMS: tuple[str, ...] = ("claude:fable", "claude:7d", "claude:5h")
 CLAUDE_WINDOW_ITEMS: dict[str, str] = {
     "seven_day": "claude:7d",
     "five_hour": "claude:5h",
+}
+# Codex windows by id; an account without a 5h window (Pro) shows its week alone.
+CODEX_WINDOW_SUFFIXES: dict[str, str] = {
+    "usage": "7d",
+    "five_hour": "5h",
 }
 ANTIGRAVITY_WINDOW_ITEMS: dict[str, str] = {
     "gemini-weekly": "antigravity:gemini-weekly",
@@ -253,20 +258,28 @@ PROVIDER_DISPLAY_ITEMS: dict[str, tuple[str, ...]] = {
     "claude": CLAUDE_DISPLAY_ITEMS,
     "claude-2": ("claude-2:fable", "claude-2:7d", "claude-2:5h"),
     "antigravity": ANTIGRAVITY_DISPLAY_ITEMS,
+    **{
+        account.provider_id: tuple(f"{account.provider_id}:{suffix}" for suffix in CODEX_WINDOW_SUFFIXES.values())
+        for account in CODEX_ACCOUNTS
+    },
 }
 
 # Display order. A provider needs local credentials (Antigravity needs its CLI),
 # so a machine with one Codex account shows one Codex row.
 DEFAULT_PROVIDERS: tuple[str, ...] = (
-    "codex",
-    "codex-2",
+    *PROVIDER_DISPLAY_ITEMS["codex"],
+    *PROVIDER_DISPLAY_ITEMS["codex-2"],
     "grok",
     *CLAUDE_DISPLAY_ITEMS,
     *ANTIGRAVITY_DISPLAY_ITEMS,
 )
 PROVIDER_LABELS: dict[str, str] = {
     "codex": "Codex",
+    "codex:7d": "Codex 7d",
+    "codex:5h": "Codex 5h",
     "codex-2": "Codex 2",
+    "codex-2:7d": "Codex 2 7d",
+    "codex-2:5h": "Codex 2 5h",
     "grok": "Grok",
     "claude": "Claude",
     "claude:fable": "fable 7d",
@@ -311,6 +324,15 @@ def _register_claude_display_items(provider_id: str, label: str | None = None) -
         PROVIDER_LABELS[f"{provider_id}:fable"] = f"{base} fable 7d"
         PROVIDER_LABELS[f"{provider_id}:7d"] = f"{base} 7d"
         PROVIDER_LABELS[f"{provider_id}:5h"] = f"{base} 5h"
+
+
+def _register_codex_display_items(provider_id: str) -> None:
+    PROVIDER_DISPLAY_ITEMS.setdefault(
+        provider_id, tuple(f"{provider_id}:{suffix}" for suffix in CODEX_WINDOW_SUFFIXES.values())
+    )
+    base = PROVIDER_LABELS.get(provider_id, provider_id)
+    for suffix in CODEX_WINDOW_SUFFIXES.values():
+        PROVIDER_LABELS.setdefault(f"{provider_id}:{suffix}", f"{base} {suffix}")
 
 
 def discover_claude_homes() -> dict[str, Path]:
@@ -395,7 +417,16 @@ def discover_codex_accounts() -> dict[str, CodexAccount]:
     except OSError:
         pass
     CODEX_ACCOUNT_BY_ID.update(accounts)
+    for pid in accounts:
+        _register_codex_display_items(pid)
     return accounts
+
+
+def is_codex_account(provider_id: str) -> bool:
+    """A known Codex account, discovering Paseo-configured ones on first sight."""
+    if provider_id in CODEX_ACCOUNT_BY_ID:
+        return True
+    return (provider_id == "codex" or provider_id.startswith("codex-")) and provider_id in discover_codex_accounts()
 
 
 def provider_fetch_id(item: str) -> str:
@@ -403,6 +434,8 @@ def provider_fetch_id(item: str) -> str:
     if item == 'grok-bot':
         return 'grok'  # Saved runner selection uses the ordinary Grok meter.
     provider, sep, _ = item.partition(":")
+    if sep and is_codex_account(provider):
+        return provider
     if sep and (provider in PROVIDER_DISPLAY_ITEMS or is_claude_provider(provider)):
         _register_claude_display_items(provider)
         return provider
@@ -4093,7 +4126,9 @@ def _unique_provider_ids(values: Any) -> list[str]:
             pid = item.strip()
             if pid == "grok-bot":
                 continue  # Retired duplicate meter; Grok includes Bot consumption.
-            if pid and ":" not in pid and is_claude_provider(pid):
+            if pid and ":" not in pid and is_codex_account(pid):
+                _register_codex_display_items(pid)
+            elif pid and ":" not in pid and is_claude_provider(pid):
                 _register_claude_display_items(pid)
             # Legacy group entries stand for all their rows, including an
             # explicit disable of the entire group.
@@ -4126,7 +4161,9 @@ def resolve_provider_config(
     for index, must in enumerate(DEFAULT_PROVIDERS):
         if must not in known:
             previous = DEFAULT_PROVIDERS[index - 1] if index else None
-            if previous and must.startswith(previous + "-") and previous in known:
+            # A new row joins its account's rows ("codex-2:7d" after "codex:5h", "claude:7d" after "claude:fable").
+            account, previous_account = must.partition(":")[0], (previous or "").partition(":")[0]
+            if previous and previous in known and (account == previous_account or account.startswith(previous_account + "-")):
                 known.insert(known.index(previous) + 1, must)
             else:
                 known.append(must)
@@ -5857,6 +5894,12 @@ def codex_authorized_json(
     return status, payload
 
 
+def codex_window_label(seconds: Any) -> str:
+    """The window's length as read: 5h, 7d, or minutes for anything else."""
+    seconds = int(seconds or 0)
+    return '5h' if seconds == 18000 else '7d' if seconds == 604800 else f'usage-{seconds // 60}m'
+
+
 def fetch_codex_usage(account: CodexAccount) -> ProviderUsage:
     source_key = provider_credential_key(account.provider_id)
     status, payload = codex_authorized_json(CODEX_USAGE_URL, home=account.home)
@@ -5877,7 +5920,7 @@ def fetch_codex_usage(account: CodexAccount) -> ProviderUsage:
         seconds = window.get('limit_window_seconds') or default_seconds
         wid = 'five_hour' if seconds == 18000 else 'usage' if seconds == 604800 else f'usage-{int(seconds / 60)}m'
         windows.append(UsageWindow(
-            id=wid, label='5h' if seconds == 18000 else '7d' if seconds == 604800 else wid,
+            id=wid, label=codex_window_label(seconds),
             used_pct=float(used), resets_at=_iso_timestamp(window.get('reset_at')),
         ))
     if not windows:
@@ -7336,7 +7379,7 @@ def fetch_pi_usage(provider_id: str = "pi") -> ProviderUsage:
         windows.append(
             UsageWindow(
                 id="secondary",
-                label="7d",
+                label=codex_window_label(w.get("limit_window_seconds") or 604800),
                 used_pct=float(w.get("used_percent", 0)),
                 resets_at=_epoch_to_iso(w.get("reset_at")),
             )
@@ -7346,7 +7389,7 @@ def fetch_pi_usage(provider_id: str = "pi") -> ProviderUsage:
         windows.append(
             UsageWindow(
                 id="primary",
-                label="5h",
+                label=codex_window_label(w.get("limit_window_seconds") or 18000),
                 used_pct=float(w.get("used_percent", 0)),
                 resets_at=_epoch_to_iso(w.get("reset_at")),
             )
@@ -7417,8 +7460,9 @@ def provider_available(provider_id: str) -> bool:
 def discovered_default_providers() -> list[str]:
     items = list(DEFAULT_PROVIDERS)
     for pid in discover_codex_accounts():
-        if pid not in items:
-            items.append(pid)
+        for sub in PROVIDER_DISPLAY_ITEMS[pid]:
+            if sub not in items:
+                items.append(sub)
     for pid in discover_claude_homes():
         if pid == "claude":
             continue
@@ -7821,6 +7865,9 @@ def display_item(row: DisplayRow) -> str | None:
     """
     if row.provider_id == "antigravity":
         return ANTIGRAVITY_WINDOW_ITEMS.get(row.window_id)
+    if row.provider_id in CODEX_ACCOUNT_BY_ID:
+        suffix = CODEX_WINDOW_SUFFIXES.get(row.window_id)
+        return f"{row.provider_id}:{suffix}" if suffix else None
     if not is_claude_provider(row.provider_id):
         return row.provider_id
     if row.window_id.startswith("weekly_"):
@@ -7991,11 +8038,8 @@ def _expand_display_rows(providers: list[ProviderUsage]) -> list[DisplayRow]:
 
         if p.windows:
             shown = p.windows
-            if p.provider_id in CODEX_ACCOUNT_BY_ID:
-                # Retain one tile, but expose both constraints to the router.
-                shown = [max(shown, key=lambda w: w.used_pct if w.used_pct is not None else -1)]
             multi = len(shown) > 1
-            # Like Codex's single tile, an account whose only general window is the week (Claude Ultra has no 5h)
+            # An account whose only general window is the week (Claude Ultra and Codex Pro have no 5h)
             # is titled by its name alone; model-scoped weeks (fable 7d) keep their own label.
             labelled = len([w for w in shown if not w.id.startswith("weekly_")]) > 1
             # Allow 5h + 7d + scoped model weeks (e.g. fable 7d)
