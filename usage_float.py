@@ -8307,6 +8307,26 @@ def display_item(row: DisplayRow) -> str | None:
     return item.replace("claude:", f"{row.provider_id}:") if item else None
 
 
+def items_without_window(providers: list[ProviderUsage]) -> dict[str, tuple[str, ...]]:
+    """Settings entries the float cannot show because the account's latest reading lacks that window.
+
+    Maps each such entry to the labels of the windows the reading does have (for the hover). Decided
+    from the rows the reading expands to, so it matches the float. An account with no reading (none
+    yet, or a failed fetch without windows) is left out: nothing is known about its windows.
+    """
+    missing: dict[str, tuple[str, ...]] = {}
+    for provider in providers:
+        items = PROVIDER_DISPLAY_ITEMS.get(provider.provider_id)
+        if not items or not provider.windows:
+            continue
+        present = {display_item(row) for row in _expand_display_rows([provider])}
+        labels = tuple(str(w.label or w.id) for w in provider.windows)
+        for item in items:
+            if item not in present:
+                missing[item] = labels
+    return missing
+
+
 # A Magpie account is read only when asked, so a reading this old is marked on its hover line.
 POOL_MEMBER_STALE_SECONDS = 1800
 # An account this little spent gives nothing back when it resets, so its reset is not the pool's next refill.
@@ -11745,6 +11765,13 @@ def run_ui() -> None:
         # Avoid SetWindowPos(...SWP_SHOWWINDOW) on every refresh; it needlessly
         # invalidates the full-screen surface on mixed-DPI monitor layouts.
         render(relayout=not state.get("panel_active"))
+        # An open Settings window re-checks which rows the new readings can show.
+        on_readings = state.get("settings_readings_changed")
+        if callable(on_readings):
+            try:
+                on_readings()
+            except Exception:
+                pass
 
     # Relative time ticker
     def tick_footer() -> None:
@@ -12164,18 +12191,25 @@ def run_ui() -> None:
         ]
         main_tab_btns: dict[str, tk.Label] = {}
         active_main_tab: dict[str, Any] = {"title": initial_tab, "initialized": False}
+        # Tabs not shown at open are built the first time they are selected (see build_*_tab below).
+        lazy_tab_builders: dict[str, Callable[[], None]] = {}
 
         def select_main_tab(title: str) -> None:
             if active_main_tab.get("initialized") and active_main_tab["title"] == title:
                 return
             active_main_tab["title"] = title
             active_main_tab["initialized"] = True
-            if title == "动态壁纸":
-                # First visit to the wallpaper tab: fetch mpv in the background if it is missing.
-                starter = wp_subtab_state.get("start_mpv_download")
-                if callable(starter):
-                    win.after_idle(lambda: starter(retry=False))
             with _freeze_redraw(content_host):
+                build_tab = lazy_tab_builders.pop(title, None)
+                if build_tab is not None:
+                    build_tab()
+                if title == "动态壁纸" and build_tab is None:
+                    # Revisiting the built wallpaper tab: fetch mpv in the background if it is
+                    # still missing. A first visit builds the tab, and build_wallpaper_tab starts
+                    # the download itself once its mpv row exists.
+                    starter = wp_subtab_state.get("start_mpv_download")
+                    if callable(starter):
+                        win.after_idle(lambda: starter(retry=False))
                 for tab_title, frame in main_tabs:
                     btn = main_tab_btns.get(tab_title)
                     if tab_title == title:
@@ -12709,6 +12743,41 @@ def run_ui() -> None:
             render_provider_tree()
             return "break"
 
+        badge_tip: dict[str, Any] = {"win": None}
+
+        def show_badge_tip(event: Any, pid: str) -> None:
+            rec = bar_records.get(pid)
+            text = str((rec or {}).get("tip") or "")
+            if not text or provider_drag.get("item"):
+                return
+            tip = badge_tip.get("win")
+            try:
+                if tip is None or not tip.winfo_exists():
+                    tip = tk.Toplevel(win)
+                    tip.withdraw()
+                    tip.overrideredirect(True)
+                    tip.attributes("-topmost", True)
+                    label = tk.Label(
+                        tip, justify="left", bg="#1f2937", fg="#f9fafb",
+                        font=settings_font_small, padx=10, pady=6, wraplength=360,
+                    )
+                    label.pack()
+                    tip._label = label  # type: ignore[attr-defined]
+                    badge_tip["win"] = tip
+                tip._label.configure(text=text)  # type: ignore[attr-defined]
+                tip.geometry(f"+{event.x_root + 12}+{event.y_root + 14}")
+                tip.deiconify()
+            except Exception:
+                pass
+
+        def hide_badge_tip() -> None:
+            tip = badge_tip.get("win")
+            try:
+                if tip is not None and tip.winfo_exists():
+                    tip.withdraw()
+            except Exception:
+                pass
+
         def _ensure_bar_record(pid: str) -> dict[str, Any]:
             rec = bar_records.get(pid)
             if rec is not None and rec["bar"].winfo_exists():
@@ -12769,10 +12838,12 @@ def run_ui() -> None:
                 "<ButtonPress-1>",
                 lambda ev, item_id=pid: start_bar_drag(ev, item_id, toggle_only=True),
             )
+            sub_lbl.bind("<Enter>", lambda ev, item_id=pid: show_badge_tip(ev, item_id), add="+")
+            sub_lbl.bind("<Leave>", lambda _ev: hide_badge_tip(), add="+")
             for drag_w in (bar, title_lbl, sub_lbl, grip_lbl):
                 drag_w.bind(
                     "<ButtonPress-1>",
-                    lambda ev, item_id=pid: start_bar_drag(ev, item_id, toggle_only=False),
+                    lambda ev, item_id=pid: (hide_badge_tip(), start_bar_drag(ev, item_id, toggle_only=False))[1],
                 )
                 drag_w.bind("<B1-Motion>", motion_bar_drag)
                 drag_w.bind("<ButtonRelease-1>", release_bar_drag)
@@ -12789,6 +12860,7 @@ def run_ui() -> None:
                 "grip": grip_lbl,
                 "sig": None,
                 "cell": None,
+                "tip": "",
             }
             bind_board_list_wheel(bar)
             bar_records[pid] = rec
@@ -12806,6 +12878,7 @@ def run_ui() -> None:
                     rid = str(row.get("id") or "")
                     if rid:
                         scanned_cache[rid] = row
+                state["provider_scan_cache"] = dict(scanned_cache)
             elif not scanned_cache:
                 for row in scan_providers(enabled_providers, provider_order):
                     rid = str(row.get("id") or "")
@@ -12814,6 +12887,8 @@ def run_ui() -> None:
 
             enabled_set = set(enabled_providers)
             dragging_id = provider_drag.get("item")
+            # Rows the float cannot show: the account's latest reading has no such window.
+            windowless = items_without_window(list(state.get("providers") or []))
 
             for col_idx, col_list in enumerate((left_col_items, right_col_items)):
                 enabled_in_col = sum(1 for pid in col_list if pid in enabled_set)
@@ -12831,7 +12906,9 @@ def run_ui() -> None:
                     is_dragging = pid == dragging_id
                     available = bool(info.get("available"))
                     lbl_text = str(info.get("label") or provider_label(pid))
-                    sig = (checked, is_dragging, available, lbl_text)
+                    has_windows = windowless.get(pid) if available else None
+                    no_window = has_windows is not None
+                    sig = (checked, is_dragging, available, lbl_text, has_windows)
                     rec = _ensure_bar_record(pid)
                     if rec.get("sig") == sig:
                         continue
@@ -12847,7 +12924,7 @@ def run_ui() -> None:
                         card_bg = S_BAR_ON_BG
                         border_col = S_BAR_ON_BORDER
                         title_fg = S_TEXT
-                        meta_fg = S_ACCENT if available else S_MUTED
+                        meta_fg = S_ACCENT if available and not no_window else S_MUTED
                         check_fg = S_ACCENT
                     else:
                         card_bg = S_BAR_OFF_BG
@@ -12858,6 +12935,8 @@ def run_ui() -> None:
 
                     if is_dragging:
                         badge_text = _tr("拖动中", 'Dragging')
+                    elif checked and no_window:
+                        badge_text = _tr("无此窗口", 'No such window')
                     elif checked:
                         badge_text = _tr("已就绪", 'Ready') if available else _tr("未检测", 'Not Detected')
                     else:
@@ -12888,6 +12967,13 @@ def run_ui() -> None:
                         text=badge_text,
                         fg=meta_fg,
                         bg=card_bg,
+                    )
+                    rec["tip"] = (
+                        _tr("该账号最新读数没有这个窗口，悬浮窗不显示此行；窗口恢复后自动显示。现有窗口：{0}",
+                            "This account's latest reading has no such window, so the float shows no row "
+                            "for it; it shows again when the window comes back. Windows read: {0}").format(
+                            ", ".join(has_windows) if has_windows else "—")
+                        if no_window and checked and not is_dragging else ""
                     )
 
             cols_now = (tuple(left_col_items), tuple(right_col_items))
@@ -12920,7 +13006,12 @@ def run_ui() -> None:
                                     )
                                     rec["cell"] = target_cell
                     sync_board_scrollregion()
-                _refresh_slot_bounds(redraw=False)
+                # Slot bounds only steer a drag (start_bar_drag measures them); measuring here forced a full
+                # geometry pass on every render, including the initial build of a still-hidden window.
+                if provider_drag.get("item"):
+                    _refresh_slot_bounds(redraw=False)
+                else:
+                    slot_bounds.clear()
 
             available_count = sum(1 for row in scanned_cache.values() if row.get("available"))
             text = (
@@ -12998,7 +13089,55 @@ def run_ui() -> None:
             font=settings_font_badge,
         ).pack(side="right")
 
+        def seed_provider_scan() -> None:
+            """Fill the board from what is already known, so opening never waits on credential checks.
+
+            The last scan (this process) is reused as is; before any scan an account counts as
+            detected when it already has a reading. scan_in_background then corrects both.
+            """
+            last = state.get("provider_scan_cache") or {}
+            read = {p.provider_id for p in state.get("providers") or [] if p.windows or p.summary}
+            for pid in dict.fromkeys([*left_col_items, *right_col_items, *provider_order]):
+                row = last.get(pid)
+                scanned_cache[pid] = dict(row) if isinstance(row, dict) else {
+                    "id": pid,
+                    "label": provider_label(pid),
+                    "available": provider_fetch_id(pid) in read,
+                }
+
+        def scan_in_background() -> None:
+            configured, order = list(enabled_providers), list(provider_order)
+
+            def work() -> None:
+                try:
+                    rows = scan_providers(configured, order)
+                except Exception:
+                    return
+
+                def deliver() -> None:
+                    if state.get("settings_win") is win and win.winfo_exists():
+                        render_provider_tree(rows)
+                    else:
+                        state["provider_scan_cache"] = {
+                            str(row.get("id")): row for row in rows if row.get("id")
+                        }
+
+                try:
+                    root.after(0, deliver)
+                except Exception:
+                    pass
+
+            threading.Thread(target=work, daemon=True, name="settings-provider-scan").start()
+
+        seed_provider_scan()
         render_provider_tree()
+        scan_in_background()
+
+        def on_readings_changed() -> None:
+            if state.get("settings_win") is win and win.winfo_exists():
+                render_provider_tree()
+
+        state["settings_readings_changed"] = on_readings_changed
 
         # Timezone card in Tab 1
         tz_card = make_card(providers_pad, pady=(0, 0), padx_inner=14, pady_inner=10)
@@ -13051,713 +13190,253 @@ def run_ui() -> None:
         timezone_combo.bind("<Return>", persist_timezone)
         timezone_combo.bind("<FocusOut>", persist_timezone)
 
-        # ── Tab 2: 副屏 ──
-        settings_monitors = _enumerate_monitors()
-        monitor_by_label = {_monitor_label(monitor): monitor for monitor in settings_monitors}
-        selected_monitor = _choose_panel_monitor(
-            settings_monitors,
-            state.get("monitor_device"),
-            state.get("monitor_id"),
-        )
-        if selected_monitor is None:
-            selected_monitor = _choose_panel_monitor(settings_monitors, None)
-        selected_monitor_label = (
-            _monitor_label(selected_monitor) if selected_monitor is not None else _tr("未检测到显示器", 'No monitors detected')
-        )
-
-        display_card = make_card(display_pad, pady=(0, 10))
-        tk.Label(
-            display_card,
-            text=_tr("目标显示器与整屏仪表盘", 'Monitor & Full-Screen Dashboard'),
-            fg=S_TEXT,
-            bg=S_CARD_BG,
-            font=settings_font_section,
-            anchor="w",
-        ).pack(fill="x", pady=(0, 6))
-
-        monitor_var = tk.StringVar(value=selected_monitor_label)
-
-        def selected_device() -> str | None:
-            selected = monitor_by_label.get(monitor_var.get())
-            return selected.device if selected is not None else None
+        # Only the tab shown at open is built then; each other tab is built the first time it is
+        # selected. Names that on_close or another tab needs start as None until their tab exists.
+        persist_shortcut_from_ui: Callable[[], None] | None = None
+        panel_mode_var: tk.BooleanVar | None = None
+        commit_all_directory_weights: Callable[[], None] | None = None
+        apply_wallpaper_image_seconds: Callable[..., Any] | None = None
+        size_var: tk.IntVar | None = None
+        sync_floating_controls: Callable[[bool], None] | None = None
 
         def place_settings_window() -> None:
             place_settings_on_primary(win)
 
-        panel_mode_var = tk.BooleanVar(
-            value=state.get("display_mode") == DISPLAY_MODE_PANEL
-        )
+        def floating_controls_requested() -> bool:
+            if panel_mode_var is not None:
+                return bool(panel_mode_var.get())
+            return state.get("display_mode") == DISPLAY_MODE_PANEL
 
-        def update_panel_status() -> None:
-            active = bool(state.get("panel_active"))
-            requested = bool(panel_mode_var.get())
-            if requested and active:
-                panel_status.configure(
-                    text=_tr("● 已铺满所选副屏；在副屏任意位置右键可随时打开菜单。", '● Dashboard fills the selected display. Right-click anywhere for the menu.'),
-                    fg=S_ACCENT,
-                )
-            elif requested:
-                panel_status.configure(
-                    text=_tr("● 所选副屏未连接，当前临时回退为桌面悬浮窗。", '● Selected display disconnected. Using the floating HUD temporarily.'),
-                    fg="#fbbf24",
-                )
-            else:
-                panel_status.configure(
-                    text=_tr("开启后将自动铺满所选副屏；拔下副屏时自动回到桌面悬浮窗。", 'Fills the selected display. Returns to the floating HUD when disconnected.'),
-                    fg=S_MUTED,
-                )
-            try:
-                scale.configure(state="disabled" if requested else "normal")
-                size_label.configure(text=_tr("自动", 'Auto') if requested else f"{size_var.get()} pt")
-                chk.configure(state="disabled" if requested else "normal")
-                opacity_state = "disabled" if requested else "normal"
-                bg_op_scale.configure(state=opacity_state)
-                tx_op_scale.configure(state=opacity_state)
-                bg_op_lbl.configure(text=_tr("固定黑底", 'Solid black') if requested else f"{bg_op_var.get()}%")
-                tx_op_lbl.configure(text=_tr("固定清晰", 'Full opacity') if requested else f"{tx_op_var.get()}%")
-                opacity_hint.configure(
-                    text=(
-                        _tr("专用副屏使用不透明黑底和清晰文字；上方字号与透明度设置仅用于桌面悬浮窗。", 'Aux Display uses a solid black background and opaque text. Font and opacity controls apply to the floating HUD.')
-                        if requested
-                        else _tr("拖动滑块即可实时预览。数值越高越不透明，底板与文字互不影响。", 'Drag sliders to preview. Higher values are more opaque; background and text are independent.')
-                    )
-                )
-            except Exception:
-                pass
-
-        def on_panel_mode_toggle() -> None:
-            requested = bool(panel_mode_var.get())
-            device = selected_device()
-            if requested and device is None:
-                fallback = _choose_panel_monitor(_enumerate_monitors(), None)
-                device = fallback.device if fallback is not None else None
-            set_display_mode(
-                DISPLAY_MODE_PANEL if requested else DISPLAY_MODE_FLOAT,
-                device,
-                persist=True,
+        def build_display_tab() -> None:
+            nonlocal persist_shortcut_from_ui, panel_mode_var
+            # ── Tab 2: 副屏 ──
+            settings_monitors = _enumerate_monitors()
+            monitor_by_label = {_monitor_label(monitor): monitor for monitor in settings_monitors}
+            selected_monitor = _choose_panel_monitor(
+                settings_monitors,
+                state.get("monitor_device"),
+                state.get("monitor_id"),
             )
-            update_panel_status()
-            win.after_idle(place_settings_window)
-
-        panel_checkbox = tk.Checkbutton(
-            display_card,
-            text=_tr("启用专用副屏模式（整屏双列仪表盘）", 'Enable Dedicated Aux Display Mode'),
-            variable=panel_mode_var,
-            command=on_panel_mode_toggle,
-            bg=S_CARD_BG,
-            fg=S_TEXT,
-            activebackground=S_CARD_BG,
-            activeforeground=S_TEXT,
-            selectcolor=S_INPUT_BG,
-            font=settings_font,
-            anchor="w",
-            bd=0,
-            highlightthickness=0,
-        )
-        panel_checkbox.pack(fill="x", pady=(0, 8))
-
-        def on_monitor_selected(_event: Any = None) -> None:
-            label = monitor_var.get()
-            monitor = monitor_by_label.get(label)
-            if monitor is None:
-                return
-            state["monitor_device"] = monitor.device
-            state["monitor_id"] = monitor.monitor_id or state.get("monitor_id")
-            cfg["monitor_device"] = monitor.device
-            cfg["monitor_id"] = state.get("monitor_id")
-            if panel_mode_var.get():
-                set_display_mode(DISPLAY_MODE_PANEL, monitor.device, persist=True)
-            else:
-                save_config(cfg)
-            update_panel_status()
-            win.after_idle(place_settings_window)
-
-        mon_select_row = tk.Frame(display_card, bg=S_CARD_BG)
-        mon_select_row.pack(fill="x", pady=(0, 6))
-        tk.Label(
-            mon_select_row,
-            text=_tr("副屏显示器", 'Aux Display Monitor'),
-            fg=S_MUTED,
-            bg=S_CARD_BG,
-            font=settings_font_small,
-            width=10,
-            anchor="w",
-        ).pack(side="left")
-        monitor_combo = ttk.Combobox(
-            mon_select_row,
-            textvariable=monitor_var,
-            values=tuple(monitor_by_label.keys()) or (_tr("未检测到显示器", 'No monitors detected'),),
-            state="readonly",
-            font=settings_font_small,
-        )
-        monitor_combo.pack(side="left", fill="x", expand=True)
-        monitor_combo.bind("<<ComboboxSelected>>", on_monitor_selected)
-
-        panel_status = tk.Label(
-            display_card,
-            text="",
-            fg=S_MUTED,
-            bg=S_CARD_BG,
-            font=settings_font_small,
-            anchor="w",
-            justify="left",
-            wraplength=510,
-        )
-        panel_status.pack(fill="x", pady=(4, 0))
-
-        # Shortcut card in Tab 2
-        shortcut_card = make_card(display_pad, pady=(0, 0))
-        key_labels = (("Ctrl", "ctrl"), ("Shift", "shift"), ("Alt", "alt"), ("Win", "win"))
-        key_label_to_id = {label: key for label, key in key_labels}
-        key_id_to_label = {key: label for label, key in key_labels}
-        shortcut_enabled_var = tk.BooleanVar(value=bool(state.get("shortcut_enabled", True)))
-        shortcut_mode_var = tk.StringVar(
-            value=_normalize_shortcut_mode(state.get("shortcut_mode"))
-        )
-        shortcut_key_var = tk.StringVar(
-            value=key_id_to_label.get(
-                _normalize_shortcut_key(state.get("shortcut_key")), "Ctrl"
+            if selected_monitor is None:
+                selected_monitor = _choose_panel_monitor(settings_monitors, None)
+            selected_monitor_label = (
+                _monitor_label(selected_monitor) if selected_monitor is not None else _tr("未检测到显示器", 'No monitors detected')
             )
-        )
-        shortcut_count_var = tk.StringVar(
-            value=str(_normalize_shortcut_repeat_count(state.get("shortcut_repeat_count")))
-        )
-        shortcut_combo_keys = list(
-            state.get("shortcut_combo") or SHORTCUT_COMBO_DEFAULT
-        )
-        shortcut_combo_var = tk.StringVar(
-            value=_format_shortcut_combo(shortcut_combo_keys)
-        )
 
-        def persist_shortcut_from_ui() -> None:
-            apply_shortcut_config(
-                enabled=bool(shortcut_enabled_var.get()),
-                mode=shortcut_mode_var.get(),
-                key=key_label_to_id.get(shortcut_key_var.get(), "ctrl"),
-                repeat_count=_normalize_shortcut_repeat_count(shortcut_count_var.get()),
-                combo=shortcut_combo_keys,
-                persist=True,
-            )
-            shortcut_count_var.set(str(state["shortcut_repeat_count"]))
-            shortcut_combo_var.set(_format_shortcut_combo(state["shortcut_combo"]))
-            update_shortcut_controls()
-
-        def update_shortcut_controls() -> None:
-            enabled = bool(shortcut_enabled_var.get())
-            mode = _normalize_shortcut_mode(shortcut_mode_var.get())
-            repeat_state = "normal" if enabled and mode == SHORTCUT_MODE_REPEAT else "disabled"
-            combo_state = "normal" if enabled and mode == SHORTCUT_MODE_COMBO else "disabled"
-            try:
-                for widget in shortcut_repeat_widgets:
-                    if isinstance(widget, ttk.Combobox):
-                        widget.configure(state="readonly" if repeat_state == "normal" else "disabled")
-                    else:
-                        widget.configure(state=repeat_state)
-                for widget in shortcut_combo_widgets:
-                    widget.configure(state=combo_state)
-                for widget in shortcut_mode_widgets:
-                    widget.configure(state="normal" if enabled else "disabled")
-            except Exception:
-                pass
-
-        tk.Label(
-            shortcut_card,
-            text=_tr("全局切换快捷键", 'Global Toggle Shortcut'),
-            fg=S_TEXT,
-            bg=S_CARD_BG,
-            font=settings_font_section,
-            anchor="w",
-        ).pack(fill="x", pady=(0, 4))
-        tk.Checkbutton(
-            shortcut_card,
-            text=_tr("启用全局快捷键，一键切换「用量面板 / 动态壁纸」", 'Enable a global shortcut to toggle Usage Panel / Live Wallpaper'),
-            variable=shortcut_enabled_var,
-            command=persist_shortcut_from_ui,
-            bg=S_CARD_BG,
-            fg=S_TEXT,
-            activebackground=S_CARD_BG,
-            activeforeground=S_TEXT,
-            selectcolor=S_INPUT_BG,
-            font=settings_font,
-            anchor="w",
-            bd=0,
-            highlightthickness=0,
-        ).pack(fill="x", pady=(0, 6))
-
-        shortcut_mode_widgets: list[Any] = []
-        shortcut_repeat_widgets: list[Any] = []
-        shortcut_combo_widgets: list[Any] = []
-
-        mode_row = tk.Frame(shortcut_card, bg=S_CARD_BG)
-        mode_row.pack(fill="x", pady=(0, 6))
-        repeat_radio = tk.Radiobutton(
-            mode_row,
-            text=_tr("连按修饰键", 'Repeat Key'),
-            value=SHORTCUT_MODE_REPEAT,
-            variable=shortcut_mode_var,
-            command=persist_shortcut_from_ui,
-            bg=S_CARD_BG,
-            fg=S_TEXT,
-            activebackground=S_CARD_BG,
-            activeforeground=S_TEXT,
-            selectcolor=S_INPUT_BG,
-            font=settings_font_small,
-            anchor="w",
-            bd=0,
-            highlightthickness=0,
-        )
-        repeat_radio.pack(side="left")
-        combo_radio = tk.Radiobutton(
-            mode_row,
-            text=_tr("自定义组合键", 'Key Combo'),
-            value=SHORTCUT_MODE_COMBO,
-            variable=shortcut_mode_var,
-            command=persist_shortcut_from_ui,
-            bg=S_CARD_BG,
-            fg=S_TEXT,
-            activebackground=S_CARD_BG,
-            activeforeground=S_TEXT,
-            selectcolor=S_INPUT_BG,
-            font=settings_font_small,
-            anchor="w",
-            bd=0,
-            highlightthickness=0,
-        )
-        combo_radio.pack(side="left", padx=(16, 0))
-        shortcut_mode_widgets.extend((repeat_radio, combo_radio))
-
-        repeat_row = tk.Frame(shortcut_card, bg=S_CARD_BG)
-        repeat_row.pack(fill="x", pady=(0, 6))
-        tk.Label(
-            repeat_row,
-            text=_tr("修饰键", 'Modifier Key'),
-            fg=S_MUTED,
-            bg=S_CARD_BG,
-            font=settings_font_small,
-        ).pack(side="left")
-        key_combo = ttk.Combobox(
-            repeat_row,
-            textvariable=shortcut_key_var,
-            values=tuple(label for label, _key in key_labels),
-            state="readonly",
-            width=8,
-            font=settings_font_small,
-        )
-        key_combo.pack(side="left", padx=(6, 16))
-        key_combo.bind("<<ComboboxSelected>>", lambda _e: persist_shortcut_from_ui())
-        tk.Label(
-            repeat_row,
-            text=_tr("连按次数", 'Repeat Count'),
-            fg=S_MUTED,
-            bg=S_CARD_BG,
-            font=settings_font_small,
-        ).pack(side="left")
-        count_spin = tk.Spinbox(
-            repeat_row,
-            from_=SHORTCUT_REPEAT_COUNT_MIN,
-            to=SHORTCUT_REPEAT_COUNT_MAX,
-            width=4,
-            textvariable=shortcut_count_var,
-            command=persist_shortcut_from_ui,
-            font=settings_font_small,
-            justify="right",
-            bg=S_INPUT_BG,
-            fg=S_TEXT,
-            insertbackground=S_TEXT,
-            buttonbackground=S_BTN_BG,
-            relief="flat",
-            bd=0,
-            highlightthickness=1,
-            highlightbackground=S_CARD_BORDER,
-        )
-        count_spin.pack(side="left", padx=(6, 0))
-        count_spin.bind("<FocusOut>", lambda _event: persist_shortcut_from_ui())
-        count_spin.bind("<Return>", lambda _event: persist_shortcut_from_ui())
-        shortcut_repeat_widgets.extend((key_combo, count_spin))
-
-        combo_row = tk.Frame(shortcut_card, bg=S_CARD_BG)
-        combo_row.pack(fill="x", pady=(0, 6))
-        combo_label = tk.Label(
-            combo_row,
-            textvariable=shortcut_combo_var,
-            fg=S_TEXT,
-            bg=S_INPUT_BG,
-            font=settings_font_small,
-            anchor="w",
-            padx=10,
-            pady=5,
-        )
-        combo_label.pack(side="left", fill="x", expand=True)
-
-        def start_combo_capture() -> None:
-            if get_async_key_state is None:
-                shortcut_combo_var.set(_tr("当前系统无法录制快捷键", 'Shortcut recording is unavailable on this system'))
-                return
-            state["shortcut_capture"] = True
-            shortcut_combo_var.set(_tr("请按下组合键…", 'Press a key combination…'))
-            seen: list[str] = []
-
-            def finish(keys: list[str]) -> None:
-                state["shortcut_capture"] = False
-                if len(keys) >= 2:
-                    shortcut_combo_keys[:] = _normalize_shortcut_combo(keys)
-                    persist_shortcut_from_ui()
-                else:
-                    shortcut_combo_var.set(_format_shortcut_combo(shortcut_combo_keys))
-
-            def poll_capture(remaining: int) -> None:
-                if not state.get("shortcut_capture"):
-                    return
-                down = _shortcut_keys_currently_down(get_async_key_state)
-                if down:
-                    seen[:] = down
-                elif seen:
-                    finish(list(seen))
-                    return
-                if remaining <= 0:
-                    finish(list(seen))
-                    return
-                win.after(40, lambda: poll_capture(remaining - 1))
-
-            win.after(200, lambda: poll_capture(150))
-
-        capture_btn = make_button(
-            combo_row,
-            _tr("录制组合键", 'Record Key Combo'),
-            start_combo_capture,
-            small=True,
-            padx=10,
-            pady=4,
-        )
-        capture_btn.pack(side="left", padx=(8, 0))
-        shortcut_combo_widgets.extend((combo_label, capture_btn))
-
-        tk.Label(
-            shortcut_card,
-            text=_tr("连按默认两次 Ctrl；组合键按下后立即切换。仅在专用副屏模式下生效，Ctrl+C 等正常组合键不会误触。", 'Default: press Ctrl twice. Key combos toggle immediately. Only active in Aux Display mode; normal combos such as Ctrl+C are ignored.'),
-            fg=S_MUTED,
-            bg=S_CARD_BG,
-            font=settings_font_small,
-            anchor="w",
-            wraplength=510,
-            justify="left",
-        ).pack(fill="x")
-        update_shortcut_controls()
-
-        # ── Tab 3: 动态壁纸 ──
-        wallpaper_folders = list(state.get("wallpaper_folders") or [])
-        wallpaper_disabled_folders = list(
-            state.get("wallpaper_disabled_folders") or []
-        )
-        wallpaper_folder_depths = _normalize_wallpaper_folder_depths(
-            state.get("wallpaper_folder_depths"),
-            wallpaper_folders,
-        )
-        wallpaper_image_seconds_var = tk.StringVar(
-            value=str(int(state["wallpaper_image_seconds"]))
-        )
-        wallpaper_audio_var = tk.BooleanVar(
-            value=bool(state.get("wallpaper_audio", True))
-        )
-        wallpaper_random_mode_var = tk.StringVar(
-            value=_normalize_wallpaper_random_mode(
-                state.get("wallpaper_random_mode")
-            )
-        )
-        settings_media_files: list[Path] = []
-        weight_vars: dict[str, tk.StringVar] = {}
-        depth_vars: dict[str, tk.StringVar] = {}
-
-        def apply_wallpaper_random_mode() -> None:
-            mode = _normalize_wallpaper_random_mode(wallpaper_random_mode_var.get())
-            wallpaper_random_mode_var.set(mode)
-            changed = mode != state.get("wallpaper_random_mode")
-            state["wallpaper_random_mode"] = mode
-            cfg["wallpaper_random_mode"] = mode
-            save_config(cfg)
-            if not changed:
-                return
-            if state.get("wallpaper_active"):
-                set_wallpaper_active(False)
-                set_wallpaper_active(True)
-            else:
-                _clear_wallpaper_state()
-                _schedule_background_wallpaper_prepare()
-
-        dirs_card = make_card(
-            directories_pad,
-            pady=(0, 8),
-            expand=True,
-            fill="both",
-        )
-        dirs_hdr = tk.Frame(dirs_card, bg=S_CARD_BG)
-        dirs_hdr.pack(fill="x", pady=(0, 2))
-        tk.Label(
-            dirs_hdr,
-            text=_tr("媒体目录与递归层数", 'Media Folders & Recursion Depth'),
-            fg=S_TEXT,
-            bg=S_CARD_BG,
-            font=settings_font_section,
-            anchor="w",
-        ).pack(side="left")
-        tk.Label(
-            dirs_card,
-            text=_tr("添加目录后立即生效并在后台慢速建立缓存索引；可为每个目录设置子目录递归层数（用于「随机权重」分组显示）。", 'Folders take effect immediately and are indexed slowly in the background. Set recursion depth per folder to group Random Weights.'),
-            fg=S_MUTED,
-            bg=S_CARD_BG,
-            font=settings_font_small,
-            anchor="w",
-            justify="left",
-            wraplength=510,
-        ).pack(fill="x", pady=(0, 8))
-
-        folder_list_frame = tk.Frame(
-            dirs_card,
-            bg=S_COL_BG,
-            highlightthickness=0,
-            bd=0,
-        )
-        folder_list_frame.pack(fill="both", expand=True)
-        folder_canvas = tk.Canvas(
-            folder_list_frame,
-            bg=S_COL_BG,
-            highlightthickness=0,
-            bd=0,
-            height=210,
-        )
-        folder_scrollbar = ttk.Scrollbar(
-            folder_list_frame,
-            orient="vertical",
-            command=folder_canvas.yview,
-            style="Vertical.TScrollbar",
-        )
-        folder_scrollbar.pack(side="right", fill="y")
-        folder_canvas.pack(side="left", fill="both", expand=True)
-        folder_canvas.configure(yscrollcommand=folder_scrollbar.set)
-        folder_rows = tk.Frame(folder_canvas, bg=S_COL_BG, padx=6, pady=6)
-        folder_canvas_window = folder_canvas.create_window(
-            (0, 0), window=folder_rows, anchor="nw"
-        )
-        sync_folder_scrollregion, scroll_folder_list = _bind_scrollable_canvas(
-            folder_canvas,
-            folder_rows,
-            folder_canvas_window,
-        )
-
-        def bind_folder_list_wheel(widget: Any) -> None:
-            widget.bind("<MouseWheel>", scroll_folder_list)
-            for child in widget.winfo_children():
-                bind_folder_list_wheel(child)
-
-        bind_folder_list_wheel(folder_list_frame)
-
-        folder_button_row = tk.Frame(dirs_card, bg=S_CARD_BG)
-        folder_button_row.pack(fill="x", pady=(8, 4))
-        folder_status = tk.Label(
-            dirs_card,
-            text="",
-            fg=S_MUTED,
-            bg=S_CARD_BG,
-            font=settings_font_small,
-            anchor="w",
-            justify="left",
-            wraplength=510,
-        )
-        folder_status.pack(fill="x")
-
-        mpv_row = tk.Frame(dirs_card, bg=S_CARD_BG)
-        mpv_status_lbl = tk.Label(
-            mpv_row,
-            text="",
-            fg=S_MUTED,
-            bg=S_CARD_BG,
-            font=settings_font_small,
-            anchor="w",
-            justify="left",
-            wraplength=400,
-        )
-        mpv_status_lbl.pack(side="left", fill="x", expand=True)
-        mpv_retry_btn = tk.Label(
-            mpv_row,
-            text=_tr("下载 mpv", "Download mpv"),
-            fg=S_ACCENT,
-            bg=S_CARD_BG,
-            font=settings_font_small,
-            cursor="hand2",
-            padx=8,
-        )
-        mpv_retry_btn.pack(side="right")
-        mpv_row_state: dict[str, Any] = {"sig": None, "job": None}
-
-        def refresh_mpv_row() -> None:
-            mpv_row_state["job"] = None
-            try:
-                if not win.winfo_exists():
-                    return
-            except Exception:
-                return
-            available = _find_mpv_executable(cfg.get("mpv_path")) is not None
-            snapshot = _mpv_provision_snapshot()
-            status = "ready" if available else str(snapshot.get("status") or "idle")
-            text = _mpv_provision_text(snapshot) if not available else ""
-            sig = (status, text)
-            if mpv_row_state["sig"] != sig:
-                mpv_row_state["sig"] = sig
-                # The summary line above also names the mpv state; keep the two in step.
-                update_wallpaper_folder_status()
-                if available:
-                    mpv_row.pack_forget()
-                else:
-                    mpv_status_lbl.configure(text=text, fg="#f87171" if status == "failed" else S_MUTED)
-                    if status == "running":
-                        mpv_retry_btn.pack_forget()
-                    else:
-                        mpv_retry_btn.configure(
-                            text=_tr("重试", "Retry") if status == "failed" else _tr("下载 mpv", "Download mpv")
-                        )
-                        mpv_retry_btn.pack(side="right")
-                    if not mpv_row.winfo_manager():
-                        mpv_row.pack(fill="x", pady=(4, 0))
-            if status == "running":
-                mpv_row_state["job"] = win.after(400, refresh_mpv_row)
-
-        def start_mpv_download(_event: Any = None, *, retry: bool = True) -> None:
-            _start_mpv_provisioning(cfg.get("mpv_path"), retry=retry)
-            refresh_mpv_row()
-
-        mpv_retry_btn.bind("<Button-1>", start_mpv_download)
-        wp_subtab_state["start_mpv_download"] = start_mpv_download
-        # select_main_tab(initial_tab) ran before this card existed: when Settings opened
-        # straight onto the wallpaper tab, start the background download now.
-        if active_main_tab.get("title") == "动态壁纸":
-            win.after_idle(lambda: start_mpv_download(retry=False))
-        else:
-            win.after_idle(refresh_mpv_row)
-
-        playback_card = make_card(directories_pad, pady=(0, 0), pady_inner=10)
-        image_interval_row = tk.Frame(playback_card, bg=S_CARD_BG)
-        image_interval_row.pack(fill="x")
-        tk.Label(
-            image_interval_row,
-            text=_tr("图片切换间隔", 'Image Duration'),
-            fg=S_TEXT,
-            bg=S_CARD_BG,
-            font=settings_font,
-        ).pack(side="left")
-
-        def apply_wallpaper_image_seconds(
-            _event: Any = None,
-            *,
-            persist: bool = True,
-            reprepare: bool = True,
-        ) -> None:
-            try:
-                seconds = int(wallpaper_image_seconds_var.get().strip())
-            except (TypeError, ValueError):
-                seconds = int(state["wallpaper_image_seconds"])
-            seconds = max(2, min(300, seconds))
-            wallpaper_image_seconds_var.set(str(seconds))
-            changed = seconds != int(state["wallpaper_image_seconds"])
-            state["wallpaper_image_seconds"] = seconds
-            cfg["wallpaper_image_seconds"] = seconds
-            if persist:
-                save_config(cfg)
-            if changed and reprepare and not state.get("wallpaper_active"):
-                _clear_wallpaper_state()
-                _schedule_background_wallpaper_prepare()
-
-        image_interval_spinbox = tk.Spinbox(
-            image_interval_row,
-            from_=2,
-            to=300,
-            increment=1,
-            width=5,
-            textvariable=wallpaper_image_seconds_var,
-            command=apply_wallpaper_image_seconds,
-            font=settings_font,
-            justify="right",
-            bg=S_INPUT_BG,
-            fg=S_TEXT,
-            insertbackground=S_TEXT,
-            buttonbackground=S_BTN_BG,
-            relief="flat",
-            bd=0,
-            highlightthickness=1,
-            highlightbackground=S_CARD_BORDER,
-        )
-        image_interval_spinbox.pack(side="left", padx=(10, 4))
-        image_interval_spinbox.bind("<FocusOut>", apply_wallpaper_image_seconds)
-        image_interval_spinbox.bind("<Return>", apply_wallpaper_image_seconds)
-        tk.Label(
-            image_interval_row,
-            text=_tr("秒（2–300）", 'seconds (2–300)'),
-            fg=S_MUTED,
-            bg=S_CARD_BG,
-            font=settings_font_small,
-        ).pack(side="left")
-
-        def apply_wallpaper_audio() -> None:
-            enabled = bool(wallpaper_audio_var.get())
-            changed = enabled != bool(state.get("wallpaper_audio", True))
-            state["wallpaper_audio"] = enabled
-            cfg["wallpaper_audio"] = enabled
-            save_config(cfg)
-            if not changed:
-                return
-            was_active = bool(state.get("wallpaper_active"))
-            if was_active and state.get("wallpaper_web_mode") and browser_wallpaper_player.running:
-                browser_wallpaper_player.set_muted(not enabled)
-            elif was_active:
-                set_wallpaper_active(False)
-                set_wallpaper_active(True)
-            else:
-                _clear_wallpaper_state()
-                _schedule_background_wallpaper_prepare()
-
-        tk.Checkbutton(
-            image_interval_row,
-            text=_tr("播放视频声音", 'Play Video Audio'),
-            variable=wallpaper_audio_var,
-            command=apply_wallpaper_audio,
-            fg=S_TEXT,
-            bg=S_CARD_BG,
-            activebackground=S_CARD_BG,
-            activeforeground=S_TEXT,
-            selectcolor=S_INPUT_BG,
-            font=settings_font,
-            anchor="w",
-            bd=0,
-            highlightthickness=0,
-        ).pack(side="right")
-
-        # Wallpaper Sub-tab 2: 随机权重
-        weights_mode_card = make_card(weights_pad, pady=(0, 8), pady_inner=10)
-        tk.Label(
-            weights_mode_card,
-            text=_tr("随机策略", 'Random Strategy'),
-            fg=S_TEXT,
-            bg=S_CARD_BG,
-            font=settings_font_section,
-            anchor="w",
-        ).pack(fill="x", pady=(0, 4))
-        for mode, label in (
-            (
-                WALLPAPER_RANDOM_MODE_DIRECTORY,
-                _tr("单目录随机：按权重抽中某个目录后，本轮只在其中播放", 'Single folder: pick a folder by weight, then play only that folder this session'),
-            ),
-            (
-                WALLPAPER_RANDOM_MODE_GLOBAL,
-                _tr("全目录混合随机：每次切换都在所有目录中按权重随机抽取", 'All folders: pick media across all folders by weight at each transition'),
-            ),
-        ):
-            tk.Radiobutton(
-                weights_mode_card,
-                text=label,
-                value=mode,
-                variable=wallpaper_random_mode_var,
-                command=apply_wallpaper_random_mode,
+            display_card = make_card(display_pad, pady=(0, 10))
+            tk.Label(
+                display_card,
+                text=_tr("目标显示器与整屏仪表盘", 'Monitor & Full-Screen Dashboard'),
                 fg=S_TEXT,
                 bg=S_CARD_BG,
+                font=settings_font_section,
+                anchor="w",
+            ).pack(fill="x", pady=(0, 6))
+
+            monitor_var = tk.StringVar(value=selected_monitor_label)
+
+            def selected_device() -> str | None:
+                selected = monitor_by_label.get(monitor_var.get())
+                return selected.device if selected is not None else None
+
+            panel_mode_var = tk.BooleanVar(
+                value=state.get("display_mode") == DISPLAY_MODE_PANEL
+            )
+
+            def update_panel_status() -> None:
+                active = bool(state.get("panel_active"))
+                requested = bool(panel_mode_var.get())
+                if requested and active:
+                    panel_status.configure(
+                        text=_tr("● 已铺满所选副屏；在副屏任意位置右键可随时打开菜单。", '● Dashboard fills the selected display. Right-click anywhere for the menu.'),
+                        fg=S_ACCENT,
+                    )
+                elif requested:
+                    panel_status.configure(
+                        text=_tr("● 所选副屏未连接，当前临时回退为桌面悬浮窗。", '● Selected display disconnected. Using the floating HUD temporarily.'),
+                        fg="#fbbf24",
+                    )
+                else:
+                    panel_status.configure(
+                        text=_tr("开启后将自动铺满所选副屏；拔下副屏时自动回到桌面悬浮窗。", 'Fills the selected display. Returns to the floating HUD when disconnected.'),
+                        fg=S_MUTED,
+                    )
+                if sync_floating_controls is not None:
+                    sync_floating_controls(requested)
+
+            def on_panel_mode_toggle() -> None:
+                requested = bool(panel_mode_var.get())
+                device = selected_device()
+                if requested and device is None:
+                    fallback = _choose_panel_monitor(_enumerate_monitors(), None)
+                    device = fallback.device if fallback is not None else None
+                set_display_mode(
+                    DISPLAY_MODE_PANEL if requested else DISPLAY_MODE_FLOAT,
+                    device,
+                    persist=True,
+                )
+                update_panel_status()
+                win.after_idle(place_settings_window)
+
+            panel_checkbox = tk.Checkbutton(
+                display_card,
+                text=_tr("启用专用副屏模式（整屏双列仪表盘）", 'Enable Dedicated Aux Display Mode'),
+                variable=panel_mode_var,
+                command=on_panel_mode_toggle,
+                bg=S_CARD_BG,
+                fg=S_TEXT,
+                activebackground=S_CARD_BG,
+                activeforeground=S_TEXT,
+                selectcolor=S_INPUT_BG,
+                font=settings_font,
+                anchor="w",
+                bd=0,
+                highlightthickness=0,
+            )
+            panel_checkbox.pack(fill="x", pady=(0, 8))
+
+            def on_monitor_selected(_event: Any = None) -> None:
+                label = monitor_var.get()
+                monitor = monitor_by_label.get(label)
+                if monitor is None:
+                    return
+                state["monitor_device"] = monitor.device
+                state["monitor_id"] = monitor.monitor_id or state.get("monitor_id")
+                cfg["monitor_device"] = monitor.device
+                cfg["monitor_id"] = state.get("monitor_id")
+                if panel_mode_var.get():
+                    set_display_mode(DISPLAY_MODE_PANEL, monitor.device, persist=True)
+                else:
+                    save_config(cfg)
+                update_panel_status()
+                win.after_idle(place_settings_window)
+
+            mon_select_row = tk.Frame(display_card, bg=S_CARD_BG)
+            mon_select_row.pack(fill="x", pady=(0, 6))
+            tk.Label(
+                mon_select_row,
+                text=_tr("副屏显示器", 'Aux Display Monitor'),
+                fg=S_MUTED,
+                bg=S_CARD_BG,
+                font=settings_font_small,
+                width=10,
+                anchor="w",
+            ).pack(side="left")
+            monitor_combo = ttk.Combobox(
+                mon_select_row,
+                textvariable=monitor_var,
+                values=tuple(monitor_by_label.keys()) or (_tr("未检测到显示器", 'No monitors detected'),),
+                state="readonly",
+                font=settings_font_small,
+            )
+            monitor_combo.pack(side="left", fill="x", expand=True)
+            monitor_combo.bind("<<ComboboxSelected>>", on_monitor_selected)
+
+            panel_status = tk.Label(
+                display_card,
+                text="",
+                fg=S_MUTED,
+                bg=S_CARD_BG,
+                font=settings_font_small,
+                anchor="w",
+                justify="left",
+                wraplength=510,
+            )
+            panel_status.pack(fill="x", pady=(4, 0))
+
+            # Shortcut card in Tab 2
+            shortcut_card = make_card(display_pad, pady=(0, 0))
+            key_labels = (("Ctrl", "ctrl"), ("Shift", "shift"), ("Alt", "alt"), ("Win", "win"))
+            key_label_to_id = {label: key for label, key in key_labels}
+            key_id_to_label = {key: label for label, key in key_labels}
+            shortcut_enabled_var = tk.BooleanVar(value=bool(state.get("shortcut_enabled", True)))
+            shortcut_mode_var = tk.StringVar(
+                value=_normalize_shortcut_mode(state.get("shortcut_mode"))
+            )
+            shortcut_key_var = tk.StringVar(
+                value=key_id_to_label.get(
+                    _normalize_shortcut_key(state.get("shortcut_key")), "Ctrl"
+                )
+            )
+            shortcut_count_var = tk.StringVar(
+                value=str(_normalize_shortcut_repeat_count(state.get("shortcut_repeat_count")))
+            )
+            shortcut_combo_keys = list(
+                state.get("shortcut_combo") or SHORTCUT_COMBO_DEFAULT
+            )
+            shortcut_combo_var = tk.StringVar(
+                value=_format_shortcut_combo(shortcut_combo_keys)
+            )
+
+            def persist_shortcut_from_ui() -> None:
+                apply_shortcut_config(
+                    enabled=bool(shortcut_enabled_var.get()),
+                    mode=shortcut_mode_var.get(),
+                    key=key_label_to_id.get(shortcut_key_var.get(), "ctrl"),
+                    repeat_count=_normalize_shortcut_repeat_count(shortcut_count_var.get()),
+                    combo=shortcut_combo_keys,
+                    persist=True,
+                )
+                shortcut_count_var.set(str(state["shortcut_repeat_count"]))
+                shortcut_combo_var.set(_format_shortcut_combo(state["shortcut_combo"]))
+                update_shortcut_controls()
+
+            def update_shortcut_controls() -> None:
+                enabled = bool(shortcut_enabled_var.get())
+                mode = _normalize_shortcut_mode(shortcut_mode_var.get())
+                repeat_state = "normal" if enabled and mode == SHORTCUT_MODE_REPEAT else "disabled"
+                combo_state = "normal" if enabled and mode == SHORTCUT_MODE_COMBO else "disabled"
+                try:
+                    for widget in shortcut_repeat_widgets:
+                        if isinstance(widget, ttk.Combobox):
+                            widget.configure(state="readonly" if repeat_state == "normal" else "disabled")
+                        else:
+                            widget.configure(state=repeat_state)
+                    for widget in shortcut_combo_widgets:
+                        widget.configure(state=combo_state)
+                    for widget in shortcut_mode_widgets:
+                        widget.configure(state="normal" if enabled else "disabled")
+                except Exception:
+                    pass
+
+            tk.Label(
+                shortcut_card,
+                text=_tr("全局切换快捷键", 'Global Toggle Shortcut'),
+                fg=S_TEXT,
+                bg=S_CARD_BG,
+                font=settings_font_section,
+                anchor="w",
+            ).pack(fill="x", pady=(0, 4))
+            tk.Checkbutton(
+                shortcut_card,
+                text=_tr("启用全局快捷键，一键切换「用量面板 / 动态壁纸」", 'Enable a global shortcut to toggle Usage Panel / Live Wallpaper'),
+                variable=shortcut_enabled_var,
+                command=persist_shortcut_from_ui,
+                bg=S_CARD_BG,
+                fg=S_TEXT,
+                activebackground=S_CARD_BG,
+                activeforeground=S_TEXT,
+                selectcolor=S_INPUT_BG,
+                font=settings_font,
+                anchor="w",
+                bd=0,
+                highlightthickness=0,
+            ).pack(fill="x", pady=(0, 6))
+
+            shortcut_mode_widgets: list[Any] = []
+            shortcut_repeat_widgets: list[Any] = []
+            shortcut_combo_widgets: list[Any] = []
+
+            mode_row = tk.Frame(shortcut_card, bg=S_CARD_BG)
+            mode_row.pack(fill="x", pady=(0, 6))
+            repeat_radio = tk.Radiobutton(
+                mode_row,
+                text=_tr("连按修饰键", 'Repeat Key'),
+                value=SHORTCUT_MODE_REPEAT,
+                variable=shortcut_mode_var,
+                command=persist_shortcut_from_ui,
+                bg=S_CARD_BG,
+                fg=S_TEXT,
                 activebackground=S_CARD_BG,
                 activeforeground=S_TEXT,
                 selectcolor=S_INPUT_BG,
@@ -13765,456 +13444,987 @@ def run_ui() -> None:
                 anchor="w",
                 bd=0,
                 highlightthickness=0,
-            ).pack(fill="x", pady=1)
-
-        weights_list_card = make_card(
-            weights_pad,
-            pady=(0, 0),
-            expand=True,
-            fill="both",
-        )
-        w_hdr = tk.Frame(weights_list_card, bg=S_CARD_BG)
-        w_hdr.pack(fill="x", pady=(0, 2))
-        tk.Label(
-            w_hdr,
-            text=_tr("子目录抽中权重（基于缓存索引与递归层数）", 'Subfolder Weights (cached index)'),
-            fg=S_TEXT,
-            bg=S_CARD_BG,
-            font=settings_font_section,
-            anchor="w",
-        ).pack(side="left")
-        tk.Label(
-            weights_list_card,
-            text=_tr("10 为默认基准，20 约为两倍概率，0 表示禁用首选；直接读取缓存索引，不重复全盘扫描。", '10 is the default; 20 doubles the chance; 0 disables preference. Uses the cached index without scanning again.'),
-            fg=S_MUTED,
-            bg=S_CARD_BG,
-            font=settings_font_small,
-            anchor="w",
-            justify="left",
-            wraplength=510,
-        ).pack(fill="x", pady=(0, 6))
-
-        weight_list_frame = tk.Frame(
-            weights_list_card,
-            bg=S_COL_BG,
-            highlightthickness=0,
-            bd=0,
-        )
-        weight_list_frame.pack(fill="both", expand=True)
-        weight_canvas = tk.Canvas(
-            weight_list_frame,
-            bg=S_COL_BG,
-            highlightthickness=0,
-            bd=0,
-            height=220,
-        )
-        weight_scrollbar = ttk.Scrollbar(
-            weight_list_frame,
-            orient="vertical",
-            command=weight_canvas.yview,
-            style="Vertical.TScrollbar",
-        )
-        weight_scrollbar.pack(side="right", fill="y")
-        weight_canvas.pack(side="left", fill="both", expand=True)
-        weight_canvas.configure(yscrollcommand=weight_scrollbar.set)
-        weight_rows = tk.Frame(weight_canvas, bg=S_COL_BG, padx=6, pady=6)
-        weight_canvas_window = weight_canvas.create_window(
-            (0, 0), window=weight_rows, anchor="nw"
-        )
-        sync_weight_scrollregion, scroll_weight_list = _bind_scrollable_canvas(
-            weight_canvas,
-            weight_rows,
-            weight_canvas_window,
-        )
-
-        def bind_weight_list_wheel(widget: Any) -> None:
-            widget.bind("<MouseWheel>", scroll_weight_list)
-            for child in widget.winfo_children():
-                bind_weight_list_wheel(child)
-
-        bind_weight_list_wheel(weight_list_frame)
-
-        folder_row_records: list[dict[str, Any]] = []
-        weight_row_records: list[dict[str, Any]] = []
-
-        def restart_wallpaper_preparation(delay_ms: int = 350) -> None:
-            if state.get("wallpaper_active"):
-                set_wallpaper_active(False)
-                set_wallpaper_active(True)
-            else:
-                _clear_wallpaper_state()
-                _schedule_background_wallpaper_prepare(delay_ms=delay_ms)
-
-        def persist_wallpaper_folders() -> None:
-            """Persist folders, disabled state, and recursion depths immediately (0 disk scan)."""
-            normalized = _normalize_wallpaper_folders(wallpaper_folders)
-            wallpaper_folders[:] = normalized
-            disabled = _normalize_wallpaper_disabled_folders(
-                wallpaper_disabled_folders,
-                normalized,
             )
-            wallpaper_disabled_folders[:] = disabled
-            depths = _normalize_wallpaper_folder_depths(
-                wallpaper_folder_depths,
-                normalized,
+            repeat_radio.pack(side="left")
+            combo_radio = tk.Radiobutton(
+                mode_row,
+                text=_tr("自定义组合键", 'Key Combo'),
+                value=SHORTCUT_MODE_COMBO,
+                variable=shortcut_mode_var,
+                command=persist_shortcut_from_ui,
+                bg=S_CARD_BG,
+                fg=S_TEXT,
+                activebackground=S_CARD_BG,
+                activeforeground=S_TEXT,
+                selectcolor=S_INPUT_BG,
+                font=settings_font_small,
+                anchor="w",
+                bd=0,
+                highlightthickness=0,
             )
-            wallpaper_folder_depths.clear()
-            wallpaper_folder_depths.update(depths)
-            weights = _normalize_wallpaper_weights(
-                state.get("wallpaper_subdir_weights")
+            combo_radio.pack(side="left", padx=(16, 0))
+            shortcut_mode_widgets.extend((repeat_radio, combo_radio))
+
+            repeat_row = tk.Frame(shortcut_card, bg=S_CARD_BG)
+            repeat_row.pack(fill="x", pady=(0, 6))
+            tk.Label(
+                repeat_row,
+                text=_tr("修饰键", 'Modifier Key'),
+                fg=S_MUTED,
+                bg=S_CARD_BG,
+                font=settings_font_small,
+            ).pack(side="left")
+            key_combo = ttk.Combobox(
+                repeat_row,
+                textvariable=shortcut_key_var,
+                values=tuple(label for label, _key in key_labels),
+                state="readonly",
+                width=8,
+                font=settings_font_small,
             )
-            state["wallpaper_folders"] = list(normalized)
-            state["wallpaper_folder"] = normalized[0] if normalized else None
-            state["wallpaper_disabled_folders"] = list(disabled)
-            state["wallpaper_folder_depths"] = dict(depths)
-            state["wallpaper_subdir_weights"] = weights
-            cfg["wallpaper_folders"] = list(normalized)
-            cfg["wallpaper_folder"] = normalized[0] if normalized else None
-            cfg["wallpaper_disabled_folders"] = list(disabled)
-            cfg["wallpaper_folder_depths"] = dict(depths)
-            cfg["wallpaper_subdir_weights"] = weights
-            save_config(cfg)
-
-        def apply_folder_depth(folder_key: str, variable: tk.StringVar) -> None:
-            fallback = wallpaper_folder_depths.get(folder_key, WALLPAPER_DIR_DEPTH_DEFAULT)
-            try:
-                depth = int(str(variable.get()).strip())
-            except (TypeError, ValueError):
-                depth = fallback
-            depth = max(WALLPAPER_DIR_DEPTH_MIN, min(WALLPAPER_DIR_DEPTH_MAX, depth))
-            variable.set(str(depth))
-            changed = wallpaper_folder_depths.get(folder_key) != depth
-            wallpaper_folder_depths[folder_key] = depth
-            state["wallpaper_folder_depths"] = dict(wallpaper_folder_depths)
-            cfg["wallpaper_folder_depths"] = dict(wallpaper_folder_depths)
-            save_config(cfg)
-            request_weight_rows_refresh()
-            if changed and not state.get("wallpaper_active"):
-                _clear_wallpaper_state()
-                _schedule_background_wallpaper_prepare(delay_ms=350)
-
-        def apply_directory_weight(key: str, variable: tk.StringVar) -> None:
-            weights = _merge_wallpaper_weight_values(
-                state.get("wallpaper_subdir_weights"),
-                {key: variable.get()},
+            key_combo.pack(side="left", padx=(6, 16))
+            key_combo.bind("<<ComboboxSelected>>", lambda _e: persist_shortcut_from_ui())
+            tk.Label(
+                repeat_row,
+                text=_tr("连按次数", 'Repeat Count'),
+                fg=S_MUTED,
+                bg=S_CARD_BG,
+                font=settings_font_small,
+            ).pack(side="left")
+            count_spin = tk.Spinbox(
+                repeat_row,
+                from_=SHORTCUT_REPEAT_COUNT_MIN,
+                to=SHORTCUT_REPEAT_COUNT_MAX,
+                width=4,
+                textvariable=shortcut_count_var,
+                command=persist_shortcut_from_ui,
+                font=settings_font_small,
+                justify="right",
+                bg=S_INPUT_BG,
+                fg=S_TEXT,
+                insertbackground=S_TEXT,
+                buttonbackground=S_BTN_BG,
+                relief="flat",
+                bd=0,
+                highlightthickness=1,
+                highlightbackground=S_CARD_BORDER,
             )
-            weight = weights.get(key, WALLPAPER_DIR_WEIGHT_DEFAULT)
-            variable.set(str(weight))
-            state["wallpaper_subdir_weights"] = weights
-            cfg["wallpaper_subdir_weights"] = weights
-            save_config(cfg)
-            if not state.get("wallpaper_active"):
-                _clear_wallpaper_state()
-                _schedule_background_wallpaper_prepare(delay_ms=350)
+            count_spin.pack(side="left", padx=(6, 0))
+            count_spin.bind("<FocusOut>", lambda _event: persist_shortcut_from_ui())
+            count_spin.bind("<Return>", lambda _event: persist_shortcut_from_ui())
+            shortcut_repeat_widgets.extend((key_combo, count_spin))
 
-        def commit_all_directory_weights() -> None:
-            for fkey, dvar in list(depth_vars.items()):
+            combo_row = tk.Frame(shortcut_card, bg=S_CARD_BG)
+            combo_row.pack(fill="x", pady=(0, 6))
+            combo_label = tk.Label(
+                combo_row,
+                textvariable=shortcut_combo_var,
+                fg=S_TEXT,
+                bg=S_INPUT_BG,
+                font=settings_font_small,
+                anchor="w",
+                padx=10,
+                pady=5,
+            )
+            combo_label.pack(side="left", fill="x", expand=True)
+
+            def start_combo_capture() -> None:
+                if get_async_key_state is None:
+                    shortcut_combo_var.set(_tr("当前系统无法录制快捷键", 'Shortcut recording is unavailable on this system'))
+                    return
+                state["shortcut_capture"] = True
+                shortcut_combo_var.set(_tr("请按下组合键…", 'Press a key combination…'))
+                seen: list[str] = []
+
+                def finish(keys: list[str]) -> None:
+                    state["shortcut_capture"] = False
+                    if len(keys) >= 2:
+                        shortcut_combo_keys[:] = _normalize_shortcut_combo(keys)
+                        persist_shortcut_from_ui()
+                    else:
+                        shortcut_combo_var.set(_format_shortcut_combo(shortcut_combo_keys))
+
+                def poll_capture(remaining: int) -> None:
+                    if not state.get("shortcut_capture"):
+                        return
+                    down = _shortcut_keys_currently_down(get_async_key_state)
+                    if down:
+                        seen[:] = down
+                    elif seen:
+                        finish(list(seen))
+                        return
+                    if remaining <= 0:
+                        finish(list(seen))
+                        return
+                    win.after(40, lambda: poll_capture(remaining - 1))
+
+                win.after(200, lambda: poll_capture(150))
+
+            capture_btn = make_button(
+                combo_row,
+                _tr("录制组合键", 'Record Key Combo'),
+                start_combo_capture,
+                small=True,
+                padx=10,
+                pady=4,
+            )
+            capture_btn.pack(side="left", padx=(8, 0))
+            shortcut_combo_widgets.extend((combo_label, capture_btn))
+
+            tk.Label(
+                shortcut_card,
+                text=_tr("连按默认两次 Ctrl；组合键按下后立即切换。仅在专用副屏模式下生效，Ctrl+C 等正常组合键不会误触。", 'Default: press Ctrl twice. Key combos toggle immediately. Only active in Aux Display mode; normal combos such as Ctrl+C are ignored.'),
+                fg=S_MUTED,
+                bg=S_CARD_BG,
+                font=settings_font_small,
+                anchor="w",
+                wraplength=510,
+                justify="left",
+            ).pack(fill="x")
+            update_shortcut_controls()
+            update_panel_status()
+
+        def build_wallpaper_tab() -> None:
+            nonlocal commit_all_directory_weights, apply_wallpaper_image_seconds
+            # ── Tab 3: 动态壁纸 ──
+            wallpaper_folders = list(state.get("wallpaper_folders") or [])
+            wallpaper_disabled_folders = list(
+                state.get("wallpaper_disabled_folders") or []
+            )
+            wallpaper_folder_depths = _normalize_wallpaper_folder_depths(
+                state.get("wallpaper_folder_depths"),
+                wallpaper_folders,
+            )
+            wallpaper_image_seconds_var = tk.StringVar(
+                value=str(int(state["wallpaper_image_seconds"]))
+            )
+            wallpaper_audio_var = tk.BooleanVar(
+                value=bool(state.get("wallpaper_audio", True))
+            )
+            wallpaper_random_mode_var = tk.StringVar(
+                value=_normalize_wallpaper_random_mode(
+                    state.get("wallpaper_random_mode")
+                )
+            )
+            settings_media_files: list[Path] = []
+            weight_vars: dict[str, tk.StringVar] = {}
+            depth_vars: dict[str, tk.StringVar] = {}
+
+            def apply_wallpaper_random_mode() -> None:
+                mode = _normalize_wallpaper_random_mode(wallpaper_random_mode_var.get())
+                wallpaper_random_mode_var.set(mode)
+                changed = mode != state.get("wallpaper_random_mode")
+                state["wallpaper_random_mode"] = mode
+                cfg["wallpaper_random_mode"] = mode
+                save_config(cfg)
+                if not changed:
+                    return
+                if state.get("wallpaper_active"):
+                    set_wallpaper_active(False)
+                    set_wallpaper_active(True)
+                else:
+                    _clear_wallpaper_state()
+                    _schedule_background_wallpaper_prepare()
+
+            dirs_card = make_card(
+                directories_pad,
+                pady=(0, 8),
+                expand=True,
+                fill="both",
+            )
+            dirs_hdr = tk.Frame(dirs_card, bg=S_CARD_BG)
+            dirs_hdr.pack(fill="x", pady=(0, 2))
+            tk.Label(
+                dirs_hdr,
+                text=_tr("媒体目录与递归层数", 'Media Folders & Recursion Depth'),
+                fg=S_TEXT,
+                bg=S_CARD_BG,
+                font=settings_font_section,
+                anchor="w",
+            ).pack(side="left")
+            tk.Label(
+                dirs_card,
+                text=_tr("添加目录后立即生效并在后台慢速建立缓存索引；可为每个目录设置子目录递归层数（用于「随机权重」分组显示）。", 'Folders take effect immediately and are indexed slowly in the background. Set recursion depth per folder to group Random Weights.'),
+                fg=S_MUTED,
+                bg=S_CARD_BG,
+                font=settings_font_small,
+                anchor="w",
+                justify="left",
+                wraplength=510,
+            ).pack(fill="x", pady=(0, 8))
+
+            folder_list_frame = tk.Frame(
+                dirs_card,
+                bg=S_COL_BG,
+                highlightthickness=0,
+                bd=0,
+            )
+            folder_list_frame.pack(fill="both", expand=True)
+            folder_canvas = tk.Canvas(
+                folder_list_frame,
+                bg=S_COL_BG,
+                highlightthickness=0,
+                bd=0,
+                height=210,
+            )
+            folder_scrollbar = ttk.Scrollbar(
+                folder_list_frame,
+                orient="vertical",
+                command=folder_canvas.yview,
+                style="Vertical.TScrollbar",
+            )
+            folder_scrollbar.pack(side="right", fill="y")
+            folder_canvas.pack(side="left", fill="both", expand=True)
+            folder_canvas.configure(yscrollcommand=folder_scrollbar.set)
+            folder_rows = tk.Frame(folder_canvas, bg=S_COL_BG, padx=6, pady=6)
+            folder_canvas_window = folder_canvas.create_window(
+                (0, 0), window=folder_rows, anchor="nw"
+            )
+            sync_folder_scrollregion, scroll_folder_list = _bind_scrollable_canvas(
+                folder_canvas,
+                folder_rows,
+                folder_canvas_window,
+            )
+
+            def bind_folder_list_wheel(widget: Any) -> None:
+                widget.bind("<MouseWheel>", scroll_folder_list)
+                for child in widget.winfo_children():
+                    bind_folder_list_wheel(child)
+
+            bind_folder_list_wheel(folder_list_frame)
+
+            folder_button_row = tk.Frame(dirs_card, bg=S_CARD_BG)
+            folder_button_row.pack(fill="x", pady=(8, 4))
+            folder_status = tk.Label(
+                dirs_card,
+                text="",
+                fg=S_MUTED,
+                bg=S_CARD_BG,
+                font=settings_font_small,
+                anchor="w",
+                justify="left",
+                wraplength=510,
+            )
+            folder_status.pack(fill="x")
+            mpv_row = tk.Frame(dirs_card, bg=S_CARD_BG)
+            mpv_status_lbl = tk.Label(
+                mpv_row,
+                text="",
+                fg=S_MUTED,
+                bg=S_CARD_BG,
+                font=settings_font_small,
+                anchor="w",
+                justify="left",
+                wraplength=400,
+            )
+            mpv_status_lbl.pack(side="left", fill="x", expand=True)
+            mpv_retry_btn = tk.Label(
+                mpv_row,
+                text=_tr("下载 mpv", "Download mpv"),
+                fg=S_ACCENT,
+                bg=S_CARD_BG,
+                font=settings_font_small,
+                cursor="hand2",
+                padx=8,
+            )
+            mpv_retry_btn.pack(side="right")
+            mpv_row_state: dict[str, Any] = {"sig": None, "job": None}
+
+            def refresh_mpv_row() -> None:
+                job = mpv_row_state.get("job")
+                mpv_row_state["job"] = None
+                if job is not None:
+                    # Keep a single poll chain when a start and a scheduled poll overlap.
+                    try:
+                        win.after_cancel(job)
+                    except Exception:
+                        pass
                 try:
-                    d_val = int(str(dvar.get()).strip())
-                    wallpaper_folder_depths[fkey] = max(
-                        WALLPAPER_DIR_DEPTH_MIN,
-                        min(WALLPAPER_DIR_DEPTH_MAX, d_val),
-                    )
+                    if not win.winfo_exists():
+                        return
+                except Exception:
+                    return
+                available = _find_mpv_executable(cfg.get("mpv_path")) is not None
+                snapshot = _mpv_provision_snapshot()
+                status = "ready" if available else str(snapshot.get("status") or "idle")
+                text = _mpv_provision_text(snapshot) if not available else ""
+                sig = (status, text)
+                if mpv_row_state["sig"] != sig:
+                    mpv_row_state["sig"] = sig
+                    # The summary line above also names the mpv state; keep the two in step.
+                    update_wallpaper_folder_status()
+                    if available:
+                        mpv_row.pack_forget()
+                    else:
+                        mpv_status_lbl.configure(
+                            text=text,
+                            fg="#f87171" if status == "failed" else S_MUTED,
+                        )
+                        if status == "running":
+                            mpv_retry_btn.pack_forget()
+                        else:
+                            mpv_retry_btn.configure(
+                                text=_tr("重试", "Retry")
+                                if status == "failed"
+                                else _tr("下载 mpv", "Download mpv")
+                            )
+                            mpv_retry_btn.pack(side="right")
+                        if not mpv_row.winfo_manager():
+                            mpv_row.pack(fill="x", pady=(4, 0))
+                if status == "running":
+                    mpv_row_state["job"] = win.after(400, refresh_mpv_row)
+
+            def start_mpv_download(_event: Any = None, *, retry: bool = True) -> None:
+                _start_mpv_provisioning(cfg.get("mpv_path"), retry=retry)
+                refresh_mpv_row()
+
+            mpv_retry_btn.bind("<Button-1>", start_mpv_download)
+            wp_subtab_state["start_mpv_download"] = start_mpv_download
+            # This builder runs on the wallpaper tab's first visit (or at open when Settings
+            # opens straight onto it): start the background download now that the row exists.
+            if active_main_tab.get("title") == "动态壁纸":
+                win.after_idle(lambda: start_mpv_download(retry=False))
+            else:
+                win.after_idle(refresh_mpv_row)
+
+            playback_card = make_card(directories_pad, pady=(0, 0), pady_inner=10)
+            image_interval_row = tk.Frame(playback_card, bg=S_CARD_BG)
+            image_interval_row.pack(fill="x")
+            tk.Label(
+                image_interval_row,
+                text=_tr("图片切换间隔", 'Image Duration'),
+                fg=S_TEXT,
+                bg=S_CARD_BG,
+                font=settings_font,
+            ).pack(side="left")
+
+            def apply_wallpaper_image_seconds(
+                _event: Any = None,
+                *,
+                persist: bool = True,
+                reprepare: bool = True,
+            ) -> None:
+                try:
+                    seconds = int(wallpaper_image_seconds_var.get().strip())
                 except (TypeError, ValueError):
-                    pass
-            state["wallpaper_folder_depths"] = dict(wallpaper_folder_depths)
-            cfg["wallpaper_folder_depths"] = dict(wallpaper_folder_depths)
-            previous = _normalize_wallpaper_weights(
-                state.get("wallpaper_subdir_weights")
-            )
-            weights = _merge_wallpaper_weight_values(
-                previous,
-                {key: variable.get() for key, variable in weight_vars.items()},
-            )
-            for key, variable in weight_vars.items():
-                variable.set(str(weights.get(key, WALLPAPER_DIR_WEIGHT_DEFAULT)))
-            state["wallpaper_subdir_weights"] = weights
-            cfg["wallpaper_subdir_weights"] = weights
-            if weights != previous and not state.get("wallpaper_active"):
-                _clear_wallpaper_state()
-                _schedule_background_wallpaper_prepare(delay_ms=350)
+                    seconds = int(state["wallpaper_image_seconds"])
+                seconds = max(2, min(300, seconds))
+                wallpaper_image_seconds_var.set(str(seconds))
+                changed = seconds != int(state["wallpaper_image_seconds"])
+                state["wallpaper_image_seconds"] = seconds
+                cfg["wallpaper_image_seconds"] = seconds
+                if persist:
+                    save_config(cfg)
+                if changed and reprepare and not state.get("wallpaper_active"):
+                    _clear_wallpaper_state()
+                    _schedule_background_wallpaper_prepare()
 
-        def refresh_weight_rows() -> None:
-            nonlocal settings_media_files
-            wp_subtab_state["weights_dirty"] = False
-            enabled_folders = _enabled_wallpaper_folders(
-                wallpaper_folders,
-                wallpaper_disabled_folders,
+            image_interval_spinbox = tk.Spinbox(
+                image_interval_row,
+                from_=2,
+                to=300,
+                increment=1,
+                width=5,
+                textvariable=wallpaper_image_seconds_var,
+                command=apply_wallpaper_image_seconds,
+                font=settings_font,
+                justify="right",
+                bg=S_INPUT_BG,
+                fg=S_TEXT,
+                insertbackground=S_TEXT,
+                buttonbackground=S_BTN_BG,
+                relief="flat",
+                bd=0,
+                highlightthickness=1,
+                highlightbackground=S_CARD_BORDER,
             )
-            index_cache: dict[str, dict[str, Any]] = state.setdefault(
-                "wallpaper_index_cache", {}
-            )
-            cached_files, _uncached = _cached_wallpaper_media_for_folders(
-                enabled_folders,
-                index_cache,
-            )
-            settings_media_files = cached_files
-            directories = _wallpaper_media_directories(
-                settings_media_files,
-                enabled_folders,
-                wallpaper_folder_depths,
-            )
-            scanning_now: set[str] = state.get("wallpaper_scanning_folders") or set()
-            weights = dict(state.get("wallpaper_subdir_weights") or {})
-            target_keys = [_wallpaper_path_key(directory) for directory, _ in directories]
-            existing_keys = [rec.get("key") for rec in weight_row_records]
-            if (
-                directories
-                and target_keys == existing_keys
-                and all(rec["row"].winfo_exists() for rec in weight_row_records)
+            image_interval_spinbox.pack(side="left", padx=(10, 4))
+            image_interval_spinbox.bind("<FocusOut>", apply_wallpaper_image_seconds)
+            image_interval_spinbox.bind("<Return>", apply_wallpaper_image_seconds)
+            tk.Label(
+                image_interval_row,
+                text=_tr("秒（2–300）", 'seconds (2–300)'),
+                fg=S_MUTED,
+                bg=S_CARD_BG,
+                font=settings_font_small,
+            ).pack(side="left")
+
+            def apply_wallpaper_audio() -> None:
+                enabled = bool(wallpaper_audio_var.get())
+                changed = enabled != bool(state.get("wallpaper_audio", True))
+                state["wallpaper_audio"] = enabled
+                cfg["wallpaper_audio"] = enabled
+                save_config(cfg)
+                if not changed:
+                    return
+                was_active = bool(state.get("wallpaper_active"))
+                if was_active and state.get("wallpaper_web_mode") and browser_wallpaper_player.running:
+                    browser_wallpaper_player.set_muted(not enabled)
+                elif was_active:
+                    set_wallpaper_active(False)
+                    set_wallpaper_active(True)
+                else:
+                    _clear_wallpaper_state()
+                    _schedule_background_wallpaper_prepare()
+
+            tk.Checkbutton(
+                image_interval_row,
+                text=_tr("播放视频声音", 'Play Video Audio'),
+                variable=wallpaper_audio_var,
+                command=apply_wallpaper_audio,
+                fg=S_TEXT,
+                bg=S_CARD_BG,
+                activebackground=S_CARD_BG,
+                activeforeground=S_TEXT,
+                selectcolor=S_INPUT_BG,
+                font=settings_font,
+                anchor="w",
+                bd=0,
+                highlightthickness=0,
+            ).pack(side="right")
+
+            # Wallpaper Sub-tab 2: 随机权重
+            weights_mode_card = make_card(weights_pad, pady=(0, 8), pady_inner=10)
+            tk.Label(
+                weights_mode_card,
+                text=_tr("随机策略", 'Random Strategy'),
+                fg=S_TEXT,
+                bg=S_CARD_BG,
+                font=settings_font_section,
+                anchor="w",
+            ).pack(fill="x", pady=(0, 4))
+            for mode, label in (
+                (
+                    WALLPAPER_RANDOM_MODE_DIRECTORY,
+                    _tr("单目录随机：按权重抽中某个目录后，本轮只在其中播放", 'Single folder: pick a folder by weight, then play only that folder this session'),
+                ),
+                (
+                    WALLPAPER_RANDOM_MODE_GLOBAL,
+                    _tr("全目录混合随机：每次切换都在所有目录中按权重随机抽取", 'All folders: pick media across all folders by weight at each transition'),
+                ),
             ):
-                for (directory, media_count), rec in zip(directories, weight_row_records):
-                    key = rec["key"]
-                    dir_text = _wallpaper_directory_label(
-                        directory,
-                        wallpaper_folders,
-                        max_chars=44,
-                    )
-                    if str(rec["dir_lbl"].cget("text")) != dir_text:
-                        rec["dir_lbl"].configure(text=dir_text)
-                    cnt_text = _tr(f"  {media_count} 个媒体", f'  {media_count} media files')
-                    if str(rec["count_lbl"].cget("text")) != cnt_text:
-                        rec["count_lbl"].configure(text=cnt_text)
-                    target_val = str(weights.get(key, WALLPAPER_DIR_WEIGHT_DEFAULT))
-                    if key in weight_vars and str(weight_vars[key].get()) != target_val:
-                        weight_vars[key].set(target_val)
-                return
-
-            for child in weight_rows.winfo_children():
-                child.destroy()
-            weight_row_records.clear()
-            weight_vars.clear()
-            if not directories:
-                empty_msg = (
-                    _tr("正在后台慢速扫描目录索引，请稍候…", 'Indexing folders slowly in the background. Please wait…')
-                    if scanning_now
-                    else _tr("添加含图片或视频的目录后，这里会按设定的递归层数显示子目录。", 'Add folders with images or videos to show subfolders at the selected depth.')
-                )
-                tk.Label(
-                    weight_rows,
-                    text=empty_msg,
-                    fg=S_ACCENT_BLUE if scanning_now else S_MUTED,
-                    bg=S_COL_BG,
+                tk.Radiobutton(
+                    weights_mode_card,
+                    text=label,
+                    value=mode,
+                    variable=wallpaper_random_mode_var,
+                    command=apply_wallpaper_random_mode,
+                    fg=S_TEXT,
+                    bg=S_CARD_BG,
+                    activebackground=S_CARD_BG,
+                    activeforeground=S_TEXT,
+                    selectcolor=S_INPUT_BG,
                     font=settings_font_small,
                     anchor="w",
-                    justify="left",
-                    wraplength=460,
-                ).pack(fill="x", pady=12, padx=6)
-                sync_weight_scrollregion()
-                return
-            for directory, media_count in directories:
-                key = _wallpaper_path_key(directory)
-                row = tk.Frame(
-                    weight_rows,
-                    bg=S_SURFACE_ALT,
+                    bd=0,
                     highlightthickness=0,
-                    bd=0,
-                    padx=10,
-                    pady=7,
-                )
-                row.pack(fill="x", pady=2)
-                row.grid_columnconfigure(0, weight=1)
-                label_frame = tk.Frame(row, bg=S_SURFACE_ALT)
-                label_frame.grid(row=0, column=0, sticky="ew")
-                dir_lbl = tk.Label(
-                    label_frame,
-                    text=_wallpaper_directory_label(
-                        directory,
-                        wallpaper_folders,
-                        max_chars=44,
-                    ),
-                    fg=S_TEXT,
-                    bg=S_SURFACE_ALT,
-                    font=settings_font_small,
-                    anchor="w",
-                    justify="left",
-                )
-                dir_lbl.pack(side="left")
-                count_lbl = tk.Label(
-                    label_frame,
-                    text=_tr(f"  {media_count} 个媒体", f'  {media_count} media files'),
-                    fg=S_MUTED,
-                    bg=S_SURFACE_ALT,
-                    font=settings_font_badge,
-                    anchor="w",
-                )
-                count_lbl.pack(side="left", padx=(6, 0))
-                variable = tk.StringVar(
-                    value=str(weights.get(key, WALLPAPER_DIR_WEIGHT_DEFAULT))
-                )
-                weight_vars[key] = variable
-                spinbox = tk.Spinbox(
-                    row,
-                    from_=WALLPAPER_DIR_WEIGHT_MIN,
-                    to=WALLPAPER_DIR_WEIGHT_MAX,
-                    width=5,
-                    textvariable=variable,
-                    command=lambda k=key, v=variable: apply_directory_weight(k, v),
-                    font=settings_font,
-                    justify="right",
-                    bg=S_INPUT_BG,
-                    fg=S_TEXT,
-                    insertbackground=S_TEXT,
-                    buttonbackground=S_BTN_BG,
-                    relief="flat",
-                    bd=0,
-                    highlightthickness=1,
-                    highlightbackground=S_CARD_BORDER,
-                )
-                spinbox.grid(row=0, column=1, sticky="e", padx=(8, 2))
-                spinbox.bind(
-                    "<FocusOut>",
-                    lambda _event, k=key, v=variable: apply_directory_weight(k, v),
-                )
-                spinbox.bind(
-                    "<Return>",
-                    lambda _event, k=key, v=variable: apply_directory_weight(k, v),
-                )
-                weight_row_records.append(
-                    {
-                        "key": key,
-                        "row": row,
-                        "dir_lbl": dir_lbl,
-                        "count_lbl": count_lbl,
-                        "spinbox": spinbox,
-                    }
-                )
-            bind_weight_list_wheel(weight_rows)
-            sync_weight_scrollregion()
+                ).pack(fill="x", pady=1)
 
-        wp_subtab_state["refresh_weights"] = refresh_weight_rows
+            weights_list_card = make_card(
+                weights_pad,
+                pady=(0, 0),
+                expand=True,
+                fill="both",
+            )
+            w_hdr = tk.Frame(weights_list_card, bg=S_CARD_BG)
+            w_hdr.pack(fill="x", pady=(0, 2))
+            tk.Label(
+                w_hdr,
+                text=_tr("子目录抽中权重（基于缓存索引与递归层数）", 'Subfolder Weights (cached index)'),
+                fg=S_TEXT,
+                bg=S_CARD_BG,
+                font=settings_font_section,
+                anchor="w",
+            ).pack(side="left")
+            tk.Label(
+                weights_list_card,
+                text=_tr("10 为默认基准，20 约为两倍概率，0 表示禁用首选；直接读取缓存索引，不重复全盘扫描。", '10 is the default; 20 doubles the chance; 0 disables preference. Uses the cached index without scanning again.'),
+                fg=S_MUTED,
+                bg=S_CARD_BG,
+                font=settings_font_small,
+                anchor="w",
+                justify="left",
+                wraplength=510,
+            ).pack(fill="x", pady=(0, 6))
 
-        def request_weight_rows_refresh() -> None:
-            wp_subtab_state["weights_dirty"] = True
-            if wp_subtab_state.get("active") == "随机权重":
-                refresh_weight_rows()
+            weight_list_frame = tk.Frame(
+                weights_list_card,
+                bg=S_COL_BG,
+                highlightthickness=0,
+                bd=0,
+            )
+            weight_list_frame.pack(fill="both", expand=True)
+            weight_canvas = tk.Canvas(
+                weight_list_frame,
+                bg=S_COL_BG,
+                highlightthickness=0,
+                bd=0,
+                height=220,
+            )
+            weight_scrollbar = ttk.Scrollbar(
+                weight_list_frame,
+                orient="vertical",
+                command=weight_canvas.yview,
+                style="Vertical.TScrollbar",
+            )
+            weight_scrollbar.pack(side="right", fill="y")
+            weight_canvas.pack(side="left", fill="both", expand=True)
+            weight_canvas.configure(yscrollcommand=weight_scrollbar.set)
+            weight_rows = tk.Frame(weight_canvas, bg=S_COL_BG, padx=6, pady=6)
+            weight_canvas_window = weight_canvas.create_window(
+                (0, 0), window=weight_rows, anchor="nw"
+            )
+            sync_weight_scrollregion, scroll_weight_list = _bind_scrollable_canvas(
+                weight_canvas,
+                weight_rows,
+                weight_canvas_window,
+            )
 
-        def update_wallpaper_folder_status(
-            uncached_all: list[str] | None = None,
-        ) -> None:
-            enabled_folders = _enabled_wallpaper_folders(
-                wallpaper_folders,
-                wallpaper_disabled_folders,
-            )
-            index_cache: dict[str, dict[str, Any]] = state.setdefault(
-                "wallpaper_index_cache", {}
-            )
-            scanning_set: set[str] = state.setdefault(
-                "wallpaper_scanning_folders", set()
-            )
-            total_cached_media = 0
-            for folder in enabled_folders:
-                entry = index_cache.get(_wallpaper_path_key(folder))
-                if isinstance(entry, dict) and isinstance(entry.get("files"), list):
-                    total_cached_media += len(entry["files"])
-            executable = _find_mpv_executable(cfg.get("mpv_path"))
-            engine_text = (
-                _tr("mpv 已就绪", 'mpv Ready')
-                if executable is not None
-                else _mpv_provision_text(_mpv_provision_snapshot())
-            )
-            scan_note = (
-                _tr(" · 后台慢扫描中…", ' · Indexing in background…')
-                if (scanning_set or uncached_all)
-                else ""
-            )
-            status_text = (
-                _tr(f"已启用 {len(enabled_folders)} / 共 {len(wallpaper_folders)} 个目录"
-                f" · 已缓存 {total_cached_media} 个媒体 · {engine_text}{scan_note}", f'Enabled {len(enabled_folders)} / {len(wallpaper_folders)} folders · Cached {total_cached_media} media files · {engine_text}{scan_note}')
-            )
-            if str(folder_status.cget("text")) != status_text:
-                folder_status.configure(text=status_text)
+            def bind_weight_list_wheel(widget: Any) -> None:
+                widget.bind("<MouseWheel>", scroll_weight_list)
+                for child in widget.winfo_children():
+                    bind_weight_list_wheel(child)
 
-        def _apply_folder_row_visual(rec: dict[str, Any], enabled: bool) -> None:
-            is_scanning = bool(rec.get("is_scanning"))
-            visual_sig = (bool(enabled), is_scanning)
-            if rec.get("_visual_sig") == visual_sig:
-                return
-            rec["_visual_sig"] = visual_sig
-            row_bg = S_SURFACE_ALT if enabled else S_BAR_OFF_BG
-            row_fg = S_TEXT if enabled else S_BAR_OFF_FG
-            badge_fg = (
-                S_ACCENT_BLUE
-                if is_scanning
-                else (S_ACCENT if enabled else S_BAR_OFF_FG)
-            )
-            muted_fg = S_MUTED if enabled else S_BAR_OFF_FG
-            rec["row"].configure(bg=row_bg)
-            rec["chk"].configure(
-                text="☑" if enabled else "☐",
-                fg=S_ACCENT if enabled else S_BAR_OFF_FG,
-                bg=row_bg,
-            )
-            rec["path"].configure(fg=row_fg, bg=row_bg)
-            rec["del_btn"].configure(bg=row_bg)
-            rec["layer_lbl"].configure(fg=muted_fg, bg=row_bg)
-            rec["spin"].configure(fg=row_fg)
-            rec["rec_lbl"].configure(fg=muted_fg, bg=row_bg)
-            rec["badge"].configure(fg=badge_fg, bg=row_bg)
+            bind_weight_list_wheel(weight_list_frame)
 
-        def toggle_single_wallpaper_folder(index: int) -> None:
-            if not 0 <= index < len(wallpaper_folders):
-                return
-            disabled_keys = {
-                _wallpaper_path_key(folder)
-                for folder in wallpaper_disabled_folders
-            }
-            folder = wallpaper_folders[index]
-            key = _wallpaper_path_key(folder)
-            if key in disabled_keys:
-                disabled_keys.remove(key)
-                enabled_now = True
-            else:
-                disabled_keys.add(key)
-                enabled_now = False
-            wallpaper_disabled_folders[:] = [
-                f
-                for f in wallpaper_folders
-                if _wallpaper_path_key(f) in disabled_keys
-            ]
-            state["wallpaper_disabled_folders"] = list(wallpaper_disabled_folders)
-            cfg["wallpaper_disabled_folders"] = list(wallpaper_disabled_folders)
-            save_config(cfg)
-            if 0 <= index < len(folder_row_records) and folder_row_records[index]["row"].winfo_exists():
-                _apply_folder_row_visual(folder_row_records[index], enabled_now)
-                update_wallpaper_folder_status()
+            folder_row_records: list[dict[str, Any]] = []
+            weight_row_records: list[dict[str, Any]] = []
+
+            def restart_wallpaper_preparation(delay_ms: int = 350) -> None:
+                if state.get("wallpaper_active"):
+                    set_wallpaper_active(False)
+                    set_wallpaper_active(True)
+                else:
+                    _clear_wallpaper_state()
+                    _schedule_background_wallpaper_prepare(delay_ms=delay_ms)
+
+            def persist_wallpaper_folders() -> None:
+                """Persist folders, disabled state, and recursion depths immediately (0 disk scan)."""
+                normalized = _normalize_wallpaper_folders(wallpaper_folders)
+                wallpaper_folders[:] = normalized
+                disabled = _normalize_wallpaper_disabled_folders(
+                    wallpaper_disabled_folders,
+                    normalized,
+                )
+                wallpaper_disabled_folders[:] = disabled
+                depths = _normalize_wallpaper_folder_depths(
+                    wallpaper_folder_depths,
+                    normalized,
+                )
+                wallpaper_folder_depths.clear()
+                wallpaper_folder_depths.update(depths)
+                weights = _normalize_wallpaper_weights(
+                    state.get("wallpaper_subdir_weights")
+                )
+                state["wallpaper_folders"] = list(normalized)
+                state["wallpaper_folder"] = normalized[0] if normalized else None
+                state["wallpaper_disabled_folders"] = list(disabled)
+                state["wallpaper_folder_depths"] = dict(depths)
+                state["wallpaper_subdir_weights"] = weights
+                cfg["wallpaper_folders"] = list(normalized)
+                cfg["wallpaper_folder"] = normalized[0] if normalized else None
+                cfg["wallpaper_disabled_folders"] = list(disabled)
+                cfg["wallpaper_folder_depths"] = dict(depths)
+                cfg["wallpaper_subdir_weights"] = weights
+                save_config(cfg)
+
+            def apply_folder_depth(folder_key: str, variable: tk.StringVar) -> None:
+                fallback = wallpaper_folder_depths.get(folder_key, WALLPAPER_DIR_DEPTH_DEFAULT)
+                try:
+                    depth = int(str(variable.get()).strip())
+                except (TypeError, ValueError):
+                    depth = fallback
+                depth = max(WALLPAPER_DIR_DEPTH_MIN, min(WALLPAPER_DIR_DEPTH_MAX, depth))
+                variable.set(str(depth))
+                changed = wallpaper_folder_depths.get(folder_key) != depth
+                wallpaper_folder_depths[folder_key] = depth
+                state["wallpaper_folder_depths"] = dict(wallpaper_folder_depths)
+                cfg["wallpaper_folder_depths"] = dict(wallpaper_folder_depths)
+                save_config(cfg)
                 request_weight_rows_refresh()
-            else:
+                if changed and not state.get("wallpaper_active"):
+                    _clear_wallpaper_state()
+                    _schedule_background_wallpaper_prepare(delay_ms=350)
+
+            def apply_directory_weight(key: str, variable: tk.StringVar) -> None:
+                weights = _merge_wallpaper_weight_values(
+                    state.get("wallpaper_subdir_weights"),
+                    {key: variable.get()},
+                )
+                weight = weights.get(key, WALLPAPER_DIR_WEIGHT_DEFAULT)
+                variable.set(str(weight))
+                state["wallpaper_subdir_weights"] = weights
+                cfg["wallpaper_subdir_weights"] = weights
+                save_config(cfg)
+                if not state.get("wallpaper_active"):
+                    _clear_wallpaper_state()
+                    _schedule_background_wallpaper_prepare(delay_ms=350)
+
+            def commit_all_directory_weights() -> None:
+                for fkey, dvar in list(depth_vars.items()):
+                    try:
+                        d_val = int(str(dvar.get()).strip())
+                        wallpaper_folder_depths[fkey] = max(
+                            WALLPAPER_DIR_DEPTH_MIN,
+                            min(WALLPAPER_DIR_DEPTH_MAX, d_val),
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                state["wallpaper_folder_depths"] = dict(wallpaper_folder_depths)
+                cfg["wallpaper_folder_depths"] = dict(wallpaper_folder_depths)
+                previous = _normalize_wallpaper_weights(
+                    state.get("wallpaper_subdir_weights")
+                )
+                weights = _merge_wallpaper_weight_values(
+                    previous,
+                    {key: variable.get() for key, variable in weight_vars.items()},
+                )
+                for key, variable in weight_vars.items():
+                    variable.set(str(weights.get(key, WALLPAPER_DIR_WEIGHT_DEFAULT)))
+                state["wallpaper_subdir_weights"] = weights
+                cfg["wallpaper_subdir_weights"] = weights
+                if weights != previous and not state.get("wallpaper_active"):
+                    _clear_wallpaper_state()
+                    _schedule_background_wallpaper_prepare(delay_ms=350)
+
+            def refresh_weight_rows() -> None:
+                nonlocal settings_media_files
+                wp_subtab_state["weights_dirty"] = False
+                enabled_folders = _enabled_wallpaper_folders(
+                    wallpaper_folders,
+                    wallpaper_disabled_folders,
+                )
+                index_cache: dict[str, dict[str, Any]] = state.setdefault(
+                    "wallpaper_index_cache", {}
+                )
+                cached_files, _uncached = _cached_wallpaper_media_for_folders(
+                    enabled_folders,
+                    index_cache,
+                )
+                settings_media_files = cached_files
+                directories = _wallpaper_media_directories(
+                    settings_media_files,
+                    enabled_folders,
+                    wallpaper_folder_depths,
+                )
+                scanning_now: set[str] = state.get("wallpaper_scanning_folders") or set()
+                weights = dict(state.get("wallpaper_subdir_weights") or {})
+                target_keys = [_wallpaper_path_key(directory) for directory, _ in directories]
+                existing_keys = [rec.get("key") for rec in weight_row_records]
+                if (
+                    directories
+                    and target_keys == existing_keys
+                    and all(rec["row"].winfo_exists() for rec in weight_row_records)
+                ):
+                    for (directory, media_count), rec in zip(directories, weight_row_records):
+                        key = rec["key"]
+                        dir_text = _wallpaper_directory_label(
+                            directory,
+                            wallpaper_folders,
+                            max_chars=44,
+                        )
+                        if str(rec["dir_lbl"].cget("text")) != dir_text:
+                            rec["dir_lbl"].configure(text=dir_text)
+                        cnt_text = _tr(f"  {media_count} 个媒体", f'  {media_count} media files')
+                        if str(rec["count_lbl"].cget("text")) != cnt_text:
+                            rec["count_lbl"].configure(text=cnt_text)
+                        target_val = str(weights.get(key, WALLPAPER_DIR_WEIGHT_DEFAULT))
+                        if key in weight_vars and str(weight_vars[key].get()) != target_val:
+                            weight_vars[key].set(target_val)
+                    return
+
+                for child in weight_rows.winfo_children():
+                    child.destroy()
+                weight_row_records.clear()
+                weight_vars.clear()
+                if not directories:
+                    empty_msg = (
+                        _tr("正在后台慢速扫描目录索引，请稍候…", 'Indexing folders slowly in the background. Please wait…')
+                        if scanning_now
+                        else _tr("添加含图片或视频的目录后，这里会按设定的递归层数显示子目录。", 'Add folders with images or videos to show subfolders at the selected depth.')
+                    )
+                    tk.Label(
+                        weight_rows,
+                        text=empty_msg,
+                        fg=S_ACCENT_BLUE if scanning_now else S_MUTED,
+                        bg=S_COL_BG,
+                        font=settings_font_small,
+                        anchor="w",
+                        justify="left",
+                        wraplength=460,
+                    ).pack(fill="x", pady=12, padx=6)
+                    sync_weight_scrollregion()
+                    return
+                for directory, media_count in directories:
+                    key = _wallpaper_path_key(directory)
+                    row = tk.Frame(
+                        weight_rows,
+                        bg=S_SURFACE_ALT,
+                        highlightthickness=0,
+                        bd=0,
+                        padx=10,
+                        pady=7,
+                    )
+                    row.pack(fill="x", pady=2)
+                    row.grid_columnconfigure(0, weight=1)
+                    label_frame = tk.Frame(row, bg=S_SURFACE_ALT)
+                    label_frame.grid(row=0, column=0, sticky="ew")
+                    dir_lbl = tk.Label(
+                        label_frame,
+                        text=_wallpaper_directory_label(
+                            directory,
+                            wallpaper_folders,
+                            max_chars=44,
+                        ),
+                        fg=S_TEXT,
+                        bg=S_SURFACE_ALT,
+                        font=settings_font_small,
+                        anchor="w",
+                        justify="left",
+                    )
+                    dir_lbl.pack(side="left")
+                    count_lbl = tk.Label(
+                        label_frame,
+                        text=_tr(f"  {media_count} 个媒体", f'  {media_count} media files'),
+                        fg=S_MUTED,
+                        bg=S_SURFACE_ALT,
+                        font=settings_font_badge,
+                        anchor="w",
+                    )
+                    count_lbl.pack(side="left", padx=(6, 0))
+                    variable = tk.StringVar(
+                        value=str(weights.get(key, WALLPAPER_DIR_WEIGHT_DEFAULT))
+                    )
+                    weight_vars[key] = variable
+                    spinbox = tk.Spinbox(
+                        row,
+                        from_=WALLPAPER_DIR_WEIGHT_MIN,
+                        to=WALLPAPER_DIR_WEIGHT_MAX,
+                        width=5,
+                        textvariable=variable,
+                        command=lambda k=key, v=variable: apply_directory_weight(k, v),
+                        font=settings_font,
+                        justify="right",
+                        bg=S_INPUT_BG,
+                        fg=S_TEXT,
+                        insertbackground=S_TEXT,
+                        buttonbackground=S_BTN_BG,
+                        relief="flat",
+                        bd=0,
+                        highlightthickness=1,
+                        highlightbackground=S_CARD_BORDER,
+                    )
+                    spinbox.grid(row=0, column=1, sticky="e", padx=(8, 2))
+                    spinbox.bind(
+                        "<FocusOut>",
+                        lambda _event, k=key, v=variable: apply_directory_weight(k, v),
+                    )
+                    spinbox.bind(
+                        "<Return>",
+                        lambda _event, k=key, v=variable: apply_directory_weight(k, v),
+                    )
+                    weight_row_records.append(
+                        {
+                            "key": key,
+                            "row": row,
+                            "dir_lbl": dir_lbl,
+                            "count_lbl": count_lbl,
+                            "spinbox": spinbox,
+                        }
+                    )
+                bind_weight_list_wheel(weight_rows)
+                sync_weight_scrollregion()
+
+            wp_subtab_state["refresh_weights"] = refresh_weight_rows
+
+            def request_weight_rows_refresh() -> None:
+                wp_subtab_state["weights_dirty"] = True
+                if wp_subtab_state.get("active") == "随机权重":
+                    refresh_weight_rows()
+
+            def update_wallpaper_folder_status(
+                uncached_all: list[str] | None = None,
+            ) -> None:
+                enabled_folders = _enabled_wallpaper_folders(
+                    wallpaper_folders,
+                    wallpaper_disabled_folders,
+                )
+                index_cache: dict[str, dict[str, Any]] = state.setdefault(
+                    "wallpaper_index_cache", {}
+                )
+                scanning_set: set[str] = state.setdefault(
+                    "wallpaper_scanning_folders", set()
+                )
+                total_cached_media = 0
+                for folder in enabled_folders:
+                    entry = index_cache.get(_wallpaper_path_key(folder))
+                    if isinstance(entry, dict) and isinstance(entry.get("files"), list):
+                        total_cached_media += len(entry["files"])
+                executable = _find_mpv_executable(cfg.get("mpv_path"))
+                engine_text = (
+                    _tr("mpv 已就绪", 'mpv Ready')
+                    if executable is not None
+                    else _mpv_provision_text(_mpv_provision_snapshot())
+                )
+                scan_note = (
+                    _tr(" · 后台慢扫描中…", ' · Indexing in background…')
+                    if (scanning_set or uncached_all)
+                    else ""
+                )
+                status_text = (
+                    _tr(f"已启用 {len(enabled_folders)} / 共 {len(wallpaper_folders)} 个目录"
+                    f" · 已缓存 {total_cached_media} 个媒体 · {engine_text}{scan_note}", f'Enabled {len(enabled_folders)} / {len(wallpaper_folders)} folders · Cached {total_cached_media} media files · {engine_text}{scan_note}')
+                )
+                if str(folder_status.cget("text")) != status_text:
+                    folder_status.configure(text=status_text)
+
+            def _apply_folder_row_visual(rec: dict[str, Any], enabled: bool) -> None:
+                is_scanning = bool(rec.get("is_scanning"))
+                visual_sig = (bool(enabled), is_scanning)
+                if rec.get("_visual_sig") == visual_sig:
+                    return
+                rec["_visual_sig"] = visual_sig
+                row_bg = S_SURFACE_ALT if enabled else S_BAR_OFF_BG
+                row_fg = S_TEXT if enabled else S_BAR_OFF_FG
+                badge_fg = (
+                    S_ACCENT_BLUE
+                    if is_scanning
+                    else (S_ACCENT if enabled else S_BAR_OFF_FG)
+                )
+                muted_fg = S_MUTED if enabled else S_BAR_OFF_FG
+                rec["row"].configure(bg=row_bg)
+                rec["chk"].configure(
+                    text="☑" if enabled else "☐",
+                    fg=S_ACCENT if enabled else S_BAR_OFF_FG,
+                    bg=row_bg,
+                )
+                rec["path"].configure(fg=row_fg, bg=row_bg)
+                rec["del_btn"].configure(bg=row_bg)
+                rec["layer_lbl"].configure(fg=muted_fg, bg=row_bg)
+                rec["spin"].configure(fg=row_fg)
+                rec["rec_lbl"].configure(fg=muted_fg, bg=row_bg)
+                rec["badge"].configure(fg=badge_fg, bg=row_bg)
+
+            def toggle_single_wallpaper_folder(index: int) -> None:
+                if not 0 <= index < len(wallpaper_folders):
+                    return
+                disabled_keys = {
+                    _wallpaper_path_key(folder)
+                    for folder in wallpaper_disabled_folders
+                }
+                folder = wallpaper_folders[index]
+                key = _wallpaper_path_key(folder)
+                if key in disabled_keys:
+                    disabled_keys.remove(key)
+                    enabled_now = True
+                else:
+                    disabled_keys.add(key)
+                    enabled_now = False
+                wallpaper_disabled_folders[:] = [
+                    f
+                    for f in wallpaper_folders
+                    if _wallpaper_path_key(f) in disabled_keys
+                ]
+                state["wallpaper_disabled_folders"] = list(wallpaper_disabled_folders)
+                cfg["wallpaper_disabled_folders"] = list(wallpaper_disabled_folders)
+                save_config(cfg)
+                if 0 <= index < len(folder_row_records) and folder_row_records[index]["row"].winfo_exists():
+                    _apply_folder_row_visual(folder_row_records[index], enabled_now)
+                    update_wallpaper_folder_status()
+                    request_weight_rows_refresh()
+                else:
+                    refresh_wallpaper_directory_ui()
+                restart_wallpaper_preparation(delay_ms=450)
+
+            def remove_single_wallpaper_folder(index: int) -> None:
+                if not 0 <= index < len(wallpaper_folders):
+                    return
+                wallpaper_folders.pop(index)
+                persist_wallpaper_folders()
                 refresh_wallpaper_directory_ui()
-            restart_wallpaper_preparation(delay_ms=450)
+                restart_wallpaper_preparation(delay_ms=350)
 
-        def remove_single_wallpaper_folder(index: int) -> None:
-            if not 0 <= index < len(wallpaper_folders):
-                return
-            wallpaper_folders.pop(index)
-            persist_wallpaper_folders()
-            refresh_wallpaper_directory_ui()
-            restart_wallpaper_preparation(delay_ms=350)
+            def refresh_wallpaper_directory_ui() -> None:
+                if not win.winfo_exists():
+                    return
+                disabled_keys = {
+                    _wallpaper_path_key(folder)
+                    for folder in wallpaper_disabled_folders
+                }
+                index_cache: dict[str, dict[str, Any]] = state.setdefault(
+                    "wallpaper_index_cache", {}
+                )
+                scanning_set: set[str] = state.setdefault(
+                    "wallpaper_scanning_folders", set()
+                )
+                uncached_all: list[str] = []
+                current_keys = [_wallpaper_path_key(f) for f in wallpaper_folders]
+                existing_keys = [rec.get("key") for rec in folder_row_records]
 
-        def refresh_wallpaper_directory_ui() -> None:
-            if not win.winfo_exists():
-                return
-            disabled_keys = {
-                _wallpaper_path_key(folder)
-                for folder in wallpaper_disabled_folders
-            }
-            index_cache: dict[str, dict[str, Any]] = state.setdefault(
-                "wallpaper_index_cache", {}
-            )
-            scanning_set: set[str] = state.setdefault(
-                "wallpaper_scanning_folders", set()
-            )
-            uncached_all: list[str] = []
-            current_keys = [_wallpaper_path_key(f) for f in wallpaper_folders]
-            existing_keys = [rec.get("key") for rec in folder_row_records]
+                if (
+                    wallpaper_folders
+                    and current_keys == existing_keys
+                    and all(rec["row"].winfo_exists() for rec in folder_row_records)
+                ):
+                    for index, folder in enumerate(wallpaper_folders):
+                        key = current_keys[index]
+                        enabled = key not in disabled_keys
+                        entry = index_cache.get(key)
+                        is_scanning = key in scanning_set
+                        if not is_scanning and (
+                            not isinstance(entry, dict)
+                            or not isinstance(entry.get("files"), list)
+                        ):
+                            uncached_all.append(folder)
+                            is_scanning = True
+                        rec = folder_row_records[index]
+                        rec["folder"] = folder
+                        rec["is_scanning"] = is_scanning
+                        elided = _middle_elide_path(folder, max_chars=34)
+                        if str(rec["path"].cget("text")) != elided:
+                            rec["path"].configure(text=elided)
+                        count_num = (
+                            len(entry.get("files") or [])
+                            if isinstance(entry, dict)
+                            else 0
+                        )
+                        badge_text = _tr("扫描中…", 'Scanning…') if is_scanning else _tr(f"{count_num} 媒体", f'{count_num} media files')
+                        if str(rec["badge"].cget("text")) != badge_text:
+                            rec["badge"].configure(text=badge_text)
+                        depth_val = wallpaper_folder_depths.get(
+                            key, WALLPAPER_DIR_DEPTH_DEFAULT
+                        )
+                        if key in depth_vars and str(depth_vars[key].get()) != str(depth_val):
+                            depth_vars[key].set(str(depth_val))
+                        _apply_folder_row_visual(rec, enabled)
+                    update_wallpaper_folder_status(uncached_all)
+                    request_weight_rows_refresh()
+                    if uncached_all:
+                        _ensure_wallpaper_folders_indexed_async(
+                            uncached_all,
+                            notify_start=False,
+                        )
+                    return
 
-            if (
-                wallpaper_folders
-                and current_keys == existing_keys
-                and all(rec["row"].winfo_exists() for rec in folder_row_records)
-            ):
+                for child in folder_rows.winfo_children():
+                    child.destroy()
+                folder_row_records.clear()
+                depth_vars.clear()
+
+                if not wallpaper_folders:
+                    tk.Label(
+                        folder_rows,
+                        text=_tr("尚未添加壁纸目录，点击下方「＋ 添加目录」即可立刻添加并后台慢扫描。", 'No wallpaper folders yet. Click “＋ Add Folder” to add and index a folder.'),
+                        fg=S_MUTED,
+                        bg=S_COL_BG,
+                        font=settings_font_small,
+                        anchor="w",
+                        justify="left",
+                        wraplength=460,
+                    ).pack(fill="x", pady=14, padx=6)
+
                 for index, folder in enumerate(wallpaper_folders):
-                    key = current_keys[index]
+                    key = _wallpaper_path_key(folder)
                     enabled = key not in disabled_keys
                     entry = index_cache.get(key)
                     is_scanning = key in scanning_set
@@ -14224,26 +14434,143 @@ def run_ui() -> None:
                     ):
                         uncached_all.append(folder)
                         is_scanning = True
-                    rec = folder_row_records[index]
-                    rec["folder"] = folder
-                    rec["is_scanning"] = is_scanning
-                    elided = _middle_elide_path(folder, max_chars=34)
-                    if str(rec["path"].cget("text")) != elided:
-                        rec["path"].configure(text=elided)
-                    count_num = (
-                        len(entry.get("files") or [])
-                        if isinstance(entry, dict)
-                        else 0
+
+                    row_bg = S_SURFACE_ALT if enabled else S_BAR_OFF_BG
+                    row_fg = S_TEXT if enabled else S_BAR_OFF_FG
+                    row = tk.Frame(
+                        folder_rows,
+                        bg=row_bg,
+                        highlightthickness=0,
+                        bd=0,
+                        padx=10,
+                        pady=7,
                     )
-                    badge_text = _tr("扫描中…", 'Scanning…') if is_scanning else _tr(f"{count_num} 媒体", f'{count_num} media files')
-                    if str(rec["badge"].cget("text")) != badge_text:
-                        rec["badge"].configure(text=badge_text)
+                    row.pack(fill="x", pady=2)
+
+                    chk_lbl = tk.Label(
+                        row,
+                        text="☑" if enabled else "☐",
+                        fg=S_ACCENT if enabled else S_BAR_OFF_FG,
+                        bg=row_bg,
+                        font=settings_font_section,
+                        cursor="hand2",
+                        padx=2,
+                    )
+                    chk_lbl.pack(side="left")
+                    chk_lbl.bind(
+                        "<Button-1>",
+                        lambda _e, idx=index: toggle_single_wallpaper_folder(idx),
+                    )
+
+                    path_lbl = tk.Label(
+                        row,
+                        text=_middle_elide_path(folder, max_chars=34),
+                        fg=row_fg,
+                        bg=row_bg,
+                        font=settings_font_small,
+                        anchor="w",
+                    )
+                    path_lbl.pack(side="left", fill="x", expand=True, padx=(6, 6))
+
+                    del_btn = tk.Label(
+                        row,
+                        text=_tr("移除", 'Remove'),
+                        fg=S_SUBTLE,
+                        bg=row_bg,
+                        font=settings_font_badge,
+                        cursor="hand2",
+                        padx=6,
+                        pady=2,
+                    )
+                    del_btn.pack(side="right", padx=(6, 0))
+                    del_btn.bind(
+                        "<Button-1>",
+                        lambda _e, idx=index: remove_single_wallpaper_folder(idx),
+                    )
+                    del_btn.bind("<Enter>", lambda _e, w=del_btn: w.configure(fg="#f87171"))
+                    del_btn.bind("<Leave>", lambda _e, w=del_btn: w.configure(fg=S_SUBTLE))
+
                     depth_val = wallpaper_folder_depths.get(
                         key, WALLPAPER_DIR_DEPTH_DEFAULT
                     )
-                    if key in depth_vars and str(depth_vars[key].get()) != str(depth_val):
-                        depth_vars[key].set(str(depth_val))
-                    _apply_folder_row_visual(rec, enabled)
+                    d_var = tk.StringVar(value=str(depth_val))
+                    depth_vars[key] = d_var
+                    layer_lbl = tk.Label(
+                        row,
+                        text=_tr("层", 'levels'),
+                        fg=S_MUTED if enabled else S_BAR_OFF_FG,
+                        bg=row_bg,
+                        font=settings_font_badge,
+                    )
+                    layer_lbl.pack(side="right", padx=(2, 0))
+                    depth_spin = tk.Spinbox(
+                        row,
+                        from_=WALLPAPER_DIR_DEPTH_MIN,
+                        to=WALLPAPER_DIR_DEPTH_MAX,
+                        width=3,
+                        textvariable=d_var,
+                        command=lambda k=key, v=d_var: apply_folder_depth(k, v),
+                        font=settings_font_small,
+                        justify="right",
+                        bg=S_INPUT_BG,
+                        fg=S_TEXT if enabled else S_BAR_OFF_FG,
+                        insertbackground=S_TEXT,
+                        buttonbackground=S_BTN_BG,
+                        relief="flat",
+                        bd=0,
+                        highlightthickness=1,
+                        highlightbackground=S_CARD_BORDER,
+                    )
+                    depth_spin.pack(side="right", padx=(3, 0))
+                    depth_spin.bind(
+                        "<FocusOut>",
+                        lambda _e, k=key, v=d_var: apply_folder_depth(k, v),
+                    )
+                    depth_spin.bind(
+                        "<Return>",
+                        lambda _e, k=key, v=d_var: apply_folder_depth(k, v),
+                    )
+                    rec_lbl = tk.Label(
+                        row,
+                        text=_tr("递归", 'Depth'),
+                        fg=S_MUTED if enabled else S_BAR_OFF_FG,
+                        bg=row_bg,
+                        font=settings_font_badge,
+                    )
+                    rec_lbl.pack(side="right", padx=(8, 0))
+
+                    count_num = len(entry.get("files") or []) if isinstance(entry, dict) else 0
+                    badge_text = _tr("扫描中…", 'Scanning…') if is_scanning else _tr(f"{count_num} 媒体", f'{count_num} media files')
+                    badge_fg = S_ACCENT_BLUE if is_scanning else (S_ACCENT if enabled else S_BAR_OFF_FG)
+                    badge_lbl = tk.Label(
+                        row,
+                        text=badge_text,
+                        fg=badge_fg,
+                        bg=row_bg,
+                        font=settings_font_badge,
+                        anchor="e",
+                    )
+                    badge_lbl.pack(side="right", padx=(4, 0))
+
+                    folder_row_records.append(
+                        {
+                            "key": key,
+                            "folder": folder,
+                            "row": row,
+                            "chk": chk_lbl,
+                            "path": path_lbl,
+                            "del_btn": del_btn,
+                            "layer_lbl": layer_lbl,
+                            "spin": depth_spin,
+                            "rec_lbl": rec_lbl,
+                            "badge": badge_lbl,
+                            "is_scanning": is_scanning,
+                            "_visual_sig": (bool(enabled), bool(is_scanning)),
+                        }
+                    )
+
+                bind_folder_list_wheel(folder_rows)
+                sync_folder_scrollregion()
                 update_wallpaper_folder_status(uncached_all)
                 request_weight_rows_refresh()
                 if uncached_all:
@@ -14251,495 +14578,353 @@ def run_ui() -> None:
                         uncached_all,
                         notify_start=False,
                     )
-                return
 
-            for child in folder_rows.winfo_children():
-                child.destroy()
-            folder_row_records.clear()
-            depth_vars.clear()
+            state["wallpaper_scan_callback"] = refresh_wallpaper_directory_ui
 
-            if not wallpaper_folders:
-                tk.Label(
-                    folder_rows,
-                    text=_tr("尚未添加壁纸目录，点击下方「＋ 添加目录」即可立刻添加并后台慢扫描。", 'No wallpaper folders yet. Click “＋ Add Folder” to add and index a folder.'),
-                    fg=S_MUTED,
-                    bg=S_COL_BG,
-                    font=settings_font_small,
-                    anchor="w",
-                    justify="left",
-                    wraplength=460,
-                ).pack(fill="x", pady=14, padx=6)
-
-            for index, folder in enumerate(wallpaper_folders):
-                key = _wallpaper_path_key(folder)
-                enabled = key not in disabled_keys
-                entry = index_cache.get(key)
-                is_scanning = key in scanning_set
-                if not is_scanning and (
-                    not isinstance(entry, dict)
-                    or not isinstance(entry.get("files"), list)
-                ):
-                    uncached_all.append(folder)
-                    is_scanning = True
-
-                row_bg = S_SURFACE_ALT if enabled else S_BAR_OFF_BG
-                row_fg = S_TEXT if enabled else S_BAR_OFF_FG
-                row = tk.Frame(
-                    folder_rows,
-                    bg=row_bg,
-                    highlightthickness=0,
-                    bd=0,
-                    padx=10,
-                    pady=7,
+            def add_wallpaper_folder() -> None:
+                current = wallpaper_folders[-1] if wallpaper_folders else ""
+                initial = current if current and Path(current).is_dir() else str(HOME / "Pictures")
+                selected = filedialog.askdirectory(
+                    parent=win,
+                    title=_tr("添加动态壁纸目录", 'Add Live Wallpaper Folder'),
+                    initialdir=initial,
+                    mustexist=True,
                 )
-                row.pack(fill="x", pady=2)
-
-                chk_lbl = tk.Label(
-                    row,
-                    text="☑" if enabled else "☐",
-                    fg=S_ACCENT if enabled else S_BAR_OFF_FG,
-                    bg=row_bg,
-                    font=settings_font_section,
-                    cursor="hand2",
-                    padx=2,
-                )
-                chk_lbl.pack(side="left")
-                chk_lbl.bind(
-                    "<Button-1>",
-                    lambda _e, idx=index: toggle_single_wallpaper_folder(idx),
-                )
-
-                path_lbl = tk.Label(
-                    row,
-                    text=_middle_elide_path(folder, max_chars=34),
-                    fg=row_fg,
-                    bg=row_bg,
-                    font=settings_font_small,
-                    anchor="w",
-                )
-                path_lbl.pack(side="left", fill="x", expand=True, padx=(6, 6))
-
-                del_btn = tk.Label(
-                    row,
-                    text=_tr("移除", 'Remove'),
-                    fg=S_SUBTLE,
-                    bg=row_bg,
-                    font=settings_font_badge,
-                    cursor="hand2",
-                    padx=6,
-                    pady=2,
-                )
-                del_btn.pack(side="right", padx=(6, 0))
-                del_btn.bind(
-                    "<Button-1>",
-                    lambda _e, idx=index: remove_single_wallpaper_folder(idx),
-                )
-                del_btn.bind("<Enter>", lambda _e, w=del_btn: w.configure(fg="#f87171"))
-                del_btn.bind("<Leave>", lambda _e, w=del_btn: w.configure(fg=S_SUBTLE))
-
-                depth_val = wallpaper_folder_depths.get(
-                    key, WALLPAPER_DIR_DEPTH_DEFAULT
-                )
-                d_var = tk.StringVar(value=str(depth_val))
-                depth_vars[key] = d_var
-                layer_lbl = tk.Label(
-                    row,
-                    text=_tr("层", 'levels'),
-                    fg=S_MUTED if enabled else S_BAR_OFF_FG,
-                    bg=row_bg,
-                    font=settings_font_badge,
-                )
-                layer_lbl.pack(side="right", padx=(2, 0))
-                depth_spin = tk.Spinbox(
-                    row,
-                    from_=WALLPAPER_DIR_DEPTH_MIN,
-                    to=WALLPAPER_DIR_DEPTH_MAX,
-                    width=3,
-                    textvariable=d_var,
-                    command=lambda k=key, v=d_var: apply_folder_depth(k, v),
-                    font=settings_font_small,
-                    justify="right",
-                    bg=S_INPUT_BG,
-                    fg=S_TEXT if enabled else S_BAR_OFF_FG,
-                    insertbackground=S_TEXT,
-                    buttonbackground=S_BTN_BG,
-                    relief="flat",
-                    bd=0,
-                    highlightthickness=1,
-                    highlightbackground=S_CARD_BORDER,
-                )
-                depth_spin.pack(side="right", padx=(3, 0))
-                depth_spin.bind(
-                    "<FocusOut>",
-                    lambda _e, k=key, v=d_var: apply_folder_depth(k, v),
-                )
-                depth_spin.bind(
-                    "<Return>",
-                    lambda _e, k=key, v=d_var: apply_folder_depth(k, v),
-                )
-                rec_lbl = tk.Label(
-                    row,
-                    text=_tr("递归", 'Depth'),
-                    fg=S_MUTED if enabled else S_BAR_OFF_FG,
-                    bg=row_bg,
-                    font=settings_font_badge,
-                )
-                rec_lbl.pack(side="right", padx=(8, 0))
-
-                count_num = len(entry.get("files") or []) if isinstance(entry, dict) else 0
-                badge_text = _tr("扫描中…", 'Scanning…') if is_scanning else _tr(f"{count_num} 媒体", f'{count_num} media files')
-                badge_fg = S_ACCENT_BLUE if is_scanning else (S_ACCENT if enabled else S_BAR_OFF_FG)
-                badge_lbl = tk.Label(
-                    row,
-                    text=badge_text,
-                    fg=badge_fg,
-                    bg=row_bg,
-                    font=settings_font_badge,
-                    anchor="e",
-                )
-                badge_lbl.pack(side="right", padx=(4, 0))
-
-                folder_row_records.append(
-                    {
-                        "key": key,
-                        "folder": folder,
-                        "row": row,
-                        "chk": chk_lbl,
-                        "path": path_lbl,
-                        "del_btn": del_btn,
-                        "layer_lbl": layer_lbl,
-                        "spin": depth_spin,
-                        "rec_lbl": rec_lbl,
-                        "badge": badge_lbl,
-                        "is_scanning": is_scanning,
-                        "_visual_sig": (bool(enabled), bool(is_scanning)),
-                    }
-                )
-
-            bind_folder_list_wheel(folder_rows)
-            sync_folder_scrollregion()
-            update_wallpaper_folder_status(uncached_all)
-            request_weight_rows_refresh()
-            if uncached_all:
+                if not selected:
+                    return
+                norm_sel = _normalize_wallpaper_folders([selected])
+                if not norm_sel:
+                    return
+                folder_path = norm_sel[0]
+                key = _wallpaper_path_key(folder_path)
+                if folder_path not in wallpaper_folders:
+                    wallpaper_folders.append(folder_path)
+                wallpaper_folder_depths.setdefault(key, WALLPAPER_DIR_DEPTH_DEFAULT)
+                # Immediately persist and render UI without waiting for disk scan
+                persist_wallpaper_folders()
+                state.setdefault("wallpaper_scanning_folders", set()).add(key)
+                refresh_wallpaper_directory_ui()
+                state.setdefault("wallpaper_scanning_folders", set()).discard(key)
                 _ensure_wallpaper_folders_indexed_async(
-                    uncached_all,
+                    [folder_path],
+                    force_rescan=True,
                     notify_start=False,
                 )
 
-        state["wallpaper_scan_callback"] = refresh_wallpaper_directory_ui
+            def rescan_all_wallpaper_folders() -> None:
+                if not wallpaper_folders:
+                    return
+                _ensure_wallpaper_folders_indexed_async(
+                    list(wallpaper_folders),
+                    force_rescan=True,
+                    notify_start=False,
+                )
+                refresh_wallpaper_directory_ui()
 
-        def add_wallpaper_folder() -> None:
-            current = wallpaper_folders[-1] if wallpaper_folders else ""
-            initial = current if current and Path(current).is_dir() else str(HOME / "Pictures")
-            selected = filedialog.askdirectory(
-                parent=win,
-                title=_tr("添加动态壁纸目录", 'Add Live Wallpaper Folder'),
-                initialdir=initial,
-                mustexist=True,
-            )
-            if not selected:
-                return
-            norm_sel = _normalize_wallpaper_folders([selected])
-            if not norm_sel:
-                return
-            folder_path = norm_sel[0]
-            key = _wallpaper_path_key(folder_path)
-            if folder_path not in wallpaper_folders:
-                wallpaper_folders.append(folder_path)
-            wallpaper_folder_depths.setdefault(key, WALLPAPER_DIR_DEPTH_DEFAULT)
-            # Immediately persist and render UI without waiting for disk scan
-            persist_wallpaper_folders()
-            state.setdefault("wallpaper_scanning_folders", set()).add(key)
+            make_button(
+                folder_button_row,
+                _tr("＋ 添加目录", '＋ Add Folder…'),
+                add_wallpaper_folder,
+                primary=True,
+                small=True,
+                padx=12,
+                pady=4,
+            ).pack(side="left")
+            make_button(
+                folder_button_row,
+                _tr("↻ 重新扫描索引", '↻ Rescan Index'),
+                rescan_all_wallpaper_folders,
+                small=True,
+                padx=10,
+                pady=4,
+            ).pack(side="left", padx=(8, 0))
+
+            def reset_all_directory_weights() -> None:
+                keys = list(weight_vars)
+                weights = dict(state.get("wallpaper_subdir_weights") or {})
+                for key in keys:
+                    weights[key] = WALLPAPER_DIR_WEIGHT_DEFAULT
+                    weight_vars[key].set(str(WALLPAPER_DIR_WEIGHT_DEFAULT))
+                state["wallpaper_subdir_weights"] = weights
+                cfg["wallpaper_subdir_weights"] = weights
+                save_config(cfg)
+                if not state.get("wallpaper_active"):
+                    _clear_wallpaper_state()
+                    _schedule_background_wallpaper_prepare()
+
+            make_button(
+                w_hdr,
+                _tr("全部恢复为 10", 'Reset All to 10'),
+                reset_all_directory_weights,
+                small=True,
+                padx=10,
+                pady=3,
+            ).pack(side="right")
+            make_button(
+                w_hdr,
+                _tr("↻ 重新扫描", '↻ Rescan'),
+                rescan_all_wallpaper_folders,
+                small=True,
+                padx=10,
+                pady=3,
+            ).pack(side="right", padx=(0, 6))
             refresh_wallpaper_directory_ui()
-            state.setdefault("wallpaper_scanning_folders", set()).discard(key)
-            _ensure_wallpaper_folders_indexed_async(
-                [folder_path],
-                force_rescan=True,
-                notify_start=False,
+
+        def build_floating_tab() -> None:
+            nonlocal size_var, sync_floating_controls
+            # ── Tab 4: 悬浮窗 ──
+            float_style_card = make_card(floating_pad, pady=(0, 10))
+            tk.Label(
+                float_style_card,
+                text=_tr("外观与不透明度", 'Appearance & Opacity'),
+                fg=S_TEXT,
+                bg=S_CARD_BG,
+                font=settings_font_section,
+                anchor="w",
+            ).pack(fill="x", pady=(0, 8))
+
+            font_hdr = tk.Frame(float_style_card, bg=S_CARD_BG)
+            font_hdr.pack(fill="x")
+            tk.Label(
+                font_hdr,
+                text=_tr("悬浮窗字体大小", 'Floating HUD Font Size'),
+                fg=S_TEXT,
+                bg=S_CARD_BG,
+                font=settings_font,
+                anchor="w",
+            ).pack(side="left")
+            size_var = tk.IntVar(value=int(state["font_size"]))
+            size_label = tk.Label(
+                font_hdr,
+                text=f"{size_var.get()} pt",
+                fg=S_ACCENT,
+                bg=S_CARD_BG,
+                font=settings_font_section,
             )
+            size_label.pack(side="right")
 
-        def rescan_all_wallpaper_folders() -> None:
-            if not wallpaper_folders:
-                return
-            _ensure_wallpaper_folders_indexed_async(
-                list(wallpaper_folders),
-                force_rescan=True,
-                notify_start=False,
+            def on_font_slide(val: str) -> None:
+                try:
+                    v = int(float(val))
+                except Exception:
+                    return
+                try:
+                    size_label.configure(text=f"{v} pt")
+                except Exception:
+                    pass
+                apply_font_size(v, persist=False, relayout=True)
+
+            scale = tk.Scale(
+                float_style_card,
+                from_=FONT_SIZE_MIN,
+                to=FONT_SIZE_MAX,
+                orient="horizontal",
+                variable=size_var,
+                command=on_font_slide,
+                showvalue=False,
+                length=220,
+                bg=S_CARD_BG,
+                fg=S_TEXT,
+                highlightthickness=0,
+                troughcolor=S_INPUT_BG,
+                activebackground=S_ACCENT,
+                sliderrelief="flat",
+                bd=0,
             )
-            refresh_wallpaper_directory_ui()
+            scale.pack(fill="x", pady=(4, 12))
 
-        make_button(
-            folder_button_row,
-            _tr("＋ 添加目录", '＋ Add Folder…'),
-            add_wallpaper_folder,
-            primary=True,
-            small=True,
-            padx=12,
-            pady=4,
-        ).pack(side="left")
-        make_button(
-            folder_button_row,
-            _tr("↻ 重新扫描索引", '↻ Rescan Index'),
-            rescan_all_wallpaper_folders,
-            small=True,
-            padx=10,
-            pady=4,
-        ).pack(side="left", padx=(8, 0))
+            bg_hdr = tk.Frame(float_style_card, bg=S_CARD_BG)
+            bg_hdr.pack(fill="x")
+            tk.Label(
+                bg_hdr,
+                text=_tr("底板不透明度", 'Background Opacity'),
+                fg=S_TEXT,
+                bg=S_CARD_BG,
+                font=settings_font,
+                anchor="w",
+            ).pack(side="left")
+            bg_op_var = tk.IntVar(value=int(state["bg_opacity"]))
+            bg_op_lbl = tk.Label(
+                bg_hdr,
+                text=f"{bg_op_var.get()}%",
+                fg=S_ACCENT,
+                bg=S_CARD_BG,
+                font=settings_font_section,
+            )
+            bg_op_lbl.pack(side="right")
 
-        def reset_all_directory_weights() -> None:
-            keys = list(weight_vars)
-            weights = dict(state.get("wallpaper_subdir_weights") or {})
-            for key in keys:
-                weights[key] = WALLPAPER_DIR_WEIGHT_DEFAULT
-                weight_vars[key].set(str(WALLPAPER_DIR_WEIGHT_DEFAULT))
-            state["wallpaper_subdir_weights"] = weights
-            cfg["wallpaper_subdir_weights"] = weights
-            save_config(cfg)
-            if not state.get("wallpaper_active"):
-                _clear_wallpaper_state()
-                _schedule_background_wallpaper_prepare()
+            def on_bg_opacity(val: str) -> None:
+                try:
+                    v = int(float(val))
+                except Exception:
+                    return
+                v = _clamp_opacity(v, BG_OPACITY_DEFAULT)
+                state["bg_opacity"] = v
+                bg_op_lbl.configure(text=f"{v}%")
+                apply_opacity()
 
-        make_button(
-            w_hdr,
-            _tr("全部恢复为 10", 'Reset All to 10'),
-            reset_all_directory_weights,
-            small=True,
-            padx=10,
-            pady=3,
-        ).pack(side="right")
-        make_button(
-            w_hdr,
-            _tr("↻ 重新扫描", '↻ Rescan'),
-            rescan_all_wallpaper_folders,
-            small=True,
-            padx=10,
-            pady=3,
-        ).pack(side="right", padx=(0, 6))
-        refresh_wallpaper_directory_ui()
+            bg_op_scale = tk.Scale(
+                float_style_card,
+                from_=OPACITY_MIN,
+                to=OPACITY_MAX,
+                orient="horizontal",
+                variable=bg_op_var,
+                command=on_bg_opacity,
+                showvalue=False,
+                length=220,
+                bg=S_CARD_BG,
+                fg=S_TEXT,
+                highlightthickness=0,
+                troughcolor=S_INPUT_BG,
+                activebackground=S_ACCENT,
+                sliderrelief="flat",
+                bd=0,
+            )
+            bg_op_scale.pack(fill="x", pady=(4, 12))
 
-        # ── Tab 4: 悬浮窗 ──
-        float_style_card = make_card(floating_pad, pady=(0, 10))
-        tk.Label(
-            float_style_card,
-            text=_tr("外观与不透明度", 'Appearance & Opacity'),
-            fg=S_TEXT,
-            bg=S_CARD_BG,
-            font=settings_font_section,
-            anchor="w",
-        ).pack(fill="x", pady=(0, 8))
+            tx_hdr = tk.Frame(float_style_card, bg=S_CARD_BG)
+            tx_hdr.pack(fill="x")
+            tk.Label(
+                tx_hdr,
+                text=_tr("文字不透明度", 'Text Opacity'),
+                fg=S_TEXT,
+                bg=S_CARD_BG,
+                font=settings_font,
+                anchor="w",
+            ).pack(side="left")
+            tx_op_var = tk.IntVar(value=int(state["text_opacity"]))
+            tx_op_lbl = tk.Label(
+                tx_hdr,
+                text=f"{tx_op_var.get()}%",
+                fg=S_ACCENT,
+                bg=S_CARD_BG,
+                font=settings_font_section,
+            )
+            tx_op_lbl.pack(side="right")
 
-        font_hdr = tk.Frame(float_style_card, bg=S_CARD_BG)
-        font_hdr.pack(fill="x")
-        tk.Label(
-            font_hdr,
-            text=_tr("悬浮窗字体大小", 'Floating HUD Font Size'),
-            fg=S_TEXT,
-            bg=S_CARD_BG,
-            font=settings_font,
-            anchor="w",
-        ).pack(side="left")
-        size_var = tk.IntVar(value=int(state["font_size"]))
-        size_label = tk.Label(
-            font_hdr,
-            text=f"{size_var.get()} pt",
-            fg=S_ACCENT,
-            bg=S_CARD_BG,
-            font=settings_font_section,
+            def on_text_opacity(val: str) -> None:
+                try:
+                    v = int(float(val))
+                except Exception:
+                    return
+                v = _clamp_opacity(v, TEXT_OPACITY_DEFAULT)
+                state["text_opacity"] = v
+                tx_op_lbl.configure(text=f"{v}%")
+                apply_opacity()
+
+            tx_op_scale = tk.Scale(
+                float_style_card,
+                from_=OPACITY_MIN,
+                to=OPACITY_MAX,
+                orient="horizontal",
+                variable=tx_op_var,
+                command=on_text_opacity,
+                showvalue=False,
+                length=220,
+                bg=S_CARD_BG,
+                fg=S_TEXT,
+                highlightthickness=0,
+                troughcolor=S_INPUT_BG,
+                activebackground=S_ACCENT,
+                sliderrelief="flat",
+                bd=0,
+            )
+            tx_op_scale.pack(fill="x", pady=(4, 8))
+
+            opacity_hint = tk.Label(
+                float_style_card,
+                text=_tr("拖动滑块即可实时预览。数值越高越不透明，底板与文字互不影响。", 'Drag sliders to preview. Higher values are more opaque; background and text are independent.'),
+                fg=S_MUTED,
+                bg=S_CARD_BG,
+                font=settings_font_small,
+                anchor="w",
+                wraplength=510,
+                justify="left",
+            )
+            opacity_hint.pack(fill="x")
+
+            float_size_card = make_card(floating_pad, pady=(0, 0))
+            tk.Label(
+                float_size_card,
+                text=_tr("尺寸与交互", 'Size & Interaction'),
+                fg=S_TEXT,
+                bg=S_CARD_BG,
+                font=settings_font_section,
+                anchor="w",
+            ).pack(fill="x", pady=(0, 4))
+            resize_var = tk.BooleanVar(value=bool(state["allow_resize"]))
+
+            def on_resize_toggle() -> None:
+                set_allow_resize(bool(resize_var.get()), persist=True)
+
+            chk = tk.Checkbutton(
+                float_size_card,
+                text=_tr("允许拖动悬浮窗右下角调整尺寸", 'Allow resizing from the HUD’s bottom-right corner'),
+                variable=resize_var,
+                command=on_resize_toggle,
+                bg=S_CARD_BG,
+                fg=S_TEXT,
+                activebackground=S_CARD_BG,
+                activeforeground=S_TEXT,
+                selectcolor=S_INPUT_BG,
+                font=settings_font,
+                anchor="w",
+                bd=0,
+                highlightthickness=0,
+            )
+            chk.pack(fill="x", pady=(0, 4))
+            tk.Label(
+                float_size_card,
+                text=_tr("开启后，拖动悬浮窗右下角 ◢ 可自由改变宽度和高度；高度不会小于内容所需，避免上下裁切。", 'Drag the bottom-right ◢ to resize width and height. Height stays large enough to show all content.'),
+                fg=S_MUTED,
+                bg=S_CARD_BG,
+                font=settings_font_small,
+                wraplength=510,
+                justify="left",
+                anchor="w",
+            ).pack(fill="x")
+
+            def sync_floating_controls(requested: bool) -> None:
+                try:
+                    scale.configure(state="disabled" if requested else "normal")
+                    size_label.configure(text=_tr("自动", 'Auto') if requested else f"{size_var.get()} pt")
+                    chk.configure(state="disabled" if requested else "normal")
+                    opacity_state = "disabled" if requested else "normal"
+                    bg_op_scale.configure(state=opacity_state)
+                    tx_op_scale.configure(state=opacity_state)
+                    bg_op_lbl.configure(text=_tr("固定黑底", 'Solid black') if requested else f"{bg_op_var.get()}%")
+                    tx_op_lbl.configure(text=_tr("固定清晰", 'Full opacity') if requested else f"{tx_op_var.get()}%")
+                    opacity_hint.configure(
+                        text=(
+                            _tr("专用副屏使用不透明黑底和清晰文字；上方字号与透明度设置仅用于桌面悬浮窗。", 'Aux Display uses a solid black background and opaque text. Font and opacity controls apply to the floating HUD.')
+                            if requested
+                            else _tr("拖动滑块即可实时预览。数值越高越不透明，底板与文字互不影响。", 'Drag sliders to preview. Higher values are more opaque; background and text are independent.')
+                        )
+                    )
+                except Exception:
+                    pass
+            sync_floating_controls(floating_controls_requested())
+
+        lazy_tab_builders.update(
+            {"副屏": build_display_tab, "动态壁纸": build_wallpaper_tab, "悬浮窗": build_floating_tab}
         )
-        size_label.pack(side="right")
-
-        def on_font_slide(val: str) -> None:
-            try:
-                v = int(float(val))
-            except Exception:
-                return
-            try:
-                size_label.configure(text=f"{v} pt")
-            except Exception:
-                pass
-            apply_font_size(v, persist=False, relayout=True)
-
-        scale = tk.Scale(
-            float_style_card,
-            from_=FONT_SIZE_MIN,
-            to=FONT_SIZE_MAX,
-            orient="horizontal",
-            variable=size_var,
-            command=on_font_slide,
-            showvalue=False,
-            length=220,
-            bg=S_CARD_BG,
-            fg=S_TEXT,
-            highlightthickness=0,
-            troughcolor=S_INPUT_BG,
-            activebackground=S_ACCENT,
-            sliderrelief="flat",
-            bd=0,
-        )
-        scale.pack(fill="x", pady=(4, 12))
-
-        bg_hdr = tk.Frame(float_style_card, bg=S_CARD_BG)
-        bg_hdr.pack(fill="x")
-        tk.Label(
-            bg_hdr,
-            text=_tr("底板不透明度", 'Background Opacity'),
-            fg=S_TEXT,
-            bg=S_CARD_BG,
-            font=settings_font,
-            anchor="w",
-        ).pack(side="left")
-        bg_op_var = tk.IntVar(value=int(state["bg_opacity"]))
-        bg_op_lbl = tk.Label(
-            bg_hdr,
-            text=f"{bg_op_var.get()}%",
-            fg=S_ACCENT,
-            bg=S_CARD_BG,
-            font=settings_font_section,
-        )
-        bg_op_lbl.pack(side="right")
-
-        def on_bg_opacity(val: str) -> None:
-            try:
-                v = int(float(val))
-            except Exception:
-                return
-            v = _clamp_opacity(v, BG_OPACITY_DEFAULT)
-            state["bg_opacity"] = v
-            bg_op_lbl.configure(text=f"{v}%")
-            apply_opacity()
-
-        bg_op_scale = tk.Scale(
-            float_style_card,
-            from_=OPACITY_MIN,
-            to=OPACITY_MAX,
-            orient="horizontal",
-            variable=bg_op_var,
-            command=on_bg_opacity,
-            showvalue=False,
-            length=220,
-            bg=S_CARD_BG,
-            fg=S_TEXT,
-            highlightthickness=0,
-            troughcolor=S_INPUT_BG,
-            activebackground=S_ACCENT,
-            sliderrelief="flat",
-            bd=0,
-        )
-        bg_op_scale.pack(fill="x", pady=(4, 12))
-
-        tx_hdr = tk.Frame(float_style_card, bg=S_CARD_BG)
-        tx_hdr.pack(fill="x")
-        tk.Label(
-            tx_hdr,
-            text=_tr("文字不透明度", 'Text Opacity'),
-            fg=S_TEXT,
-            bg=S_CARD_BG,
-            font=settings_font,
-            anchor="w",
-        ).pack(side="left")
-        tx_op_var = tk.IntVar(value=int(state["text_opacity"]))
-        tx_op_lbl = tk.Label(
-            tx_hdr,
-            text=f"{tx_op_var.get()}%",
-            fg=S_ACCENT,
-            bg=S_CARD_BG,
-            font=settings_font_section,
-        )
-        tx_op_lbl.pack(side="right")
-
-        def on_text_opacity(val: str) -> None:
-            try:
-                v = int(float(val))
-            except Exception:
-                return
-            v = _clamp_opacity(v, TEXT_OPACITY_DEFAULT)
-            state["text_opacity"] = v
-            tx_op_lbl.configure(text=f"{v}%")
-            apply_opacity()
-
-        tx_op_scale = tk.Scale(
-            float_style_card,
-            from_=OPACITY_MIN,
-            to=OPACITY_MAX,
-            orient="horizontal",
-            variable=tx_op_var,
-            command=on_text_opacity,
-            showvalue=False,
-            length=220,
-            bg=S_CARD_BG,
-            fg=S_TEXT,
-            highlightthickness=0,
-            troughcolor=S_INPUT_BG,
-            activebackground=S_ACCENT,
-            sliderrelief="flat",
-            bd=0,
-        )
-        tx_op_scale.pack(fill="x", pady=(4, 8))
-
-        opacity_hint = tk.Label(
-            float_style_card,
-            text=_tr("拖动滑块即可实时预览。数值越高越不透明，底板与文字互不影响。", 'Drag sliders to preview. Higher values are more opaque; background and text are independent.'),
-            fg=S_MUTED,
-            bg=S_CARD_BG,
-            font=settings_font_small,
-            anchor="w",
-            wraplength=510,
-            justify="left",
-        )
-        opacity_hint.pack(fill="x")
-
-        float_size_card = make_card(floating_pad, pady=(0, 0))
-        tk.Label(
-            float_size_card,
-            text=_tr("尺寸与交互", 'Size & Interaction'),
-            fg=S_TEXT,
-            bg=S_CARD_BG,
-            font=settings_font_section,
-            anchor="w",
-        ).pack(fill="x", pady=(0, 4))
-        resize_var = tk.BooleanVar(value=bool(state["allow_resize"]))
-
-        def on_resize_toggle() -> None:
-            set_allow_resize(bool(resize_var.get()), persist=True)
-
-        chk = tk.Checkbutton(
-            float_size_card,
-            text=_tr("允许拖动悬浮窗右下角调整尺寸", 'Allow resizing from the HUD’s bottom-right corner'),
-            variable=resize_var,
-            command=on_resize_toggle,
-            bg=S_CARD_BG,
-            fg=S_TEXT,
-            activebackground=S_CARD_BG,
-            activeforeground=S_TEXT,
-            selectcolor=S_INPUT_BG,
-            font=settings_font,
-            anchor="w",
-            bd=0,
-            highlightthickness=0,
-        )
-        chk.pack(fill="x", pady=(0, 4))
-        tk.Label(
-            float_size_card,
-            text=_tr("开启后，拖动悬浮窗右下角 ◢ 可自由改变宽度和高度；高度不会小于内容所需，避免上下裁切。", 'Drag the bottom-right ◢ to resize width and height. Height stays large enough to show all content.'),
-            fg=S_MUTED,
-            bg=S_CARD_BG,
-            font=settings_font_small,
-            wraplength=510,
-            justify="left",
-            anchor="w",
-        ).pack(fill="x")
-        update_panel_status()
+        initial_builder = lazy_tab_builders.pop(active_main_tab["title"], None)
+        if initial_builder is not None:
+            initial_builder()
 
         def on_close() -> None:
             state["wallpaper_scan_callback"] = None
-            _commit_wallpaper_settings_before_close(
-                commit_all_directory_weights,
-                lambda: apply_wallpaper_image_seconds(
-                    persist=False,
-                    reprepare=True,
-                ),
-            )
-            final_font_size = int(size_var.get())
+            state["settings_readings_changed"] = None
+            hide_badge_tip()
+            if commit_all_directory_weights is not None and apply_wallpaper_image_seconds is not None:
+                _commit_wallpaper_settings_before_close(
+                    commit_all_directory_weights,
+                    lambda: apply_wallpaper_image_seconds(
+                        persist=False,
+                        reprepare=True,
+                    ),
+                )
+            final_font_size = int(size_var.get()) if size_var is not None else int(state["font_size"])
             apply_font_size(final_font_size, persist=False, relayout=False)
             cfg["font_size"] = final_font_size
             cfg["card_width"] = int(state["card_width"])
@@ -14778,7 +14963,8 @@ def run_ui() -> None:
             cfg["wallpaper_image_seconds"] = int(state["wallpaper_image_seconds"])
             cfg["wallpaper_audio"] = bool(state.get("wallpaper_audio", True))
             persist_timezone()
-            persist_shortcut_from_ui()
+            if persist_shortcut_from_ui is not None:
+                persist_shortcut_from_ui()
             persist_providers(refresh=False)
             if not state.get("panel_active"):
                 cfg["x"] = root.winfo_x()

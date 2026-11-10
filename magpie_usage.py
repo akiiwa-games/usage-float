@@ -106,6 +106,27 @@ def reread_targets(payload, source: Source, now: float, max_age: float, force: b
     return targets
 
 
+GENERAL_WINDOWS = {"5 hours": ("five_hour", "5h"), "7 days": ("seven_day", "7d")}
+SCOPED_WEEK_PREFIX = "7 days · "
+
+
+def window_name(name):
+    """(window id, label) for a Magpie window name, or None for one we do not show.
+
+    "7 days · Fable" is the account's model-scoped week; it gets the id Claude's own usage API gives it
+    (weekly_fable), so the Settings item "<account>:fable" shows it like a direct Claude account's fable 7d."""
+    if not isinstance(name, str):
+        return None
+    if name in GENERAL_WINDOWS:
+        return GENERAL_WINDOWS[name]
+    if name.startswith(SCOPED_WEEK_PREFIX):
+        model = name[len(SCOPED_WEEK_PREFIX):].strip()
+        slug = "_".join(model.lower().split())
+        if slug and slug.replace("_", "").isalnum():
+            return f"weekly_{slug}", f"{model.lower()} 7d"
+    return None
+
+
 def parse_quota(payload, source: Source):
     """Read the configured account; with none (or '*'), every subscription account of the provider."""
     if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
@@ -119,15 +140,15 @@ def parse_quota(payload, source: Source):
     quota = matches[0]
     if quota.get("error") or not quota.get("readAt"):
         raise ValueError("VPS 暂未取得有效用量")
-    names = {"5 hours": ("five_hour", "5h"), "7 days": ("seven_day", "7d")}
     windows = []
     for window in quota.get("windows") or []:
-        if not isinstance(window, dict) or window.get("name") not in names:
+        named = window_name(window.get("name")) if isinstance(window, dict) else None
+        if named is None:
             continue
         value = window.get("used")
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
             raise ValueError("Magpie 用量窗口无效")
-        window_id, label = names[window["name"]]
+        window_id, label = named
         windows.append(dict(id=window_id, label=label, used_pct=float(value),
                             resets_at=window.get("resetsAt")))
     if not windows:

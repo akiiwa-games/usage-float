@@ -226,6 +226,40 @@ class WallpaperSourceChangeTests(unittest.TestCase):
         result, calls = self.run_scenario(scenario)
         self.assertEqual(calls["mpv_start"], [[result["clip"]]])
 
+    def test_first_visit_to_the_lazily_built_wallpaper_tab_starts_the_download(self) -> None:
+        def scenario(scope, state, web, release, pump, result, calls):
+            scope["open_settings"]("用量")
+            pump(0.5)
+            win = state["settings_win"]
+            result["children_at_open"] = len(win.winfo_children())
+            result["status_at_open"] = uf._MPV_PROVISIONER.snapshot().get("status")
+            win._select_settings_tab("动态壁纸")
+            pump(0.5)
+            result["status_after_visit"] = uf._MPV_PROVISIONER.snapshot().get("status")
+            release.set()
+            pump(1.5)
+            result["status_after_release"] = uf._MPV_PROVISIONER.snapshot().get("status")
+            win._select_settings_tab("用量")
+            win._select_settings_tab("动态壁纸")
+            pump(0.5)
+            result["status_after_revisit"] = uf._MPV_PROVISIONER.snapshot().get("status")
+
+        result, _calls = self.run_scenario(scenario)
+        self.assertGreater(result["children_at_open"], 0)
+        self.assertEqual(result["status_at_open"], "idle", "other tabs must not start the download")
+        self.assertEqual(result["status_after_visit"], "running")
+        self.assertEqual(result["status_after_release"], "done")
+        self.assertEqual(result["status_after_revisit"], "done", "mpv is present; no second download")
+
+    def test_opening_settings_straight_onto_the_wallpaper_tab_starts_the_download(self) -> None:
+        def scenario(scope, state, web, release, pump, result, calls):
+            scope["open_settings"]("动态壁纸")
+            pump(0.5)
+            result["status"] = uf._MPV_PROVISIONER.snapshot().get("status")
+
+        result, _calls = self.run_scenario(scenario)
+        self.assertEqual(result["status"], "running")
+
 
 class HandoffDetectionTests(unittest.TestCase):
     PROFILE = r"C:\Users\u\.usage-float\browser-sessions\web-video-abc123"
