@@ -1,16 +1,17 @@
 {
-  "build": "20260809",
-  "archive": "mpv-x86_64-20260809-git-dd5d17d328.7z",
-  "sha256": "fa0dd286b24e9c927203b2a5eaa2e1948891d69eb22e9826120d4ce7fc2bc4c4",
-  "size": 33575128,
+  "build": "20261108",
+  "archive": "mpv-x86_64-20261108-git-55d3feb45c.7z",
+  "sha256": "465faafbf90527421ccc304870f02e59f3f47d3361a6f526ef95f40f8f2c2459",
+  "size": 34145102,
   "urls": [
-    "https://downloads.sourceforge.net/project/mpv-player-windows/64bit/mpv-x86_64-20260809-git-dd5d17d328.7z",
-    "https://sourceforge.net/projects/mpv-player-windows/files/64bit/mpv-x86_64-20260809-git-dd5d17d328.7z/download"
+    "https://github.com/akiiwa-games/usage-float/releases/download/mpv-20261108/mpv-x86_64-20261108-git-55d3feb45c.7z",
+    "https://downloads.sourceforge.net/project/mpv-player-windows/64bit/mpv-x86_64-20261108-git-55d3feb45c.7z",
+    "https://sourceforge.net/projects/mpv-player-windows/files/64bit/mpv-x86_64-20261108-git-55d3feb45c.7z/download"
   ],
   "files": [
     "mpv.exe",
     "d3dcompiler_43.dll"
   ],
-  "source": "shinchiro/mpv-winbuild-cmake weekly build, mirrored on SourceForge (GitHub release assets are pruned after about 40 days)",
-  "mpv_commit": "dd5d17d328"
+  "source": "shinchiro/mpv-winbuild-cmake release 20261108 (build commit bda10a2816ce9908d419b3f4b564227330457e76); the same file is re-hosted as a usage-float release asset and mirrored on SourceForge",
+  "mpv_commit": "55d3feb45c3dda1afd02b3087d3463c57d6514f7"
 }

@@ -252,16 +252,128 @@ class EnsureMpvTests(unittest.TestCase):
         self.assertFalse((self.target / "updater.bat").exists())
 
 
+class StaleWorkDirTests(unittest.TestCase):
+    def test_next_run_sweeps_leftovers_of_interrupted_runs_only(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runtime = Path(tmp) / "runtime"
+            target = runtime / "mpv"
+            for name in (".mpv-provision-abc123", ".mpv-old-0f0f"):
+                (runtime / name).mkdir(parents=True)
+                (runtime / name / "partial.7z").write_bytes(b"x" * 1024)
+            (runtime / "keep-me").mkdir()
+            (runtime / ".mpv-provision-note.txt").write_text("a file, not our work dir", encoding="utf-8")
+            payload = b"good"
+            pin = _pin(payload)
+
+            mp.ensure_mpv(target, pin=pin, opener=_Opener({pin["urls"][0]: payload}), extractor=_fake_extractor, fallback=None)
+
+            names = sorted(p.name for p in runtime.iterdir())
+            self.assertEqual(names, [".mpv-provision-note.txt", ".mpv-provision.lock", "keep-me", "mpv"])
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows file locking")
+    def test_a_dir_with_a_file_in_use_is_skipped_not_fatal(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runtime = Path(tmp)
+            old = runtime / ".mpv-old-busy"
+            old.mkdir()
+            exe = old / "mpv.exe"
+            shutil.copyfile(sys.executable, exe)
+            busy = subprocess.Popen([str(exe), "-c", "import time; time.sleep(30)"], creationflags=subprocess.CREATE_NO_WINDOW)
+            try:
+                mp._sweep_stale_work_dirs(runtime)
+                self.assertTrue(exe.exists(), "a running mpv.exe cannot be deleted; the sweep must skip it")
+            finally:
+                busy.kill()
+                busy.wait()
+            self.assertEqual(mp._sweep_stale_work_dirs(runtime), [".mpv-old-busy"])
+
+
+@unittest.skipUnless(sys.platform == "win32", "Windows Job Objects")
+class CurlLifetimeTests(unittest.TestCase):
+    def test_job_kills_its_processes_when_the_owning_app_exits(self) -> None:
+        """The app is killed mid-download: the OS closes the job handle and ends curl with it."""
+        code = (
+            "import subprocess, sys, time\n"
+            f"sys.path.insert(0, {str(HERE)!r})\n"
+            "import mpv_provision as mp\n"
+            "job = mp._KillOnCloseJob()\n"
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], creationflags=0x08000000)\n"
+            "job.assign(child)\n"
+            "print(child.pid, flush=True)\n"
+            "time.sleep(60)\n"
+        )
+        app = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True,
+                               creationflags=subprocess.CREATE_NO_WINDOW)
+        child_pid = int(app.stdout.readline().strip())
+        import usage_float as uf
+
+        child = uf._AdoptedBrowserProcess(child_pid)
+        try:
+            self.assertIsNone(child.poll())
+            app.kill()  # hard exit: no atexit, no finally
+            app.wait(10)
+            child.wait(10)
+            self.assertIsNotNone(child.poll(), "the job must take its process down with the app")
+        finally:
+            child.terminate()
+            app.stdout.close()
+
+    def test_curl_is_bounded_and_runs_inside_the_job(self) -> None:
+        seen: dict = {}
+
+        class FakeProcess:
+            returncode = 0
+            stderr = None
+
+            def __init__(self, argv, **kwargs):
+                seen["argv"] = argv
+                self._handle = 0
+
+            def poll(self):
+                return 0
+
+            def kill(self):
+                pass
+
+            def wait(self):
+                return 0
+
+        assigned: list = []
+        original_assign = mp._KillOnCloseJob.assign
+        with TemporaryDirectory() as tmp:
+            try:
+                mp._KillOnCloseJob.assign = lambda self, process: assigned.append(process)
+                original_popen = mp.subprocess.Popen
+                mp.subprocess.Popen = FakeProcess
+                try:
+                    mp._download_with_curl("https://example.invalid/a.7z", Path(tmp) / "a.7z", None, 0, 30)
+                finally:
+                    mp.subprocess.Popen = original_popen
+            finally:
+                mp._KillOnCloseJob.assign = original_assign
+        argv = seen["argv"]
+        self.assertIn("--max-time", argv)
+        self.assertIn("--speed-time", argv)
+        self.assertIn("--connect-timeout", argv)
+        self.assertNotIn("-k", argv)
+        self.assertNotIn("--insecure", argv)
+        self.assertEqual(len(assigned), 1)
+
+
 class BackgroundProvisionerTests(unittest.TestCase):
     def test_start_returns_at_once_and_does_not_double_start(self) -> None:
         release = threading.Event()
         calls: list[Path | None] = []
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        exe = Path(tmp.name) / "mpv.exe"
 
         def runner(target, progress=None):
             calls.append(target)
             progress(5, 10)
             release.wait(5)
-            return Path("mpv.exe")
+            exe.write_bytes(b"mpv")
+            return exe
 
         provisioner = mp.BackgroundProvisioner(target=Path("t"), runner=runner)
         began = time.monotonic()
@@ -278,6 +390,27 @@ class BackgroundProvisionerTests(unittest.TestCase):
         self.assertEqual(provisioner.snapshot()["status"], "done")
         self.assertFalse(provisioner.start(), "nothing to do after success")
         self.assertEqual(len(calls), 1)
+
+    def test_mpv_deleted_after_success_is_downloaded_again(self) -> None:
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        exe = Path(tmp.name) / "mpv.exe"
+        runs: list[int] = []
+
+        def runner(target, progress=None):
+            runs.append(1)
+            exe.write_bytes(b"mpv")
+            return exe
+
+        provisioner = mp.BackgroundProvisioner(runner=runner)
+        provisioner.start()
+        provisioner.join(5)
+        self.assertFalse(provisioner.start(retry=True), "mpv is there: nothing to do")
+        exe.unlink()  # antivirus quarantine or a manual cleanup
+        self.assertTrue(provisioner.start(retry=True))
+        provisioner.join(5)
+        self.assertEqual(len(runs), 2)
+        self.assertTrue(exe.is_file())
 
     def test_failure_is_reported_and_only_retried_on_request(self) -> None:
         attempts: list[int] = []
@@ -309,9 +442,14 @@ class PinTests(unittest.TestCase):
         self.assertTrue(all(url.startswith("https://") for url in pin["urls"]))
         self.assertIn(pin["archive"], pin["urls"][0])
         self.assertEqual(pin["files"], ["mpv.exe", "d3dcompiler_43.dll"])
+        self.assertTrue(pin["urls"][0].startswith("https://github.com/akiiwa-games/usage-float/releases/download/mpv-"),
+                        "the usage-float release asset is the primary source")
+        self.assertTrue(any("sourceforge" in url for url in pin["urls"][1:]), "SourceForge stays as the fallback")
+        self.assertTrue(all(url.endswith(pin["archive"]) or url.endswith(pin["archive"] + "/download") for url in pin["urls"]))
         script = (HERE / "install-mpv.ps1").read_text(encoding="utf-8")
         self.assertIn("mpv-pin.json", script)
         self.assertIsNone(re.search(r"[0-9a-f]{64}", script), "the hash belongs in mpv-pin.json only")
+        self.assertIn('System32\\tar.exe', script, "GNU tar from Git for Windows cannot read 7z")
         notices = (HERE / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
         self.assertIn(pin["sha256"], notices)
         self.assertIn(pin["archive"], notices)

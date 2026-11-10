@@ -33,7 +33,8 @@ try {
     }
 
     New-Item -ItemType Directory -Path $tempExtract -Force | Out-Null
-    & tar.exe -xf $tempArchive -C $tempExtract @($pin.files)
+    # System32's bsdtar reads 7z; a Git-for-Windows GNU tar earlier on PATH does not.
+    & (Join-Path $env:SystemRoot "System32\tar.exe") -xf $tempArchive -C $tempExtract @($pin.files)
     if ($LASTEXITCODE -ne 0) {
         throw "Failed to extract mpv archive (tar exit $LASTEXITCODE)"
     }

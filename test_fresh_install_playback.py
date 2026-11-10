@@ -94,20 +94,182 @@ class MpvProvisionWiringTests(unittest.TestCase):
         self.assertIsNone(uf._MPV_PROVISIONER._thread)
 
 
+class WallpaperSourceChangeTests(unittest.TestCase):
+    """Real run_ui callbacks; fake download and fake players (no mpv or browser is started)."""
+
+    def run_scenario(self, scenario):
+        import threading
+        import tkinter as tk
+
+        release = threading.Event()
+
+        def fake_runner(target, progress=None):
+            if progress:
+                progress(25, 100)
+            release.wait(30)
+            target = Path(target)
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "mpv.exe").write_bytes(b"fake")
+            return target / "mpv.exe"
+
+        calls = {"web_start": 0, "web_stop_while_running": 0, "mpv_start": []}
+
+        class FakeProc:
+            pid = 4
+
+            def poll(self):
+                return None
+
+        def web_start(player, executable, host_hwnd, url, **kw):
+            calls["web_start"] += 1
+            player.process = FakeProc()
+            return True, ""
+
+        def web_stop(player):
+            if player.process is not None:
+                calls["web_stop_while_running"] += 1
+            player.process = None
+            player.browser_hwnd = 0
+
+        def web_poll_window(player, host_hwnd, width, height, *, offscreen):
+            if player.process is None:
+                return 0
+            player.browser_hwnd = 0x7FFF0001
+            return player.browser_hwnd
+
+        def mpv_start(player, executable, host_hwnd, files, **kw):
+            calls["mpv_start"].append([str(f) for f in files])
+            return False, "(test: mpv start intercepted)"
+
+        real_thread_start = threading.Thread.start
+        result: dict = {}
+
+        def fake_mainloop(root, *args, **kwargs):
+            frame = sys._getframe(1)
+            while frame is not None and frame.f_code.co_name != "run_ui":
+                frame = frame.f_back
+            scope = frame.f_locals
+            state, web = scope["state"], scope["browser_wallpaper_player"]
+
+            def pump(seconds):
+                end = time.monotonic() + seconds
+                while time.monotonic() < end:
+                    root.update()
+                    time.sleep(0.02)
+
+            try:
+                scenario(scope, state, web, release, pump, result, calls)
+            finally:
+                release.set()
+                scope["do_quit"]()
+
+        with TemporaryDirectory() as tmp:
+            clip = Path(tmp) / "clip.mp4"
+            clip.write_bytes(b"\0" * 64)
+            result["clip"] = str(clip)
+            provisioner = uf.mpv_provision.BackgroundProvisioner(runner=fake_runner)
+            with patch.object(uf, "CONFIG_PATH", Path(tmp) / "config.json"), \
+                    patch.object(uf, "HOME", Path(tmp)), \
+                    patch.object(uf, "fetch_all", return_value=[]), \
+                    patch.object(uf, "_MPV_PROVISIONER", provisioner), \
+                    patch.object(uf, "_find_mpv_executable", lambda configured=None: (
+                        (Path(tmp) / ".usage-float" / "runtime" / "mpv" / "mpv.exe")
+                        if (Path(tmp) / ".usage-float" / "runtime" / "mpv" / "mpv.exe").is_file() else None)), \
+                    patch.object(uf, "_find_browser_executable", lambda configured=None: Path(sys.executable)), \
+                    patch.object(uf._BrowserWebVideoPlayer, "start", web_start), \
+                    patch.object(uf._BrowserWebVideoPlayer, "stop", web_stop), \
+                    patch.object(uf._BrowserWebVideoPlayer, "check_alive", lambda player: player.process is not None), \
+                    patch.object(uf._BrowserWebVideoPlayer, "poll_window", web_poll_window), \
+                    patch.object(uf._BrowserWebVideoPlayer, "is_ready", lambda player: player.process is not None), \
+                    patch.object(uf._MpvWallpaperPlayer, "start", mpv_start), \
+                    patch.object(threading.Thread, "start",
+                                 lambda thread: real_thread_start(thread) if thread.name == "mpv-provision" else None), \
+                    patch.object(tk.Tk, "mainloop", fake_mainloop):
+                uf.run_ui()
+        return result, calls
+
+    def test_web_page_dropped_while_mpv_downloads_keeps_playing(self) -> None:
+        """Owner's order: video needs mpv -> download starts -> user drops a web page -> download ends."""
+
+        def scenario(scope, state, web, release, pump, result, calls):
+            scope["handle_dropped_files"]([result["clip"]])
+            pump(1.0)
+            result["waiting_after_video"] = bool(state.get("wallpaper_waiting_for_mpv"))
+            scope["handle_dropped_files"](["https://example.com/watch"])
+            pump(2.0)
+            result["waiting_after_web"] = bool(state.get("wallpaper_waiting_for_mpv"))
+            release.set()
+            pump(2.0)
+            result["web_running"] = web.running
+            result["active"] = bool(state.get("wallpaper_active"))
+            result["web_mode"] = bool(state.get("wallpaper_web_mode"))
+            result["host_placed"] = bool(scope["wallpaper_host"].winfo_manager())
+            result["stops_before_quit"] = calls["web_stop_while_running"]
+
+        result, calls = self.run_scenario(scenario)
+        self.assertTrue(result["waiting_after_video"])
+        self.assertFalse(result["waiting_after_web"], "a new source cancels the pending mpv resume")
+        self.assertTrue(result["web_running"], "the web page must survive the download finishing")
+        self.assertTrue(result["active"])
+        self.assertTrue(result["web_mode"])
+        self.assertTrue(result["host_placed"])
+        self.assertEqual(result["stops_before_quit"], 0)
+        self.assertEqual(calls["mpv_start"], [])
+
+    def test_video_still_resumes_when_nothing_else_was_dropped(self) -> None:
+        def scenario(scope, state, web, release, pump, result, calls):
+            scope["handle_dropped_files"]([result["clip"]])
+            pump(1.0)
+            release.set()
+            pump(2.0)
+
+        result, calls = self.run_scenario(scenario)
+        self.assertEqual(calls["mpv_start"], [[result["clip"]]])
+
+
 class HandoffDetectionTests(unittest.TestCase):
-    def test_prefers_the_child_that_owns_a_browser_window(self) -> None:
-        rows = [(10, 1, "msedge.exe"), (11, 10, "msedge.exe"), (12, 10, "msedge.exe"), (13, 12, "msedge.exe")]
-        self.assertEqual(uf._find_handoff_browser_pid(10, "msedge.exe", rows, window_pid_check=lambda pid: pid == 12), 12)
+    PROFILE = r"C:\Users\u\.usage-float\browser-sessions\web-video-abc123"
+    LAUNCHED = 1_000
 
-    def test_falls_back_to_the_child_with_its_own_children(self) -> None:
-        # 11 is a crashpad handler (no children); 12 is the relaunched browser with a renderer.
-        rows = [(11, 10, "msedge.exe"), (12, 10, "MSEDGE.EXE"), (13, 12, "msedge.exe"), (14, 10, "other.exe")]
-        self.assertEqual(uf._find_handoff_browser_pid(10, "msedge.exe", rows, window_pid_check=lambda pid: False), 12)
+    def identity(self, table):
+        return lambda pid: table.get(pid)
 
-    def test_no_handoff(self) -> None:
-        rows = [(11, 10, "msedge.exe"), (14, 10, "other.exe")]
-        self.assertEqual(uf._find_handoff_browser_pid(10, "msedge.exe", rows, window_pid_check=lambda pid: False), 0)
-        self.assertEqual(uf._find_handoff_browser_pid(0, "msedge.exe", rows), 0)
+    def test_adopts_only_a_child_created_after_launch_with_our_profile(self) -> None:
+        rows = [(11, 10, "msedge.exe"), (12, 10, "msedge.exe"), (13, 12, "msedge.exe")]
+        table = {
+            11: (2_000, f'"msedge.exe" --type=crashpad-handler --database={self.PROFILE}\\Crashpad'),
+            12: (2_000, f'"msedge.exe" --user-data-dir={self.PROFILE} --app=https://x'),
+            13: (2_100, f'"msedge.exe" --type=renderer --user-data-dir={self.PROFILE}'),
+        }
+        self.assertEqual(uf._find_handoff_browser_pid(10, "msedge.exe", self.PROFILE, self.LAUNCHED, rows, self.identity(table)), 12)
+
+    def test_pid_reuse_never_adopts_the_users_browser(self) -> None:
+        """The user's browser lists a long-dead parent whose pid our launcher happened to reuse."""
+        rows = [(20808, 39280, "chrome.exe"), (20900, 20808, "chrome.exe")]
+        older = {20808: (500, '"chrome.exe" --profile-directory=Default'), 20900: (600, '"chrome.exe" --type=renderer')}
+        self.assertEqual(uf._find_handoff_browser_pid(39280, "chrome.exe", self.PROFILE, self.LAUNCHED, rows, self.identity(older)), 0)
+        # Created after our launch (a fresh user window) but without our temp profile: not ours.
+        newer = {20808: (5_000, '"chrome.exe" --profile-directory=Default')}
+        self.assertEqual(uf._find_handoff_browser_pid(39280, "chrome.exe", self.PROFILE, self.LAUNCHED, rows, self.identity(newer)), 0)
+        # Our profile string but created before our launch: not ours either.
+        stale = {20808: (999, f'"chrome.exe" --user-data-dir={self.PROFILE}')}
+        self.assertEqual(uf._find_handoff_browser_pid(39280, "chrome.exe", self.PROFILE, self.LAUNCHED, rows, self.identity(stale)), 0)
+
+    def test_unreadable_or_missing_identity_is_not_ours(self) -> None:
+        rows = [(12, 10, "msedge.exe")]
+        self.assertEqual(uf._find_handoff_browser_pid(10, "msedge.exe", self.PROFILE, self.LAUNCHED, rows, lambda pid: None), 0)
+        self.assertEqual(uf._find_handoff_browser_pid(10, "msedge.exe", None, self.LAUNCHED, rows), 0)
+        self.assertEqual(uf._find_handoff_browser_pid(0, "msedge.exe", self.PROFILE, self.LAUNCHED, rows), 0)
+
+    def test_stop_sweep_lists_only_profile_processes(self) -> None:
+        rows = [(1, 0, "msedge.exe"), (2, 0, "msedge.exe"), (3, 0, "msedge.exe"), (4, 0, "other.exe")]
+        table = {
+            1: (2_000, f"msedge.exe --user-data-dir={self.PROFILE}"),
+            2: (2_000, "msedge.exe --profile-directory=Default"),
+            3: (10, f"msedge.exe --user-data-dir={self.PROFILE}"),
+            4: (2_000, f"other.exe {self.PROFILE}"),
+        }
+        self.assertEqual(uf._list_profile_processes("msedge.exe", self.PROFILE, self.LAUNCHED, rows, self.identity(table)), [1])
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows process handoff")
@@ -141,38 +303,90 @@ class BrowserStartFailureTests(unittest.TestCase):
         self.assertIn("2", message)  # argparse-style usage error exit code
         self.assertTrue("DevTools" in message or "调试端口" in message, message)
 
-    def test_relaunched_browser_is_adopted_instead_of_reported_as_failed(self) -> None:
+    def test_relaunched_browser_is_adopted_and_stop_ends_only_our_processes(self) -> None:
+        profile = self.root / "web-video-test"
+        profile.mkdir()
         pid_file = self.root / "browser.pid"
         child = self.root / "browser.py"
         child.write_text(textwrap.dedent(f"""
             import os, subprocess, sys, time
             open({str(pid_file)!r}, "w").write(str(os.getpid()))
-            renderer = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+            subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", "--type=renderer",
+                              {"--user-data-dir=" + str(profile)!r}])
             time.sleep(60)
         """), encoding="utf-8")
         launcher = self.root / "launcher.py"
         launcher.write_text(textwrap.dedent(f"""
             import subprocess, sys, time, os
-            subprocess.Popen([sys.executable, {str(child)!r}])
+            subprocess.Popen([sys.executable, {str(child)!r}, {"--user-data-dir=" + str(profile)!r}])
             deadline = time.time() + 10
             while not os.path.exists({str(pid_file)!r}) and time.time() < deadline:
                 time.sleep(0.05)
             time.sleep(0.5)
             sys.exit(0)
         """), encoding="utf-8")
-        self.player._exe_name = Path(sys.executable).name
-        self.player.process = subprocess.Popen([sys.executable, str(launcher)], creationflags=subprocess.CREATE_NO_WINDOW)
+        # Carries our profile string but predates our launch: must never be treated as ours.
+        bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", f"--user-data-dir={profile}"],
+                                     creationflags=subprocess.CREATE_NO_WINDOW)
+        self.addCleanup(bystander.kill)
+        time.sleep(0.05)
+        exe = Path(sys.executable).name
+        self.player._exe_name = exe
+        self.player.profile_dir = profile
+        self.player._launched_at = uf._filetime_now()
+        self.player.process = subprocess.Popen([sys.executable, str(launcher), f"--user-data-dir={profile}"],
+                                               creationflags=subprocess.CREATE_NO_WINDOW)
         launcher_pid = self.player.process.pid
+        launched_at = self.player._launched_at
 
         adopted = self.wait_for(lambda: self.player.check_alive() and self.player.process.pid != launcher_pid)
         self.assertTrue(adopted, self.player.last_error)
         browser_pid = int(pid_file.read_text())
         self.assertEqual(self.player.process.pid, browser_pid)
-        self.assertTrue(self.player.running)
+        owned = uf._list_profile_processes(exe, profile, launched_at)
+        self.assertIn(browser_pid, owned)
+        self.assertNotIn(bystander.pid, owned)
         handle = self.player.process
 
         self.player.stop()
         self.assertIsNotNone(self.wait_for(lambda: handle.poll()), "stop() must end the adopted browser")
+        self.assertTrue(self.wait_for(lambda: uf._list_profile_processes(exe, profile, launched_at) == []),
+                        "stop() must end every helper of our profile")
+        self.assertIsNone(bystander.poll(), "a process that predates our launch must survive stop()")
+
+    def test_pid_reuse_does_not_adopt_an_unrelated_process(self) -> None:
+        """Reviewer's orphan probe: the launcher pid equals the dead parent pid of an unrelated process."""
+        parent = subprocess.run(
+            [sys.executable, "-c", "import subprocess, sys; p = subprocess.Popen([sys.executable, '-c', "
+             "'import time; time.sleep(60)'], creationflags=0x08000000); print(p.pid)"],
+            capture_output=True, text=True, timeout=30,
+        )
+        unrelated_pid = int(parent.stdout.strip())
+        parents = {pid: ppid for pid, ppid, _image in uf._list_windows_processes()}
+        dead_parent = parents.get(unrelated_pid)
+        self.assertIsNotNone(dead_parent)
+        unrelated = uf._AdoptedBrowserProcess(unrelated_pid)
+        self.addCleanup(unrelated.terminate)
+
+        class DeadLauncher:
+            pid = dead_parent
+            returncode = 0
+
+            def poll(self):
+                return 0
+
+        profile = self.root / "web-video-x"
+        profile.mkdir()
+        self.player._exe_name = Path(sys.executable).name
+        self.player.profile_dir = profile
+        self.player._launched_at = uf._filetime_now()
+        self.player.process = DeadLauncher()
+
+        self.assertTrue(self.wait_for(lambda: not self.player.check_alive()), "must report the exit, not adopt")
+        self.assertIsInstance(self.player.process, DeadLauncher)
+        self.player.stop()
+        time.sleep(0.6)
+        self.assertIsNone(unrelated.poll(), "stop() must not touch the unrelated process")
 
     def test_cdp_status_describes_each_stage(self) -> None:
         self.assertTrue("DevToolsActivePort" in self.player.cdp_status())

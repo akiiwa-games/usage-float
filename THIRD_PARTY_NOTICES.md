@@ -8,10 +8,15 @@ rendering, and Windows `HWND` embedding are provided by mpv; Usage Float does
 not implement its own media decoder.
 
 - Project: https://github.com/mpv-player/mpv
-- Windows build: shinchiro/mpv-winbuild-cmake weekly build `20260809`, mirrored at
-  https://sourceforge.net/projects/mpv-player-windows/files/64bit/
-- Pinned archive: `mpv-x86_64-20260809-git-dd5d17d328.7z` (mpv commit `dd5d17d328`)
-- SHA-256: `fa0dd286b24e9c927203b2a5eaa2e1948891d69eb22e9826120d4ce7fc2bc4c4`
+- Windows build: shinchiro/mpv-winbuild-cmake release `20261108`
+  (https://github.com/shinchiro/mpv-winbuild-cmake/releases/tag/20261108, build
+  commit `bda10a2816ce9908d419b3f4b564227330457e76`)
+- mpv source: https://github.com/mpv-player/mpv/tree/55d3feb45c3dda1afd02b3087d3463c57d6514f7
+- Pinned archive: `mpv-x86_64-20261108-git-55d3feb45c.7z`
+- SHA-256: `465faafbf90527421ccc304870f02e59f3f47d3361a6f526ef95f40f8f2c2459`
+  (the digest GitHub publishes for the upstream asset)
+- Download sources, in order: the `mpv-20261108` release of this repository (same
+  file), then the SourceForge mirror; the same SHA-256 is enforced for every source.
 - The pin lives in `mpv-pin.json`. The source repository does not contain the
   binary: Usage Float downloads and verifies it into `~/.usage-float/runtime/mpv`
   the first time a wallpaper needs it (`mpv_provision.py`), or `install-mpv.ps1`

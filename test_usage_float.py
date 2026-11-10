@@ -2547,7 +2547,9 @@ class BrowserWebVideoWallpaperTests(unittest.TestCase):
             self.assertFalse(player._muted)
             self.assertEqual(len(player._pending_js), 4)
 
-            with patch.object(usage_float_module.subprocess, "run") as mock_run:
+            # stop() ends only processes proven ours: no taskkill /T by pid (the pid may be reused).
+            with patch.object(usage_float_module.subprocess, "run") as mock_run, \
+                    patch.object(usage_float_module, "_list_profile_processes", return_value=[]):
                 player.stop()
                 self.assertFalse(player.running)
                 for _ in range(30):
@@ -2556,7 +2558,8 @@ class BrowserWebVideoWallpaperTests(unittest.TestCase):
                     import time
                     time.sleep(0.02)
                 self.assertFalse(profile_dir.exists())
-                mock_run.assert_called_once()
+                fake_proc.terminate.assert_called_once()
+                mock_run.assert_not_called()
 
 
     def test_dropped_regular_video_loops_single_file_without_playlist(self) -> None:

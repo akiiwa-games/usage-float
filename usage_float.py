@@ -3735,36 +3735,171 @@ def _list_windows_processes() -> list[tuple[int, int, str]]:
         return []
 
 
+def _filetime_now() -> int:
+    """Current system time as a FILETIME (100 ns since 1601), comparable with process creation times."""
+    if sys.platform != "win32":
+        return 0
+    import ctypes
+    from ctypes import wintypes
+
+    value = wintypes.FILETIME()
+    ctypes.windll.kernel32.GetSystemTimeAsFileTime(ctypes.byref(value))
+    return (int(value.dwHighDateTime) << 32) | int(value.dwLowDateTime)
+
+
+def _win_process_api() -> Any:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    ntdll = ctypes.WinDLL("ntdll")
+    ntdll.NtQueryInformationProcess.restype = ctypes.c_long
+    ntdll.NtQueryInformationProcess.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.ULONG, ctypes.POINTER(wintypes.ULONG)
+    ]
+    return kernel32, ntdll
+
+
+def _handle_identity(handle: int) -> tuple[int, str] | None:
+    """(creation FILETIME, command line) for an open process handle, or None."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32, ntdll = _win_process_api()
+    created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+    if not kernel32.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user)):
+        return None
+    creation = (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
+
+    class UNICODE_STRING(ctypes.Structure):
+        _fields_ = [("Length", wintypes.USHORT), ("MaximumLength", wintypes.USHORT), ("Buffer", ctypes.c_void_p)]
+
+    needed = wintypes.ULONG(0)
+    size = 4096
+    for _ in range(3):
+        buffer = ctypes.create_string_buffer(size)
+        # ProcessCommandLineInformation (60), Windows 8.1+; works with PROCESS_QUERY_LIMITED_INFORMATION.
+        status = ntdll.NtQueryInformationProcess(handle, 60, buffer, size, ctypes.byref(needed))
+        if status == 0:
+            text = ctypes.cast(buffer, ctypes.POINTER(UNICODE_STRING)).contents
+            command_line = ctypes.wstring_at(text.Buffer, text.Length // 2) if text.Buffer and text.Length else ""
+            return creation, command_line
+        if needed.value <= size:
+            return None
+        size = int(needed.value) + 64
+    return None
+
+
+def _process_identity(pid: int) -> tuple[int, str] | None:
+    if sys.platform != "win32" or pid <= 0:
+        return None
+    try:
+        kernel32, _ntdll = _win_process_api()
+        handle = kernel32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return None
+        try:
+            return _handle_identity(handle)
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return None
+
+
+def _is_profile_process(identity: tuple[int, str] | None, profile_dir: Path | str, launched_at: int) -> bool:
+    """True only for a process created after our launch whose command line names our temp profile.
+
+    The profile is a fresh mkdtemp directory, so its path cannot appear in the user's own browser.
+    Chromium passes it to every helper (--user-data-dir, crashpad --database), so the same test
+    proves ownership for the browser and its helpers alike.
+    """
+    if identity is None:
+        return False
+    created, command_line = identity
+    if created < int(launched_at):
+        return False
+    marker = str(profile_dir).casefold().rstrip("\\/")
+    return bool(marker) and marker in command_line.casefold()
+
+
+def _is_profile_browser_process(identity: tuple[int, str] | None, profile_dir: Path | str, launched_at: int) -> bool:
+    if not _is_profile_process(identity, profile_dir, launched_at):
+        return False
+    command_line = identity[1].casefold()  # type: ignore[index]
+    return "--user-data-dir=" in command_line and "--type=" not in command_line
+
+
 def _find_handoff_browser_pid(
     launcher_pid: int,
     exe_name: str,
+    profile_dir: Path | str | None,
+    launched_at: int,
     processes: list[tuple[int, int, str]] | None = None,
-    window_pid_check: Callable[[int], bool] | None = None,
+    identity: Callable[[int], tuple[int, str] | None] | None = None,
 ) -> int:
     """Return the browser process the launched executable relaunched itself into, or 0.
 
     Edge/Chrome relaunch themselves (and the launched process exits) when a staged update
     (new_msedge.exe / new_chrome.exe) is swapped in or an old binary hands off to the new
-    version. The relaunched browser is a child of the launcher with the same image name.
-    Crashpad handlers share that name and parent too, so prefer the child that owns a
-    browser window, then the one that already started its own same-named children.
+    version. A parent pid alone proves nothing (Windows reuses pids, and the user's own
+    browser may list a long-dead parent), so the candidate must also have been created after
+    our launch and carry our temp --user-data-dir as a browser (not --type=) process.
     """
-    if launcher_pid <= 0 or not exe_name:
+    if launcher_pid <= 0 or not exe_name or not profile_dir:
         return 0
     rows = _list_windows_processes() if processes is None else processes
+    read_identity = identity or _process_identity
     name = exe_name.casefold()
-    children = [pid for pid, ppid, image in rows if ppid == launcher_pid and image.casefold() == name and pid != launcher_pid]
-    if not children:
-        return 0
-    has_window = window_pid_check or (lambda pid: bool(_find_browser_process_window(pid)))
-    for pid in children:
-        if has_window(pid):
-            return pid
-    spawned = {ppid for _pid, ppid, image in rows if image.casefold() == name}
-    for pid in children:
-        if pid in spawned:
+    for pid, ppid, image in rows:
+        if ppid != launcher_pid or pid == launcher_pid or image.casefold() != name:
+            continue
+        if _is_profile_browser_process(read_identity(pid), profile_dir, launched_at):
             return pid
     return 0
+
+
+def _list_profile_processes(
+    exe_name: str,
+    profile_dir: Path | str,
+    launched_at: int,
+    processes: list[tuple[int, int, str]] | None = None,
+    identity: Callable[[int], tuple[int, str] | None] | None = None,
+) -> list[int]:
+    """Pids of processes proven to belong to our temp browser profile."""
+    if not exe_name or not profile_dir:
+        return []
+    rows = _list_windows_processes() if processes is None else processes
+    read_identity = identity or _process_identity
+    name = exe_name.casefold()
+    return [
+        pid
+        for pid, _ppid, image in rows
+        if image.casefold() == name and _is_profile_process(read_identity(pid), profile_dir, launched_at)
+    ]
+
+
+def _terminate_profile_process(pid: int, profile_dir: Path | str, launched_at: int) -> bool:
+    """Terminate pid only if, re-checked through the same handle, it still belongs to our profile."""
+    if sys.platform != "win32":
+        return False
+    try:
+        kernel32, _ntdll = _win_process_api()
+        handle = kernel32.OpenProcess(0x0001 | 0x1000, False, int(pid))  # TERMINATE | QUERY_LIMITED
+        if not handle:
+            return False
+        try:
+            if not _is_profile_process(_handle_identity(handle), profile_dir, launched_at):
+                return False
+            return bool(kernel32.TerminateProcess(handle, 1))
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return False
 
 
 class _AdoptedBrowserProcess:
@@ -3944,6 +4079,7 @@ class _BrowserWebVideoPlayer:
         self._adopted: bool = False
         self._launcher_exit_code: int | None = None
         self._launcher_exited_at: float | None = None
+        self._launched_at: int = 0
         self._devtools_port: int = 0
         self._cdp_connected: bool = False
         self._cdp_last_error: str = ""
@@ -3970,7 +4106,9 @@ class _BrowserWebVideoPlayer:
                 if self._launcher_exited_at is None:
                     self._launcher_exited_at = time.monotonic()
                     self._launcher_exit_code = code
-                handoff_pid = _find_handoff_browser_pid(process.pid, self._exe_name)
+                handoff_pid = _find_handoff_browser_pid(
+                    process.pid, self._exe_name, self.profile_dir, self._launched_at
+                )
                 if handoff_pid:
                     try:
                         self.process = _AdoptedBrowserProcess(handoff_pid)
@@ -4053,6 +4191,7 @@ class _BrowserWebVideoPlayer:
             self._adopted = False
             self._launcher_exit_code = None
             self._launcher_exited_at = None
+            self._launched_at = 0
             self._devtools_port = 0
             self._cdp_connected = False
             self._cdp_last_error = ""
@@ -4077,6 +4216,8 @@ class _BrowserWebVideoPlayer:
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 1)
                 startupinfo.wShowWindow = 4  # SW_SHOWNOACTIVATE
+            # Anything created from here on with our profile on its command line is ours.
+            self._launched_at = _filetime_now()
             self.process = subprocess.Popen(
                 command,
                 stdin=subprocess.DEVNULL,
@@ -4269,6 +4410,8 @@ class _BrowserWebVideoPlayer:
         self._stop_event.set()
         process = self.process
         profile_dir = self.profile_dir
+        exe_name = self._exe_name
+        launched_at = self._launched_at
         self.process = None
         self.profile_dir = None
         self.browser_hwnd = 0
@@ -4281,21 +4424,10 @@ class _BrowserWebVideoPlayer:
             return
 
         def _reap(proc: Any = process, pdir: Path | None = profile_dir) -> None:
+            # Only processes proven ours are ended: the handle we hold (Popen or adopted), then
+            # helpers created after our launch whose command line names our temp profile.
+            # No taskkill /T: it follows recorded parent pids, which Windows reuses.
             if proc is not None and proc.poll() is None:
-                if sys.platform == "win32":
-                    try:
-                        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                        subprocess.run(
-                            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                            stdin=subprocess.DEVNULL,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            creationflags=flags,
-                            timeout=3.0,
-                            check=False,
-                        )
-                    except Exception:
-                        pass
                 try:
                     proc.terminate()
                     proc.wait(timeout=0.8)
@@ -4304,6 +4436,14 @@ class _BrowserWebVideoPlayer:
                         proc.kill()
                     except Exception:
                         pass
+            if pdir is not None and launched_at and sys.platform == "win32":
+                for _ in range(12):
+                    owned = _list_profile_processes(exe_name, pdir, launched_at)
+                    if not owned:
+                        break
+                    for pid in owned:
+                        _terminate_profile_process(pid, pdir, launched_at)
+                    time.sleep(0.15)
             if pdir is not None:
                 for _ in range(5):
                     try:
@@ -9540,6 +9680,8 @@ def run_ui() -> None:
         state["wallpaper_child_hwnd"] = 0
         state["wallpaper_prepare_started"] = None
         state["wallpaper_prepare_error"] = ""
+        # Any change of wallpaper source cancels "resume once mpv is downloaded".
+        state["wallpaper_waiting_for_mpv"] = False
         if stop_player:
             wallpaper_player.stop()
             browser_wallpaper_player.stop()
@@ -10064,12 +10206,24 @@ def run_ui() -> None:
         snapshot = _mpv_provision_snapshot()
         waiting = bool(state.get("wallpaper_waiting_for_mpv"))
         if snapshot.get("status") == "running":
-            if waiting and state.get("wallpaper_active") and not state.get("wallpaper_preparing"):
+            if (
+                waiting
+                and state.get("wallpaper_active")
+                and not state.get("wallpaper_preparing")
+                and not state.get("wallpaper_web_mode")
+            ):
                 wallpaper_status.configure(text=_mpv_provision_text(snapshot))
             _schedule_mpv_provision_poll()
             return
         state["wallpaper_waiting_for_mpv"] = False
-        if not waiting or not state.get("wallpaper_active") or state.get("wallpaper_preparing"):
+        if (
+            not waiting
+            or not state.get("wallpaper_active")
+            or state.get("wallpaper_preparing")
+            or state.get("wallpaper_web_mode")
+            or browser_wallpaper_player.running
+            or wallpaper_player.running
+        ):
             return
         if snapshot.get("status") == "done":
             _clear_wallpaper_state()
@@ -13449,9 +13603,10 @@ def run_ui() -> None:
             sig = (status, text)
             if mpv_row_state["sig"] != sig:
                 mpv_row_state["sig"] = sig
+                # The summary line above also names the mpv state; keep the two in step.
+                update_wallpaper_folder_status()
                 if available:
                     mpv_row.pack_forget()
-                    update_wallpaper_folder_status()
                 else:
                     mpv_status_lbl.configure(text=text, fg="#f87171" if status == "failed" else S_MUTED)
                     if status == "running":

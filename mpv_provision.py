@@ -75,6 +75,84 @@ def _curl_executable() -> str | None:
     return shutil.which("curl")
 
 
+class _KillOnCloseJob:
+    """Windows Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.
+
+    The job handle lives only in this process, so when the app exits (normally, by crash or
+    by TerminateProcess) the OS closes it and kills every process assigned to the job.
+    """
+
+    def __init__(self) -> None:
+        self.handle = None
+        if sys.platform != "win32":
+            return
+        import ctypes
+        from ctypes import wintypes
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_ulonglong) for name in (
+                "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+        class BASIC_LIMIT(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class EXTENDED_LIMIT(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", BASIC_LIMIT),
+                ("IoInfo", IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        self._kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        self._kernel32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        self._kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        self._kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = self._kernel32.CreateJobObjectW(None, None)
+        if not handle:
+            raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")
+        limits = EXTENDED_LIMIT()
+        limits.BasicLimitInformation.LimitFlags = 0x00002000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        # JobObjectExtendedLimitInformation = 9
+        if not self._kernel32.SetInformationJobObject(handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+            self._kernel32.CloseHandle(handle)
+            raise OSError(ctypes.get_last_error(), "SetInformationJobObject failed")
+        self.handle = handle
+
+    def assign(self, process: subprocess.Popen) -> None:
+        if self.handle is None:
+            return
+        import ctypes
+
+        if not self._kernel32.AssignProcessToJobObject(self.handle, int(process._handle)):  # type: ignore[attr-defined]
+            raise OSError(ctypes.get_last_error(), "AssignProcessToJobObject failed")
+
+    def close(self) -> None:
+        if self.handle is not None:
+            self._kernel32.CloseHandle(self.handle)
+            self.handle = None
+
+
+# curl gives up on its own as well: whole transfer cap, and abort when it stalls below 1 KiB/s for 60 s.
+CURL_MAX_TIME_SECONDS = 1800
+CURL_STALL_SECONDS = 60
+
+
 def _download_with_curl(url: str, destination: Path, progress: Progress | None, total: int, timeout: float) -> None:
     """Fallback for machines whose Python cannot verify the mirror's certificate.
 
@@ -86,15 +164,24 @@ def _download_with_curl(url: str, destination: Path, progress: Progress | None, 
     curl = _curl_executable()
     if not curl:
         raise ProvisionError("curl.exe not available")
+    job = _KillOnCloseJob()
     process = subprocess.Popen(
-        [curl, "-fsSL", "--retry", "2", "--connect-timeout", str(int(timeout)), "-A", USER_AGENT,
-         "-o", str(destination), url],
+        [curl, "-fsSL", "--retry", "2", "--connect-timeout", str(int(timeout)),
+         "--max-time", str(CURL_MAX_TIME_SECONDS), "--speed-limit", "1024", "--speed-time", str(CURL_STALL_SECONDS),
+         "-A", USER_AGENT, "-o", str(destination), url],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
-    deadline = time.monotonic() + max(600.0, timeout * 30)
+    try:
+        job.assign(process)
+    except OSError:
+        process.kill()
+        process.wait()
+        job.close()
+        raise
+    deadline = time.monotonic() + CURL_MAX_TIME_SECONDS + 60
     try:
         while process.poll() is None:
             if time.monotonic() > deadline:
@@ -109,6 +196,7 @@ def _download_with_curl(url: str, destination: Path, progress: Progress | None, 
     finally:
         if process.poll() is None:
             process.kill()
+        job.close()
     stderr = (process.stderr.read() if process.stderr else b"").decode("utf-8", "replace").strip()
     if process.stderr:
         process.stderr.close()
@@ -236,6 +324,25 @@ class _ProcessLock:
 
 
 _THREAD_LOCK = threading.Lock()
+STALE_PREFIXES = (".mpv-provision-", ".mpv-old-")
+
+
+def _sweep_stale_work_dirs(parent: Path) -> list[str]:
+    """Remove work dirs an interrupted run left behind. Call only while holding the provision lock:
+    the lock proves no other install is using them. Only our own prefixes are touched; a file
+    still in use (an old mpv.exe that is playing) is skipped and retried on the next run."""
+    removed: list[str] = []
+    try:
+        entries = list(parent.iterdir())
+    except OSError:
+        return removed
+    for entry in entries:
+        if not entry.name.startswith(STALE_PREFIXES) or entry.is_symlink() or not entry.is_dir():
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+        if not entry.exists():
+            removed.append(entry.name)
+    return removed
 
 
 def ensure_mpv(
@@ -261,6 +368,7 @@ def ensure_mpv(
         if not force and installed(target, pin):
             return target / "mpv.exe"
         target.parent.mkdir(parents=True, exist_ok=True)
+        _sweep_stale_work_dirs(target.parent)
         work = Path(tempfile.mkdtemp(prefix=".mpv-provision-", dir=str(target.parent)))
         try:
             archive = work / str(pin["archive"])
@@ -315,7 +423,12 @@ class BackgroundProvisioner:
         """Start once. Returns False while running, after success, or after a failure unless retry=True."""
         with self._lock:
             status = self._state["status"]
-            if status in ("running", "done") or (status == "failed" and not retry):
+            if status == "done":
+                path = self._state.get("path")
+                if path and Path(path).is_file():
+                    return False
+                status = "idle"  # mpv was removed after it was installed (antivirus, cleanup): fetch it again
+            if status == "running" or (status == "failed" and not retry):
                 return False
             self._state = {"status": "running", "done": 0, "total": 0, "error": "", "path": None}
             self._thread = threading.Thread(target=self._run, daemon=True, name="mpv-provision")
