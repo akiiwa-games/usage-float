@@ -13706,20 +13706,11 @@ def run_ui() -> None:
                 wraplength=510,
             )
             folder_status.pack(fill="x")
-            mpv_row = tk.Frame(dirs_card, bg=S_CARD_BG)
-            mpv_status_lbl = tk.Label(
-                mpv_row,
-                text="",
-                fg=S_MUTED,
-                bg=S_CARD_BG,
-                font=settings_font_small,
-                anchor="w",
-                justify="left",
-                wraplength=400,
-            )
-            mpv_status_lbl.pack(side="left", fill="x", expand=True)
+            # The summary line above names the mpv state (downloading / failed / ready); the
+            # Download / Retry link sits in the always-visible button row, because the card's
+            # lower edge is clipped when the folder list takes the page height.
             mpv_retry_btn = tk.Label(
-                mpv_row,
+                folder_button_row,
                 text=_tr("下载 mpv", "Download mpv"),
                 fg=S_ACCENT,
                 bg=S_CARD_BG,
@@ -13727,7 +13718,6 @@ def run_ui() -> None:
                 cursor="hand2",
                 padx=8,
             )
-            mpv_retry_btn.pack(side="right")
             mpv_row_state: dict[str, Any] = {"sig": None, "job": None}
 
             def refresh_mpv_row() -> None:
@@ -13751,26 +13741,18 @@ def run_ui() -> None:
                 sig = (status, text)
                 if mpv_row_state["sig"] != sig:
                     mpv_row_state["sig"] = sig
-                    # The summary line above also names the mpv state; keep the two in step.
                     update_wallpaper_folder_status()
-                    if available:
-                        mpv_row.pack_forget()
+                    folder_status.configure(fg="#f87171" if status == "failed" else S_MUTED)
+                    if status in ("ready", "running"):
+                        mpv_retry_btn.pack_forget()
                     else:
-                        mpv_status_lbl.configure(
-                            text=text,
-                            fg="#f87171" if status == "failed" else S_MUTED,
+                        mpv_retry_btn.configure(
+                            text=_tr("重试下载 mpv", "Retry mpv download")
+                            if status == "failed"
+                            else _tr("下载 mpv", "Download mpv")
                         )
-                        if status == "running":
-                            mpv_retry_btn.pack_forget()
-                        else:
-                            mpv_retry_btn.configure(
-                                text=_tr("重试", "Retry")
-                                if status == "failed"
-                                else _tr("下载 mpv", "Download mpv")
-                            )
+                        if not mpv_retry_btn.winfo_manager():
                             mpv_retry_btn.pack(side="right")
-                        if not mpv_row.winfo_manager():
-                            mpv_row.pack(fill="x", pady=(4, 0))
                 if status == "running":
                     mpv_row_state["job"] = win.after(400, refresh_mpv_row)
 
@@ -13781,7 +13763,7 @@ def run_ui() -> None:
             mpv_retry_btn.bind("<Button-1>", start_mpv_download)
             wp_subtab_state["start_mpv_download"] = start_mpv_download
             # This builder runs on the wallpaper tab's first visit (or at open when Settings
-            # opens straight onto it): start the background download now that the row exists.
+            # opens straight onto it): start the background download now that its link exists.
             if active_main_tab.get("title") == "动态壁纸":
                 win.after_idle(lambda: start_mpv_download(retry=False))
             else:

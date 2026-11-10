@@ -97,22 +97,25 @@ class MpvProvisionWiringTests(unittest.TestCase):
 class WallpaperSourceChangeTests(unittest.TestCase):
     """Real run_ui callbacks; fake download and fake players (no mpv or browser is started)."""
 
-    def run_scenario(self, scenario):
+    def run_scenario(self, scenario, *, fail_download=False):
         import threading
         import tkinter as tk
 
         release = threading.Event()
 
         def fake_runner(target, progress=None):
+            calls["downloads"] += 1
             if progress:
                 progress(25, 100)
             release.wait(30)
+            if fail_download:
+                raise uf.mpv_provision.ProvisionError("test: download failed")
             target = Path(target)
             target.mkdir(parents=True, exist_ok=True)
             (target / "mpv.exe").write_bytes(b"fake")
             return target / "mpv.exe"
 
-        calls = {"web_start": 0, "web_stop_while_running": 0, "mpv_start": []}
+        calls = {"web_start": 0, "web_stop_while_running": 0, "mpv_start": [], "downloads": 0}
 
         class FakeProc:
             pid = 4
@@ -250,6 +253,41 @@ class WallpaperSourceChangeTests(unittest.TestCase):
         self.assertEqual(result["status_after_visit"], "running")
         self.assertEqual(result["status_after_release"], "done")
         self.assertEqual(result["status_after_revisit"], "done", "mpv is present; no second download")
+
+    def test_a_failed_download_shows_a_visible_retry_link(self) -> None:
+        import tkinter as tk
+
+        def find_label(widget, prefix):
+            for child in widget.winfo_children():
+                if isinstance(child, tk.Label) and str(child.cget("text")).startswith(prefix):
+                    return child
+                found = find_label(child, prefix)
+                if found is not None:
+                    return found
+            return None
+
+        def scenario(scope, state, web, release, pump, result, calls):
+            scope["open_settings"]("动态壁纸")
+            pump(0.3)
+            release.set()
+            pump(1.0)
+            win = state["settings_win"]
+            result["status"] = uf._MPV_PROVISIONER.snapshot().get("status")
+            link = find_label(win, "重试下载 mpv")
+            result["link_mapped"] = bool(link is not None and link.winfo_ismapped())
+            summary = find_label(win, "已启用 0 / 共 0 个目录")
+            result["summary_failed"] = summary is not None and "mpv 下载失败：test: download failed" in str(
+                summary.cget("text"))
+            if link is not None:
+                link.event_generate("<Button-1>")
+                pump(0.3)
+            result["status_after_click"] = uf._MPV_PROVISIONER.snapshot().get("status")
+
+        result, calls = self.run_scenario(scenario, fail_download=True)
+        self.assertEqual(result["status"], "failed")
+        self.assertTrue(result["link_mapped"], "the retry link must be on screen, not clipped")
+        self.assertTrue(result["summary_failed"])
+        self.assertEqual(calls["downloads"], 2, "clicking the link retries the download")
 
     def test_opening_settings_straight_onto_the_wallpaper_tab_starts_the_download(self) -> None:
         def scenario(scope, state, web, release, pump, result, calls):
