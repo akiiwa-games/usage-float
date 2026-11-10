@@ -2773,5 +2773,140 @@ class SharedGrokDisplayTests(unittest.TestCase):
                                  [('grok', 'grok', 56, reset)])
 
 
+class SettingsWindowStatusTests(unittest.TestCase):
+    """Settings → 用量 says when a checked row has no window in the account's latest reading."""
+
+    @staticmethod
+    def _reading(provider_id, *window_ids):
+        native = usage_float_module
+        return native.ProviderUsage(
+            provider_id=provider_id,
+            display_name=provider_id,
+            fetched_at=datetime.now(timezone.utc).isoformat(),
+            windows=[native.UsageWindow(wid, wid, 10.0) for wid in window_ids],
+        )
+
+    def test_items_without_window_follow_the_reading(self):
+        native = usage_float_module
+        pool = self._reading('claude-2', 'seven_day', 'five_hour')
+        agy_free = self._reading('antigravity', 'gemini-weekly', '3p-weekly')
+        missing = native.items_without_window([pool, agy_free])
+        self.assertEqual(set(missing), {'claude-2:fable', 'antigravity:gemini-5h', 'antigravity:3p-5h'})
+        self.assertEqual(missing['antigravity:gemini-5h'], ('gemini-weekly', '3p-weekly'))
+        # Back on a paid tier: the 5h windows return and nothing is missing for that account.
+        agy_paid = self._reading('antigravity', 'gemini-weekly', 'gemini-5h', '3p-weekly', '3p-5h')
+        self.assertEqual(set(native.items_without_window([agy_paid])), set())
+        # No reading, or a failed one without windows: nothing is known, nothing is flagged.
+        failed = native.ProviderUsage(provider_id='claude-2', display_name='claude-2', error='boom')
+        self.assertEqual(native.items_without_window([failed]), {})
+        self.assertEqual(native.items_without_window([]), {})
+
+    def test_items_without_window_matches_the_float_rows(self):
+        native = usage_float_module
+        claude = self._reading('claude', 'weekly_fable', 'seven_day')  # Ultra: no 5h window
+        codex = self._reading('codex', 'five_hour', 'usage')
+        grok = self._reading('grok', 'credits')
+        missing = native.items_without_window([claude, codex, grok])
+        self.assertEqual(set(missing), {'claude:5h'})
+        shown = {native.display_item(row) for row in native.iter_display_rows([claude, codex, grok])}
+        self.assertTrue(set(missing).isdisjoint(shown))
+
+    def test_settings_badge_and_lazy_tabs(self):
+        import tkinter as tk
+        from unittest import mock
+
+        native = usage_float_module
+        items = ['claude-2:fable', 'claude-2:7d', 'antigravity:gemini-weekly', 'antigravity:gemini-5h']
+        captured: dict[str, object] = {}
+        errors: list[object] = []
+
+        def badges(win):
+            out = {}
+            stack = [win]
+            while stack:
+                widget = stack.pop()
+                children = widget.winfo_children()
+                stack.extend(children)
+                labels = [c for c in children if isinstance(c, tk.Label)]
+                if isinstance(widget, tk.Frame) and len(children) == 4 and len(labels) == 4:
+                    out[str(labels[1].cget('text'))] = str(labels[3].cget('text'))
+            return out
+
+        def descendants(widget):
+            return sum(1 + descendants(c) for c in widget.winfo_children())
+
+        def fake_mainloop(root, *args, **kwargs):
+            scope = sys._getframe(1).f_locals
+            state = scope['state']
+            try:
+                with mock.patch.object(tk.Wm, 'deiconify'), mock.patch.object(tk.Misc, 'focus_set'), \
+                        mock.patch.object(tk.Misc, 'lift'):
+                    state['providers'] = [
+                        self._reading('claude-2', 'seven_day', 'five_hour'),
+                        self._reading('antigravity', 'gemini-weekly', '3p-weekly'),
+                    ]
+                    scope['open_settings']()
+                    win = state['settings_win']
+                    win.update_idletasks()
+                    captured['first'] = badges(win)
+
+                    state['providers'] = [
+                        self._reading('claude-2', 'seven_day', 'five_hour'),
+                        self._reading('antigravity', 'gemini-weekly', 'gemini-5h', '3p-weekly', '3p-5h'),
+                    ]
+                    state['settings_readings_changed']()
+                    captured['window_back'] = badges(win)
+
+                    state['providers'] = []
+                    state['settings_readings_changed']()
+                    captured['no_reading'] = badges(win)
+
+                    # Only the shown tab is built at open; the wallpaper tab is built on first selection.
+                    captured['scan_callback_before'] = state.get('wallpaper_scan_callback')
+                    before = descendants(win)
+                    win._select_settings_tab('动态壁纸')
+                    captured['grew'] = descendants(win) - before
+                    captured['scan_callback_after'] = state.get('wallpaper_scan_callback')
+                    win._select_settings_tab('用量')
+
+                    # Closing with the other tabs never built keeps their settings untouched.
+                    win.tk.call(win.protocol('WM_DELETE_WINDOW'))
+                    captured['closed'] = state.get('settings_win') is None
+                    captured['saved'] = json.loads(native.CONFIG_PATH.read_text(encoding='utf-8'))
+            finally:
+                scope['do_quit']()
+
+        with TemporaryDirectory() as temp_dir:
+            config = Path(temp_dir) / 'config.json'
+            config.write_text(json.dumps({
+                'language': 'zh', 'providers': items, 'provider_order': items,
+                'provider_columns': [items[:2], items[2:]], 'font_size': 11,
+            }), encoding='utf-8')
+            with patch.object(native, 'CONFIG_PATH', config), \
+                    patch.object(native, 'fetch_all', return_value=[]), \
+                    patch.object(native, 'provider_available', return_value=True), \
+                    patch.object(native, '_report_tk_callback_exception',
+                                 side_effect=lambda *exc: errors.append(exc)), \
+                    patch.object(native.threading.Thread, 'start'), \
+                    patch.object(tk.Tk, 'mainloop', fake_mainloop):
+                native.run_ui()
+
+        self.assertEqual(errors, [])
+        first = captured['first']
+        self.assertEqual(first['Claude 2 fable 7d'], '无此窗口')
+        self.assertEqual(first['Claude 2 7d'], '已就绪')
+        self.assertEqual(first['agy gemini 5h'], '无此窗口')
+        self.assertEqual(first['agy gemini 7d'], '已就绪')
+        self.assertEqual(captured['window_back']['agy gemini 5h'], '已就绪')
+        self.assertEqual(captured['window_back']['Claude 2 fable 7d'], '无此窗口')
+        self.assertEqual(captured['no_reading']['Claude 2 fable 7d'], '已就绪')
+        self.assertIsNone(captured['scan_callback_before'])
+        self.assertGreater(captured['grew'], 20)
+        self.assertTrue(callable(captured['scan_callback_after']))
+        self.assertTrue(captured['closed'])
+        self.assertEqual(captured['saved']['font_size'], 11)
+        self.assertTrue(set(items) <= set(captured['saved']['providers']))
+
+
 if __name__ == "__main__":
     unittest.main()
