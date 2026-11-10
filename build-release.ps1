@@ -20,7 +20,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $stage "UsageFloat.exe"))) {
 $mpvSrc = Join-Path $PSScriptRoot "vendor\mpv"
 $mpvDst = Join-Path $stage "vendor\mpv"
 New-Item -ItemType Directory -Path $mpvDst -Force | Out-Null
-foreach ($name in @("mpv.exe", "d3dcompiler_43.dll", "LICENSE.GPL", "Copyright")) {
+foreach ($name in @("mpv.exe", "LICENSE.GPL", "Copyright")) {
     $src = Join-Path $mpvSrc $name
     if (-not (Test-Path -LiteralPath $src)) {
         throw "missing $src — run .\install-mpv.ps1 first"

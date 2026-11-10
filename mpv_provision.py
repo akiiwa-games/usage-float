@@ -43,22 +43,29 @@ def default_target() -> Path:
 
 
 def load_pin(path: Path | None = None) -> dict[str, Any]:
+    """The pin lists download sources in order; each carries its own archive name, SHA-256, size and URLs."""
     pin = json.loads((path or PIN_PATH).read_text(encoding="utf-8"))
-    for key in ("archive", "sha256", "urls", "files"):
+    for key in ("build", "files", "sources"):
         if not pin.get(key):
             raise ProvisionError(f"mpv-pin.json is missing {key}")
+    for index, source in enumerate(pin["sources"]):
+        for key in ("archive", "sha256", "urls"):
+            if not source.get(key):
+                raise ProvisionError(f"mpv-pin.json source {index + 1} is missing {key}")
     return pin
 
 
 def installed(target: Path | None = None, pin: dict[str, Any] | None = None) -> bool:
-    """True when target holds this pin's mpv (an older provisioned build counts as missing)."""
+    """True when target holds this pin's mpv from any of its sources (an older build counts as missing)."""
     target = Path(target or default_target())
     pin = pin or load_pin()
     try:
         marker = json.loads((target / MARKER_NAME).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
-    return marker.get("sha256") == pin["sha256"] and all((target / name).is_file() for name in pin["files"])
+    hashes = {str(source["sha256"]).lower() for source in pin["sources"]}
+    return (marker.get("build") == pin["build"] and str(marker.get("sha256", "")).lower() in hashes
+            and all((target / name).is_file() for name in pin["files"]))
 
 
 def _short_reason(exc: BaseException) -> str:
@@ -212,12 +219,13 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _download(pin: dict[str, Any], destination: Path, progress: Progress | None, opener: Callable[..., Any],
+def _download(source: dict[str, Any], destination: Path, progress: Progress | None, opener: Callable[..., Any],
               timeout: float, fallback: Callable[..., None] | None = _download_with_curl) -> None:
-    expected = str(pin["sha256"]).lower()
-    total_hint = int(pin.get("size") or 0)
+    """Fetch one source (its URLs in order) into destination, verified against that source's own SHA-256."""
+    expected = str(source["sha256"]).lower()
+    total_hint = int(source.get("size") or 0)
     errors: list[str] = []
-    for url in pin["urls"]:
+    for url in source["urls"]:
         host = urllib.parse.urlsplit(url).netloc or url
         done = 0
         try:
@@ -247,7 +255,7 @@ def _download(pin: dict[str, Any], destination: Path, progress: Progress | None,
             errors.append(f"{host}: SHA-256 mismatch ({actual[:16]}…)")
             continue
         return
-    raise ProvisionError("mpv download failed: " + " | ".join(errors))
+    raise ProvisionError(" | ".join(errors) or "no URL")
 
 
 def _tar_executable() -> str:
@@ -371,8 +379,20 @@ def ensure_mpv(
         _sweep_stale_work_dirs(target.parent)
         work = Path(tempfile.mkdtemp(prefix=".mpv-provision-", dir=str(target.parent)))
         try:
-            archive = work / str(pin["archive"])
-            _download(pin, archive, progress, opener, timeout, fallback)
+            # Sources in pin order (slim release asset first, then the original archive on SourceForge);
+            # whichever one is downloaded is checked against its own SHA-256 before anything is extracted.
+            errors: list[str] = []
+            for chosen in pin["sources"]:
+                archive = work / Path(str(chosen["archive"])).name
+                try:
+                    _download(chosen, archive, progress, opener, timeout, fallback)
+                except ProvisionError as exc:
+                    errors.append(str(exc))
+                    archive.unlink(missing_ok=True)
+                    continue
+                break
+            else:
+                raise ProvisionError("mpv download failed: " + " | ".join(errors))
             staged = work / "mpv"
             staged.mkdir()
             extractor(archive, staged, list(pin["files"]))
@@ -381,7 +401,7 @@ def ensure_mpv(
                 if source.is_file():
                     shutil.copyfile(source, staged / name)
             (staged / MARKER_NAME).write_text(
-                json.dumps({"build": pin.get("build"), "archive": pin["archive"], "sha256": pin["sha256"],
+                json.dumps({"build": pin.get("build"), "archive": chosen["archive"], "sha256": chosen["sha256"],
                             "installed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}, indent=2) + "\n",
                 encoding="utf-8",
             )

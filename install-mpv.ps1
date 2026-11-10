@@ -1,9 +1,8 @@
 $ErrorActionPreference = "Stop"
 
-# The pin (URLs, size, SHA-256, files) lives in mpv-pin.json, shared with mpv_provision.py,
-# which usage-float runs itself into ~/.usage-float/runtime/mpv when mpv is missing.
+# The pin lives in mpv-pin.json, shared with mpv_provision.py (which usage-float runs itself into
+# ~/.usage-float/runtime/mpv when mpv is missing). Sources are tried in order; each has its own SHA-256.
 $pin = Get-Content -LiteralPath (Join-Path $PSScriptRoot "mpv-pin.json") -Raw -Encoding UTF8 | ConvertFrom-Json
-$expectedSha256 = $pin.sha256.ToLowerInvariant()
 $targetDir = Join-Path $PSScriptRoot "vendor\mpv"
 $licenseDir = Join-Path $PSScriptRoot "licenses\mpv"
 $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
@@ -11,25 +10,31 @@ $tempArchive = Join-Path $tempRoot ("usage-float-mpv-" + [guid]::NewGuid().ToStr
 $tempExtract = Join-Path $tempRoot ("usage-float-mpv-" + [guid]::NewGuid().ToString("N"))
 
 try {
-    $downloaded = $false
-    foreach ($url in $pin.urls) {
-        try {
-            Write-Host "Downloading pinned mpv build $($pin.build) from $url ..."
-            Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $tempArchive -UserAgent "usage-float-mpv-provision"
-            $actualSha256 = (Get-FileHash -LiteralPath $tempArchive -Algorithm SHA256).Hash.ToLowerInvariant()
-            if ($actualSha256 -ne $expectedSha256) {
-                Write-Warning "mpv archive checksum mismatch from ${url}: $actualSha256"
-                continue
+    $downloaded = $null
+    foreach ($source in $pin.sources) {
+        $expectedSha256 = $source.sha256.ToLowerInvariant()
+        foreach ($url in $source.urls) {
+            try {
+                Write-Host "Downloading pinned mpv build $($pin.build) ($($source.archive)) from $url ..."
+                Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $tempArchive -UserAgent "usage-float-mpv-provision"
+                $actualSha256 = (Get-FileHash -LiteralPath $tempArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+                if ($actualSha256 -ne $expectedSha256) {
+                    Write-Warning "mpv archive checksum mismatch from ${url}: $actualSha256"
+                    continue
+                }
+                $downloaded = $source
+                break
             }
-            $downloaded = $true
-            break
+            catch {
+                Write-Warning "Download failed from ${url}: $_"
+            }
         }
-        catch {
-            Write-Warning "Download failed from ${url}: $_"
+        if ($downloaded) {
+            break
         }
     }
     if (-not $downloaded) {
-        throw "Could not download a verified mpv archive ($($pin.archive))"
+        throw "Could not download a verified mpv archive (build $($pin.build))"
     }
 
     New-Item -ItemType Directory -Path $tempExtract -Force | Out-Null
@@ -47,7 +52,7 @@ try {
         Copy-Item -LiteralPath (Join-Path $licenseDir $name) -Destination (Join-Path $targetDir $name) -Force
     }
 
-    Write-Host "mpv installed to $targetDir"
+    Write-Host "mpv installed to $targetDir (from $($downloaded.archive))"
     & (Join-Path $targetDir "mpv.exe") --version | Select-Object -First 2
 }
 finally {

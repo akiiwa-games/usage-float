@@ -1,17 +1,29 @@
 {
   "build": "20261108",
-  "archive": "mpv-x86_64-20261108-git-55d3feb45c.7z",
-  "sha256": "465faafbf90527421ccc304870f02e59f3f47d3361a6f526ef95f40f8f2c2459",
-  "size": 34145102,
-  "urls": [
-    "https://github.com/akiiwa-games/usage-float/releases/download/mpv-20261108/mpv-x86_64-20261108-git-55d3feb45c.7z",
-    "https://downloads.sourceforge.net/project/mpv-player-windows/64bit/mpv-x86_64-20261108-git-55d3feb45c.7z",
-    "https://sourceforge.net/projects/mpv-player-windows/files/64bit/mpv-x86_64-20261108-git-55d3feb45c.7z/download"
-  ],
+  "mpv_commit": "55d3feb45c3dda1afd02b3087d3463c57d6514f7",
   "files": [
-    "mpv.exe",
-    "d3dcompiler_43.dll"
+    "mpv.exe"
   ],
-  "source": "shinchiro/mpv-winbuild-cmake release 20261108 (build commit bda10a2816ce9908d419b3f4b564227330457e76); the same file is re-hosted as a usage-float release asset and mirrored on SourceForge",
-  "mpv_commit": "55d3feb45c3dda1afd02b3087d3463c57d6514f7"
+  "sources": [
+    {
+      "archive": "mpv-x86_64-20261108-git-55d3feb45c-slim.7z",
+      "sha256": "8f8d71974ad9aa2c885eb56afa1b423135dc98bec478d71c3d62aa86798596b0",
+      "size": 31701105,
+      "urls": [
+        "https://github.com/akiiwa-games/usage-float/releases/download/mpv-20261108/mpv-x86_64-20261108-git-55d3feb45c-slim.7z"
+      ],
+      "note": "usage-float release asset: the upstream mpv.exe, byte for byte, with LICENSE.GPL and Copyright"
+    },
+    {
+      "archive": "mpv-x86_64-20261108-git-55d3feb45c.7z",
+      "sha256": "465faafbf90527421ccc304870f02e59f3f47d3361a6f526ef95f40f8f2c2459",
+      "size": 34145102,
+      "urls": [
+        "https://downloads.sourceforge.net/project/mpv-player-windows/64bit/mpv-x86_64-20261108-git-55d3feb45c.7z",
+        "https://sourceforge.net/projects/mpv-player-windows/files/64bit/mpv-x86_64-20261108-git-55d3feb45c.7z/download"
+      ],
+      "note": "the original shinchiro archive (SourceForge mirror); SHA-256 equals the digest GitHub publishes for the upstream asset"
+    }
+  ],
+  "source": "shinchiro/mpv-winbuild-cmake release 20261108 (build commit bda10a2816ce9908d419b3f4b564227330457e76)"
 }

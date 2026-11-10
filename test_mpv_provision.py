@@ -54,15 +54,27 @@ def _fake_extractor(archive: Path, destination: Path, files: list[str]) -> None:
         (destination / name).write_bytes(b"extracted:" + name.encode())
 
 
+def _source(payload: bytes, archive: str, urls) -> dict:
+    return {"archive": archive, "sha256": hashlib.sha256(payload).hexdigest(), "size": len(payload), "urls": list(urls)}
+
+
 def _pin(payload: bytes, urls=("https://a.example/mpv.7z", "https://b.example/mpv.7z")) -> dict:
-    return {
-        "build": "test",
-        "archive": "mpv-test.7z",
-        "sha256": hashlib.sha256(payload).hexdigest(),
-        "size": len(payload),
-        "urls": list(urls),
-        "files": ["mpv.exe", "d3dcompiler_43.dll"],
-    }
+    """One source with two mirrors."""
+    return {"build": "test", "files": ["mpv.exe", "d3dcompiler_43.dll"], "sources": [_source(payload, "mpv-test.7z", urls)]}
+
+
+def _urls(pin: dict) -> list[str]:
+    return [url for source in pin["sources"] for url in source["urls"]]
+
+
+SLIM_URL = "https://github.example/releases/download/mpv-test/mpv-slim.7z"
+ORIG_URLS = ("https://downloads.sf.example/mpv-orig.7z", "https://sf.example/mpv-orig.7z/download")
+
+
+def _two_source_pin(slim: bytes, original: bytes) -> dict:
+    """The real layout: slim release asset first, the original archive (two mirrors) as fallback."""
+    return {"build": "test", "files": ["mpv.exe"],
+            "sources": [_source(slim, "mpv-slim.7z", [SLIM_URL]), _source(original, "mpv-orig.7z", ORIG_URLS)]}
 
 
 class EnsureMpvTests(unittest.TestCase):
@@ -80,7 +92,7 @@ class EnsureMpvTests(unittest.TestCase):
     def test_verified_download_installs_files_licenses_and_marker(self) -> None:
         payload = b"archive-bytes" * 1000
         pin = _pin(payload)
-        opener = _Opener({pin["urls"][0]: payload})
+        opener = _Opener({_urls(pin)[0]: payload})
         progress: list[tuple[int, int]] = []
 
         exe = mp.ensure_mpv(self.target, pin=pin, opener=opener, extractor=_fake_extractor,
@@ -92,15 +104,15 @@ class EnsureMpvTests(unittest.TestCase):
         self.assertEqual((self.target / "LICENSE.GPL").read_bytes(), (HERE / "licenses" / "mpv" / "LICENSE.GPL").read_bytes())
         self.assertTrue((self.target / "Copyright").is_file())
         marker = json.loads((self.target / mp.MARKER_NAME).read_text(encoding="utf-8"))
-        self.assertEqual(marker["sha256"], pin["sha256"])
+        self.assertEqual(marker["sha256"], pin["sources"][0]["sha256"])
         self.assertTrue(mp.installed(self.target, pin))
         self.assertEqual(progress[-1], (len(payload), len(payload)))
-        self.assertEqual(opener.calls, [pin["urls"][0]])
+        self.assertEqual(opener.calls, [_urls(pin)[0]])
         self.assertEqual(self.leftovers(), [])
 
     def test_checksum_mismatch_on_every_mirror_fails_and_installs_nothing(self) -> None:
         pin = _pin(b"the real archive")
-        opener = _Opener({url: b"tampered or an HTML error page" for url in pin["urls"]})
+        opener = _Opener({url: b"tampered or an HTML error page" for url in _urls(pin)})
 
         with self.assertRaises(mp.ProvisionError) as caught:
             mp.ensure_mpv(self.target, pin=pin, opener=opener, extractor=_fake_extractor)
@@ -109,21 +121,21 @@ class EnsureMpvTests(unittest.TestCase):
         self.assertFalse(self.target.exists())
         self.assertFalse(mp.installed(self.target, pin))
         self.assertEqual(self.leftovers(), [])
-        self.assertEqual(opener.calls, pin["urls"])
+        self.assertEqual(opener.calls, _urls(pin))
 
     def test_failed_mirror_falls_back_to_the_next_one(self) -> None:
         payload = b"good"
         pin = _pin(payload)
-        opener = _Opener({pin["urls"][0]: OSError("connection reset"), pin["urls"][1]: payload})
+        opener = _Opener({_urls(pin)[0]: OSError("connection reset"), _urls(pin)[1]: payload})
 
         mp.ensure_mpv(self.target, pin=pin, opener=opener, extractor=_fake_extractor, fallback=None)
 
         self.assertTrue(mp.installed(self.target, pin))
-        self.assertEqual(opener.calls, pin["urls"])
+        self.assertEqual(opener.calls, _urls(pin))
 
     def test_network_failure_message_names_each_mirror(self) -> None:
         pin = _pin(b"x")
-        opener = _Opener({url: OSError("getaddrinfo failed") for url in pin["urls"]})
+        opener = _Opener({url: OSError("getaddrinfo failed") for url in _urls(pin)})
 
         with self.assertRaises(mp.ProvisionError) as caught:
             mp.ensure_mpv(self.target, pin=pin, opener=opener, extractor=_fake_extractor, fallback=None)
@@ -141,7 +153,7 @@ class EnsureMpvTests(unittest.TestCase):
         payload = b"archive via curl"
         pin = _pin(payload)
         tls = urllib.error.URLError(ssl.SSLCertVerificationError("certificate verify failed: unable to get local issuer certificate"))
-        opener = _Opener({url: tls for url in pin["urls"]})
+        opener = _Opener({url: tls for url in _urls(pin)})
         fetched: list[str] = []
 
         def curl(url, destination, progress, total, timeout):
@@ -150,7 +162,7 @@ class EnsureMpvTests(unittest.TestCase):
 
         mp.ensure_mpv(self.target, pin=pin, opener=opener, extractor=_fake_extractor, fallback=curl)
         self.assertTrue(mp.installed(self.target, pin))
-        self.assertEqual(fetched, [pin["urls"][0]])
+        self.assertEqual(fetched, [_urls(pin)[0]])
 
         bad_target = self.root / "runtime" / "other"
 
@@ -164,7 +176,7 @@ class EnsureMpvTests(unittest.TestCase):
 
     def test_tls_and_curl_failures_are_both_reported_briefly(self) -> None:
         pin = _pin(b"x")
-        opener = _Opener({url: OSError("certificate verify failed") for url in pin["urls"]})
+        opener = _Opener({url: OSError("certificate verify failed") for url in _urls(pin)})
 
         def curl(url, destination, progress, total, timeout):
             raise mp.ProvisionError("curl exit 6: Could not resolve host")
@@ -184,14 +196,14 @@ class EnsureMpvTests(unittest.TestCase):
             raise mp.ProvisionError("mpv extraction failed (tar exit 1): bad archive")
 
         with self.assertRaises(mp.ProvisionError):
-            mp.ensure_mpv(self.target, pin=pin, opener=_Opener({pin["urls"][0]: payload}), extractor=broken)
+            mp.ensure_mpv(self.target, pin=pin, opener=_Opener({_urls(pin)[0]: payload}), extractor=broken)
         self.assertFalse(self.target.exists())
         self.assertEqual(self.leftovers(), [])
 
     def test_second_call_does_not_download_again(self) -> None:
         payload = b"good"
         pin = _pin(payload)
-        opener = _Opener({pin["urls"][0]: payload})
+        opener = _Opener({_urls(pin)[0]: payload})
 
         mp.ensure_mpv(self.target, pin=pin, opener=opener, extractor=_fake_extractor)
         mp.ensure_mpv(self.target, pin=pin, opener=opener, extractor=_fake_extractor)
@@ -201,7 +213,7 @@ class EnsureMpvTests(unittest.TestCase):
     def test_concurrent_callers_download_once(self) -> None:
         payload = b"good"
         pin = _pin(payload)
-        opener = _Opener({pin["urls"][0]: payload}, delay=0.3)
+        opener = _Opener({_urls(pin)[0]: payload}, delay=0.3)
         errors: list[BaseException] = []
 
         def run() -> None:
@@ -228,7 +240,7 @@ class EnsureMpvTests(unittest.TestCase):
         pin = _pin(payload)
         self.assertFalse(mp.installed(self.target, pin))
 
-        mp.ensure_mpv(self.target, pin=pin, opener=_Opener({pin["urls"][0]: payload}), extractor=_fake_extractor)
+        mp.ensure_mpv(self.target, pin=pin, opener=_Opener({_urls(pin)[0]: payload}), extractor=_fake_extractor)
 
         self.assertEqual((self.target / "mpv.exe").read_bytes(), b"extracted:mpv.exe")
         self.assertTrue(mp.installed(self.target, pin))
@@ -246,10 +258,107 @@ class EnsureMpvTests(unittest.TestCase):
         payload = archive.read_bytes()
         pin = _pin(payload)
 
-        mp.ensure_mpv(self.target, pin=pin, opener=_Opener({pin["urls"][0]: payload}))
+        mp.ensure_mpv(self.target, pin=pin, opener=_Opener({_urls(pin)[0]: payload}))
 
         self.assertEqual((self.target / "mpv.exe").read_bytes(), b"mpv.exe")
         self.assertFalse((self.target / "updater.bat").exists())
+
+
+class TwoSourceTests(unittest.TestCase):
+    """Primary = slim release asset, fallback = original archive; each verified against its own hash."""
+
+    SLIM = b"slim archive bytes" * 100
+    ORIGINAL = b"original archive bytes" * 120
+
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.target = self.root / "runtime" / "mpv"
+        self.pin = _two_source_pin(self.SLIM, self.ORIGINAL)
+        self.extracted: list[str] = []
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def extractor(self, archive: Path, destination: Path, files: list[str]) -> None:
+        self.extracted.append(archive.name)
+        _fake_extractor(archive, destination, files)
+
+    def marker(self) -> dict:
+        return json.loads((self.target / mp.MARKER_NAME).read_text(encoding="utf-8"))
+
+    def test_primary_slim_asset_is_used_when_it_verifies(self) -> None:
+        opener = _Opener({SLIM_URL: self.SLIM})
+        mp.ensure_mpv(self.target, pin=self.pin, opener=opener, extractor=self.extractor, fallback=None)
+        self.assertEqual(opener.calls, [SLIM_URL])
+        self.assertEqual(self.extracted, ["mpv-slim.7z"])
+        self.assertEqual(self.marker()["sha256"], self.pin["sources"][0]["sha256"])
+        self.assertEqual(self.marker()["archive"], "mpv-slim.7z")
+        self.assertTrue(mp.installed(self.target, self.pin))
+
+    def test_missing_primary_falls_back_to_the_original_archive(self) -> None:
+        opener = _Opener({SLIM_URL: OSError("HTTP Error 404: Not Found"), ORIG_URLS[0]: self.ORIGINAL})
+        mp.ensure_mpv(self.target, pin=self.pin, opener=opener, extractor=self.extractor, fallback=None)
+        self.assertEqual(opener.calls, [SLIM_URL, ORIG_URLS[0]])
+        self.assertEqual(self.extracted, ["mpv-orig.7z"])
+        self.assertEqual(self.marker()["sha256"], self.pin["sources"][1]["sha256"])
+        self.assertTrue(mp.installed(self.target, self.pin), "an install from the fallback counts as this pin")
+
+    def test_hash_mismatch_on_the_primary_falls_back_and_is_never_extracted(self) -> None:
+        opener = _Opener({SLIM_URL: b"tampered slim", ORIG_URLS[0]: self.ORIGINAL})
+        mp.ensure_mpv(self.target, pin=self.pin, opener=opener, extractor=self.extractor, fallback=None)
+        self.assertEqual(self.extracted, ["mpv-orig.7z"])
+        self.assertEqual(self.marker()["sha256"], self.pin["sources"][1]["sha256"])
+
+    def test_hash_mismatch_on_the_fallback_fails_and_installs_nothing(self) -> None:
+        opener = _Opener({SLIM_URL: OSError("HTTP Error 404: Not Found"),
+                          ORIG_URLS[0]: b"html error page", ORIG_URLS[1]: b"another wrong file"})
+        with self.assertRaises(mp.ProvisionError) as caught:
+            mp.ensure_mpv(self.target, pin=self.pin, opener=opener, extractor=self.extractor, fallback=None)
+        message = str(caught.exception)
+        self.assertTrue(message.startswith("mpv download failed: "))
+        self.assertIn("github.example: HTTP Error 404", message)
+        self.assertEqual(message.count("SHA-256 mismatch"), 2)
+        self.assertEqual(self.extracted, [])
+        self.assertFalse(self.target.exists())
+
+    def test_each_source_is_checked_against_its_own_hash(self) -> None:
+        """The slim bytes served where the original is expected (or vice versa) do not pass."""
+        opener = _Opener({SLIM_URL: self.ORIGINAL, ORIG_URLS[0]: self.SLIM, ORIG_URLS[1]: self.SLIM})
+        with self.assertRaises(mp.ProvisionError) as caught:
+            mp.ensure_mpv(self.target, pin=self.pin, opener=opener, extractor=self.extractor, fallback=None)
+        self.assertEqual(str(caught.exception).count("SHA-256 mismatch"), 3)
+        self.assertEqual(self.extracted, [])
+
+    def test_installed_requires_this_build_and_a_known_hash(self) -> None:
+        mp.ensure_mpv(self.target, pin=self.pin, opener=_Opener({SLIM_URL: self.SLIM}), extractor=self.extractor, fallback=None)
+        self.assertTrue(mp.installed(self.target, self.pin))
+        other = dict(self.pin, sources=[_source(b"other", "other.7z", ["https://x.example/other.7z"])])
+        self.assertFalse(mp.installed(self.target, other))
+        self.assertFalse(mp.installed(self.target, dict(self.pin, build="older")))
+
+    @unittest.skipUnless(sys.platform == "win32" and Path(r"C:\Windows\System32\tar.exe").is_file(), "needs Windows bsdtar")
+    def test_real_7z_of_either_layout_yields_the_same_mpv(self) -> None:
+        """Real System32 tar: the slim layout (mpv.exe + licenses) and the upstream layout (many files)."""
+        archives = {}
+        for name, members in (("slim", ("mpv.exe", "LICENSE.GPL", "Copyright")),
+                              ("orig", ("mpv.exe", "d3dcompiler_43.dll", "updater.bat"))):
+            src = self.root / f"src-{name}"
+            src.mkdir()
+            for member in members:
+                (src / member).write_bytes(b"mpv-binary" if member == "mpv.exe" else member.encode())
+            archive = self.root / f"{name}.7z"
+            subprocess.run([mp._tar_executable(), "--format", "7zip", "-cf", str(archive), *members], cwd=src, check=True,
+                           capture_output=True)
+            archives[name] = archive.read_bytes()
+        pin = _two_source_pin(archives["slim"], archives["orig"])
+        for label, responses in (("slim", {SLIM_URL: archives["slim"]}),
+                                 ("orig", {SLIM_URL: OSError("HTTP Error 404: Not Found"), ORIG_URLS[0]: archives["orig"]})):
+            target = self.root / f"out-{label}" / "mpv"
+            mp.ensure_mpv(target, pin=pin, opener=_Opener(responses), fallback=None)
+            self.assertEqual((target / "mpv.exe").read_bytes(), b"mpv-binary", label)
+            self.assertEqual(sorted(p.name for p in target.iterdir()),
+                             sorted(["mpv.exe", "LICENSE.GPL", "Copyright", mp.MARKER_NAME]), label)
 
 
 class StaleWorkDirTests(unittest.TestCase):
@@ -265,7 +374,7 @@ class StaleWorkDirTests(unittest.TestCase):
             payload = b"good"
             pin = _pin(payload)
 
-            mp.ensure_mpv(target, pin=pin, opener=_Opener({pin["urls"][0]: payload}), extractor=_fake_extractor, fallback=None)
+            mp.ensure_mpv(target, pin=pin, opener=_Opener({_urls(pin)[0]: payload}), extractor=_fake_extractor, fallback=None)
 
             names = sorted(p.name for p in runtime.iterdir())
             self.assertEqual(names, [".mpv-provision-note.txt", ".mpv-provision.lock", "keep-me", "mpv"])
@@ -438,21 +547,29 @@ class BackgroundProvisionerTests(unittest.TestCase):
 class PinTests(unittest.TestCase):
     def test_pin_is_complete_and_shared_with_install_script(self) -> None:
         pin = mp.load_pin()
-        self.assertRegex(pin["sha256"], r"^[0-9a-f]{64}$")
-        self.assertTrue(all(url.startswith("https://") for url in pin["urls"]))
-        self.assertIn(pin["archive"], pin["urls"][0])
-        self.assertEqual(pin["files"], ["mpv.exe", "d3dcompiler_43.dll"])
-        self.assertTrue(pin["urls"][0].startswith("https://github.com/akiiwa-games/usage-float/releases/download/mpv-"),
-                        "the usage-float release asset is the primary source")
-        self.assertTrue(any("sourceforge" in url for url in pin["urls"][1:]), "SourceForge stays as the fallback")
-        self.assertTrue(all(url.endswith(pin["archive"]) or url.endswith(pin["archive"] + "/download") for url in pin["urls"]))
+        self.assertEqual(pin["files"], ["mpv.exe"], "Windows 10+ ships d3dcompiler_47; mpv needs nothing else")
+        primary, fallback = pin["sources"]
+        for source in pin["sources"]:
+            self.assertRegex(source["sha256"], r"^[0-9a-f]{64}$")
+            self.assertGreater(source["size"], 1_000_000)
+            for url in source["urls"]:
+                self.assertTrue(url.startswith("https://"), url)
+                self.assertTrue(url.endswith(source["archive"]) or url.endswith(source["archive"] + "/download"), url)
+        self.assertNotEqual(primary["sha256"], fallback["sha256"])
+        self.assertEqual(primary["urls"], [f"https://github.com/akiiwa-games/usage-float/releases/download/mpv-{pin['build']}/{primary['archive']}"],
+                         "the slim usage-float release asset is the primary source")
+        self.assertTrue(primary["archive"].endswith("-slim.7z"))
+        self.assertTrue(fallback["urls"] and all("sourceforge" in url for url in fallback["urls"]), "SourceForge original as fallback")
+        self.assertEqual(fallback["sha256"], "465faafbf90527421ccc304870f02e59f3f47d3361a6f526ef95f40f8f2c2459",
+                         "the original archive's digest as published by GitHub for the upstream asset")
         script = (HERE / "install-mpv.ps1").read_text(encoding="utf-8")
         self.assertIn("mpv-pin.json", script)
         self.assertIsNone(re.search(r"[0-9a-f]{64}", script), "the hash belongs in mpv-pin.json only")
         self.assertIn('System32\\tar.exe', script, "GNU tar from Git for Windows cannot read 7z")
         notices = (HERE / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
-        self.assertIn(pin["sha256"], notices)
-        self.assertIn(pin["archive"], notices)
+        for source in pin["sources"]:
+            self.assertIn(source["sha256"], notices)
+            self.assertIn(source["archive"], notices)
 
     def test_license_texts_ship_with_the_repo(self) -> None:
         self.assertIn("GNU GENERAL PUBLIC LICENSE", (HERE / "licenses" / "mpv" / "LICENSE.GPL").read_text(encoding="utf-8"))
