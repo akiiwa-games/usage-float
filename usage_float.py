@@ -43,6 +43,7 @@ from zoneinfo import ZoneInfo
 
 from usage_lock import file_lock
 import magpie_usage
+import mpv_provision
 
 
 def _ensure_tcl_tk_library() -> None:
@@ -139,9 +140,31 @@ def _ui(text: str) -> str:
 
 
 HOME = Path.home()
+
+
+def _is_own_frozen_build(source_file: str | Path | None = None) -> bool:
+    """True only for UsageFloat.exe's own PyInstaller bundle.
+
+    AgentCompass hosts this module from the plugin's git clone inside its own frozen
+    executable; sys.frozen is set there too, but this file lives in the plugin directory,
+    not in the bundle, so vendor/mpv and wallpaper-start.lua must resolve next to it.
+    """
+    if not getattr(sys, "frozen", False):
+        return False
+    bundle = getattr(sys, "_MEIPASS", None)
+    if not bundle:
+        return True
+    try:
+        Path(source_file or __file__).resolve().relative_to(Path(bundle).resolve())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+_OWN_FROZEN_BUILD = _is_own_frozen_build()
 APP_DIR = (
     Path(sys.executable).resolve().parent
-    if getattr(sys, "frozen", False)
+    if _OWN_FROZEN_BUILD
     else Path(__file__).resolve().parent
 )
 VERSION = "1.3.5"
@@ -153,7 +176,7 @@ GROK_HOME = Path(os.environ.get("GROK_HOME", HOME / ".grok"))
 CONFIG_PATH = HOME / ".usage-float" / "config.json"
 CACHE_PATH = HOME / ".usage-float" / "usage-cache.json"
 WALLPAPER_INDEX_CACHE_PATH = HOME / ".usage-float" / "wallpaper-index.json"
-RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", str(APP_DIR)))
+RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", str(APP_DIR))) if _OWN_FROZEN_BUILD else APP_DIR
 WALLPAPER_START_SCRIPT_PATH = RESOURCE_DIR / "wallpaper-start.lua"
 if not WALLPAPER_START_SCRIPT_PATH.exists():
     WALLPAPER_START_SCRIPT_PATH = APP_DIR / "wallpaper-start.lua"
@@ -1463,6 +1486,45 @@ def _build_wallpaper_playback_order(
 
 
 _MPV_EXECUTABLE_CACHE: dict[str, Path | None] = {}
+# One background download of the pinned mpv into ~/.usage-float/runtime/mpv per process.
+# Started only when a wallpaper needs mpv or the wallpaper settings tab opens; never at import.
+_MPV_PROVISIONER = mpv_provision.BackgroundProvisioner()
+
+
+def _mpv_runtime_dir() -> Path:
+    return HOME / ".usage-float" / "runtime" / "mpv"
+
+
+def _start_mpv_provisioning(configured: str | Path | None = None, *, retry: bool = False) -> bool:
+    """Start the background mpv download unless mpv is already available. Never blocks."""
+    if _MPV_PROVISIONER.target is None:
+        _MPV_PROVISIONER.target = _mpv_runtime_dir()
+    if _find_mpv_executable(configured) is not None:
+        return False
+    return _MPV_PROVISIONER.start(retry=retry)
+
+
+def _mpv_provision_snapshot() -> dict[str, Any]:
+    snapshot = _MPV_PROVISIONER.snapshot()
+    if snapshot.get("status") == "done":
+        # The finder cached "not found" before the download; let it look again.
+        _MPV_EXECUTABLE_CACHE.clear()
+    return snapshot
+
+
+def _mpv_provision_text(snapshot: dict[str, Any]) -> str:
+    status = snapshot.get("status")
+    if status == "running":
+        done = int(snapshot.get("done") or 0)
+        total = int(snapshot.get("total") or 0)
+        percent = f" {min(100, int(done * 100 / total))}%" if total else ""
+        return _tr(f"正在下载 mpv 播放后端…{percent}", f"Downloading the mpv playback backend…{percent}")
+    if status == "failed":
+        error = str(snapshot.get("error") or "")
+        return _tr(f"mpv 下载失败：{error}", f"mpv download failed: {error}")
+    if status == "done":
+        return _tr("mpv 已就绪", "mpv Ready")
+    return _tr("mpv 未安装", "mpv Not Installed")
 WALLPAPER_PLAYLIST_MAX_ITEMS = 512
 
 
@@ -3622,6 +3684,143 @@ def _find_browser_process_window(root_pid: int, host_hwnd: int = 0) -> int:
         return 0
 
 
+def _list_windows_processes() -> list[tuple[int, int, str]]:
+    """(pid, parent pid, exe name) for every process, via a Toolhelp snapshot (no psutil)."""
+    if sys.platform != "win32":
+        return []
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+        kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)  # TH32CS_SNAPPROCESS
+        if not snapshot or snapshot == wintypes.HANDLE(-1).value:
+            return []
+        rows: list[tuple[int, int, str]] = []
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+            while ok:
+                rows.append((int(entry.th32ProcessID), int(entry.th32ParentProcessID), str(entry.szExeFile)))
+                ok = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snapshot)
+        return rows
+    except Exception:
+        return []
+
+
+def _find_handoff_browser_pid(
+    launcher_pid: int,
+    exe_name: str,
+    processes: list[tuple[int, int, str]] | None = None,
+    window_pid_check: Callable[[int], bool] | None = None,
+) -> int:
+    """Return the browser process the launched executable relaunched itself into, or 0.
+
+    Edge/Chrome relaunch themselves (and the launched process exits) when a staged update
+    (new_msedge.exe / new_chrome.exe) is swapped in or an old binary hands off to the new
+    version. The relaunched browser is a child of the launcher with the same image name.
+    Crashpad handlers share that name and parent too, so prefer the child that owns a
+    browser window, then the one that already started its own same-named children.
+    """
+    if launcher_pid <= 0 or not exe_name:
+        return 0
+    rows = _list_windows_processes() if processes is None else processes
+    name = exe_name.casefold()
+    children = [pid for pid, ppid, image in rows if ppid == launcher_pid and image.casefold() == name and pid != launcher_pid]
+    if not children:
+        return 0
+    has_window = window_pid_check or (lambda pid: bool(_find_browser_process_window(pid)))
+    for pid in children:
+        if has_window(pid):
+            return pid
+    spawned = {ppid for _pid, ppid, image in rows if image.casefold() == name}
+    for pid in children:
+        if pid in spawned:
+            return pid
+    return 0
+
+
+class _AdoptedBrowserProcess:
+    """Popen-like handle for a browser process this module did not start itself."""
+
+    _STILL_ACTIVE = 259
+
+    def __init__(self, pid: int) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        self.pid = int(pid)
+        self.returncode: int | None = None
+        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._kernel32.OpenProcess.restype = wintypes.HANDLE
+        self._kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        self._kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        self._kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        self._kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        self._kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        # SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION
+        self._handle = self._kernel32.OpenProcess(0x00100000 | 0x0001 | 0x1000, False, self.pid)
+        if not self._handle:
+            raise OSError(f"cannot open process {self.pid}")
+
+    def poll(self) -> int | None:
+        if self.returncode is not None:
+            return self.returncode
+        import ctypes
+        from ctypes import wintypes
+
+        code = wintypes.DWORD(0)
+        if not self._kernel32.GetExitCodeProcess(self._handle, ctypes.byref(code)):
+            self.returncode = -1
+        elif int(code.value) != self._STILL_ACTIVE:
+            self.returncode = int(code.value)
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int | None:
+        millis = 0xFFFFFFFF if timeout is None else max(0, int(timeout * 1000))
+        self._kernel32.WaitForSingleObject(self._handle, millis)
+        code = self.poll()
+        if code is None:
+            raise subprocess.TimeoutExpired(f"pid {self.pid}", timeout or 0)
+        return code
+
+    def terminate(self) -> None:
+        if self.poll() is None:
+            self._kernel32.TerminateProcess(self._handle, 1)
+
+    kill = terminate
+
+    def __del__(self) -> None:
+        try:
+            if self._handle:
+                self._kernel32.CloseHandle(self._handle)
+                self._handle = None
+        except Exception:
+            pass
+
+
 def _embed_browser_window_in_host(browser_hwnd: int, host_hwnd: int) -> bool:
     """Reparent a Chromium/Edge window into wallpaper_host and disable its own hit-testing/drop target."""
     if sys.platform != "win32" or not browser_hwnd or not host_hwnd:
@@ -3735,10 +3934,86 @@ class _BrowserWebVideoPlayer:
         self._pending_js: list[str] = []
         self._muted: bool = False
         self._paused: bool = False
+        self._proc_lock = threading.RLock()
+        self._exe_name: str = ""
+        self._adopted: bool = False
+        self._launcher_exit_code: int | None = None
+        self._launcher_exited_at: float | None = None
+        self._devtools_port: int = 0
+        self._cdp_connected: bool = False
+        self._cdp_last_error: str = ""
 
     @property
     def running(self) -> bool:
-        return self.process is not None and self.process.poll() is None
+        process = self.process
+        return process is not None and process.poll() is None
+
+    # The launched executable may hand off to a relaunched browser (staged update swap)
+    # and exit; give the handoff this long to show up before calling it a failure.
+    HANDOFF_GRACE_SECONDS = 2.0
+
+    def check_alive(self) -> bool:
+        """True while the browser runs (adopting a relaunched browser); False sets last_error."""
+        with self._proc_lock:
+            process = self.process
+            if process is None:
+                return False
+            code = process.poll()
+            if code is None:
+                return True
+            if not self._adopted:
+                if self._launcher_exited_at is None:
+                    self._launcher_exited_at = time.monotonic()
+                    self._launcher_exit_code = code
+                handoff_pid = _find_handoff_browser_pid(process.pid, self._exe_name)
+                if handoff_pid:
+                    try:
+                        self.process = _AdoptedBrowserProcess(handoff_pid)
+                    except OSError:
+                        pass
+                    else:
+                        self._adopted = True
+                        self.browser_hwnd = 0
+                        return True
+                if time.monotonic() - self._launcher_exited_at < self.HANDOFF_GRACE_SECONDS:
+                    return True
+            self.last_error = self.describe_exit(code)
+            return False
+
+    def describe_exit(self, code: int | None) -> str:
+        name = self._exe_name or "browser"
+        if self._adopted:
+            return _tr(f"{name} 已退出（退出码 {code}）", f"{name} exited (exit code {code})")
+        if self._devtools_port:
+            return _tr(f"{name} 进程已退出（退出码 {code}）", f"{name} exited with code {code}")
+        return _tr(
+            f"{name} 进程已退出（退出码 {code}），调试端口未打开",
+            f"{name} exited with code {code} before opening its DevTools port",
+        )
+
+    def cdp_status(self) -> str:
+        """Short, user-facing description of the DevTools connection for timeout messages."""
+        if not self._devtools_port:
+            return _tr(
+                "浏览器未打开调试端口（DevToolsActivePort 未生成）",
+                "The browser did not open its DevTools port (no DevToolsActivePort)",
+            )
+        if not self._cdp_connected:
+            detail = self._cdp_last_error
+            return _tr(
+                f"无法连接浏览器调试端口 127.0.0.1:{self._devtools_port}" + (f"：{detail}" if detail else ""),
+                f"Cannot reach the DevTools port 127.0.0.1:{self._devtools_port}" + (f": {detail}" if detail else ""),
+            )
+        return _tr("网页已打开，但未找到可播放的视频", "The page opened but no playable video was found")
+
+    @property
+    def cdp_connected(self) -> bool:
+        return self._cdp_connected
+
+    def _worker_should_run(self, stop_event: threading.Event) -> bool:
+        if stop_event.is_set():
+            return False
+        return self.check_alive()
 
     def start(
         self,
@@ -3769,6 +4044,13 @@ class _BrowserWebVideoPlayer:
             self._attached_at = None
             self._muted = not bool(audio_enabled)
             self._paused = False
+            self._exe_name = Path(executable).name
+            self._adopted = False
+            self._launcher_exit_code = None
+            self._launcher_exited_at = None
+            self._devtools_port = 0
+            self._cdp_connected = False
+            self._cdp_last_error = ""
             self._stop_event = threading.Event()
             with self._cmd_lock:
                 self._pending_js = [
@@ -3821,8 +4103,8 @@ class _BrowserWebVideoPlayer:
     ) -> None:
         port_file = profile_dir / "DevToolsActivePort"
         port = 0
-        for _ in range(80):
-            if stop_event.is_set() or proc.poll() is not None:
+        for _ in range(150):
+            if not self._worker_should_run(stop_event):
                 return
             if port_file.is_file():
                 try:
@@ -3835,9 +4117,10 @@ class _BrowserWebVideoPlayer:
             time.sleep(0.1)
         if not port:
             return
+        self._devtools_port = port
 
         installed_targets: set[str] = set()
-        while not stop_event.is_set() and proc.poll() is None:
+        while self._worker_should_run(stop_event):
             try:
                 raw = (
                     urllib.request.urlopen(
@@ -3848,7 +4131,9 @@ class _BrowserWebVideoPlayer:
                     .decode("utf-8", errors="replace")
                 )
                 targets = json.loads(raw)
-            except Exception:
+                self._cdp_connected = True
+            except Exception as exc:
+                self._cdp_last_error = str(exc)[:160]
                 time.sleep(0.15)
                 continue
 
@@ -3900,11 +4185,12 @@ class _BrowserWebVideoPlayer:
         *,
         offscreen: bool,
     ) -> int:
-        if not self.running or not host_hwnd:
+        process = self.process
+        if process is None or process.poll() is not None or not host_hwnd:
             return 0
         hwnd = self.browser_hwnd
         if not hwnd:
-            hwnd = _find_browser_process_window(int(self.process.pid), host_hwnd)
+            hwnd = _find_browser_process_window(int(process.pid), host_hwnd)
             if not hwnd:
                 return 0
             self.browser_hwnd = hwnd
@@ -9280,10 +9566,11 @@ def run_ui() -> None:
         if not state.get("wallpaper_active"):
             return
         if state.get("wallpaper_web_mode"):
-            process = browser_wallpaper_player.process
-            if process is None or process.poll() is not None:
+            if not browser_wallpaper_player.check_alive():
+                cause = browser_wallpaper_player.last_error
                 wallpaper_status.configure(
-                    text=_tr("网页视频播放后端已退出\n请检查网页链接或浏览器安装", 'Web video player exited\nCheck the URL or browser installation')
+                    text=_tr("网页视频播放后端已退出\n", 'Web video player exited\n')
+                    + (cause or _tr("请检查网页链接或浏览器安装", 'Check the URL or browser installation'))
                 )
                 wallpaper_status.place(relx=0.5, rely=0.5, anchor="center")
                 wallpaper_status.lift()
@@ -9396,9 +9683,11 @@ def run_ui() -> None:
         if not state.get("wallpaper_preparing"):
             return
         if state.get("wallpaper_web_mode"):
-            process = browser_wallpaper_player.process
-            if process is None or process.poll() is not None:
-                message = _tr("网页视频播放后端启动失败\n请检查链接或浏览器安装", 'Web video player failed to start\nCheck the URL or browser installation')
+            if not browser_wallpaper_player.check_alive():
+                cause = browser_wallpaper_player.last_error
+                message = _tr("网页视频播放后端启动失败\n", 'Web video player failed to start\n') + (
+                    cause or _tr("请检查链接或浏览器安装", 'Check the URL or browser installation')
+                )
                 if state.get("wallpaper_active"):
                     _show_wallpaper_error(message)
                 else:
@@ -9422,8 +9711,16 @@ def run_ui() -> None:
                     return
             started = state.get("wallpaper_prepare_started")
             if state.get("wallpaper_active") and started is not None and now - float(started) > 15.0:
+                cause = browser_wallpaper_player.cdp_status()
+                if child and browser_wallpaper_player.cdp_connected:
+                    cause = ""
+                elif not child and browser_wallpaper_player.cdp_connected:
+                    cause = _tr("浏览器窗口未出现，无法嵌入", "The browser window never appeared")
                 browser_wallpaper_player.stop()
-                _show_wallpaper_error(_tr("网页视频加载超时\n请检查网络连接或链接内容", 'Web video loading timed out\nCheck your connection or URL'))
+                _show_wallpaper_error(
+                    _tr("网页视频加载超时\n", 'Web video loading timed out\n')
+                    + (cause or _tr("请检查网络连接或链接内容", 'Check your connection or URL'))
+                )
                 return
             state["wallpaper_ready_job"] = root.after(
                 WALLPAPER_READY_POLL_MS,
@@ -9646,7 +9943,21 @@ def run_ui() -> None:
         elif not files:
             error = _tr("所选文件夹中没有支持的图片或视频", 'No supported images or videos in the selected folders')
         elif executable is None:
-            error = _tr("未找到 mpv 播放后端\n请运行 install-mpv.ps1", 'mpv playback backend not found\nPlease run install-mpv.ps1')
+            if commit:
+                _start_mpv_provisioning(cfg.get("mpv_path"), retry=True)
+            snapshot = _mpv_provision_snapshot()
+            if snapshot.get("status") == "running":
+                error = _mpv_provision_text(snapshot)
+                if commit:
+                    state["wallpaper_waiting_for_mpv"] = True
+                    _schedule_mpv_provision_poll()
+            elif snapshot.get("status") == "failed":
+                error = _mpv_provision_text(snapshot) + _tr(
+                    "\n可在 设置 › 动态壁纸 中重试",
+                    "\nRetry from Settings › Live Wallpaper",
+                )
+            else:
+                error = _tr("未找到 mpv 播放后端\n请运行 install-mpv.ps1", 'mpv playback backend not found\nPlease run install-mpv.ps1')
         if error:
             state["wallpaper_prepare_error"] = error
             if commit:
@@ -9737,6 +10048,33 @@ def run_ui() -> None:
                 _prepare_wallpaper(commit=False)
 
         state["wallpaper_background_job"] = root.after(delay_ms, prepare)
+
+    def _schedule_mpv_provision_poll() -> None:
+        if state.get("mpv_provision_job") is None:
+            state["mpv_provision_job"] = root.after(400, _poll_mpv_provision)
+
+    def _poll_mpv_provision() -> None:
+        """Tk-thread poll of the background mpv download; resumes the wallpaper once it lands."""
+        state["mpv_provision_job"] = None
+        snapshot = _mpv_provision_snapshot()
+        waiting = bool(state.get("wallpaper_waiting_for_mpv"))
+        if snapshot.get("status") == "running":
+            if waiting and state.get("wallpaper_active") and not state.get("wallpaper_preparing"):
+                wallpaper_status.configure(text=_mpv_provision_text(snapshot))
+            _schedule_mpv_provision_poll()
+            return
+        state["wallpaper_waiting_for_mpv"] = False
+        if not waiting or not state.get("wallpaper_active") or state.get("wallpaper_preparing"):
+            return
+        if snapshot.get("status") == "done":
+            _clear_wallpaper_state()
+            state["wallpaper_active"] = False
+            set_wallpaper_active(True)
+        else:
+            _show_wallpaper_error(
+                _mpv_provision_text(snapshot)
+                + _tr("\n可在 设置 › 动态壁纸 中重试", "\nRetry from Settings › Live Wallpaper")
+            )
 
     def set_wallpaper_active(active: bool) -> bool:
         active = bool(active)
@@ -11673,6 +12011,11 @@ def run_ui() -> None:
                 return
             active_main_tab["title"] = title
             active_main_tab["initialized"] = True
+            if title == "动态壁纸":
+                # First visit to the wallpaper tab: fetch mpv in the background if it is missing.
+                starter = wp_subtab_state.get("start_mpv_download")
+                if callable(starter):
+                    win.after_idle(lambda: starter(retry=False))
             with _freeze_redraw(content_host):
                 for tab_title, frame in main_tabs:
                     btn = main_tab_btns.get(tab_title)
@@ -13063,6 +13406,68 @@ def run_ui() -> None:
         )
         folder_status.pack(fill="x")
 
+        mpv_row = tk.Frame(dirs_card, bg=S_CARD_BG)
+        mpv_status_lbl = tk.Label(
+            mpv_row,
+            text="",
+            fg=S_MUTED,
+            bg=S_CARD_BG,
+            font=settings_font_small,
+            anchor="w",
+            justify="left",
+            wraplength=400,
+        )
+        mpv_status_lbl.pack(side="left", fill="x", expand=True)
+        mpv_retry_btn = tk.Label(
+            mpv_row,
+            text=_tr("下载 mpv", "Download mpv"),
+            fg=S_ACCENT,
+            bg=S_CARD_BG,
+            font=settings_font_small,
+            cursor="hand2",
+            padx=8,
+        )
+        mpv_retry_btn.pack(side="right")
+        mpv_row_state: dict[str, Any] = {"sig": None, "job": None}
+
+        def refresh_mpv_row() -> None:
+            mpv_row_state["job"] = None
+            try:
+                if not win.winfo_exists():
+                    return
+            except Exception:
+                return
+            available = _find_mpv_executable(cfg.get("mpv_path")) is not None
+            snapshot = _mpv_provision_snapshot()
+            status = "ready" if available else str(snapshot.get("status") or "idle")
+            text = _mpv_provision_text(snapshot) if not available else ""
+            sig = (status, text)
+            if mpv_row_state["sig"] != sig:
+                mpv_row_state["sig"] = sig
+                if available:
+                    mpv_row.pack_forget()
+                    update_wallpaper_folder_status()
+                else:
+                    mpv_status_lbl.configure(text=text, fg="#f87171" if status == "failed" else S_MUTED)
+                    if status == "running":
+                        mpv_retry_btn.pack_forget()
+                    else:
+                        mpv_retry_btn.configure(
+                            text=_tr("重试", "Retry") if status == "failed" else _tr("下载 mpv", "Download mpv")
+                        )
+                        mpv_retry_btn.pack(side="right")
+                    if not mpv_row.winfo_manager():
+                        mpv_row.pack(fill="x", pady=(4, 0))
+            if status == "running":
+                mpv_row_state["job"] = win.after(400, refresh_mpv_row)
+
+        def start_mpv_download(_event: Any = None, *, retry: bool = True) -> None:
+            _start_mpv_provisioning(cfg.get("mpv_path"), retry=retry)
+            refresh_mpv_row()
+
+        mpv_retry_btn.bind("<Button-1>", start_mpv_download)
+        wp_subtab_state["start_mpv_download"] = start_mpv_download
+
         playback_card = make_card(directories_pad, pady=(0, 0), pady_inner=10)
         image_interval_row = tk.Frame(playback_card, bg=S_CARD_BG)
         image_interval_row.pack(fill="x")
@@ -13537,7 +13942,11 @@ def run_ui() -> None:
                 if isinstance(entry, dict) and isinstance(entry.get("files"), list):
                     total_cached_media += len(entry["files"])
             executable = _find_mpv_executable(cfg.get("mpv_path"))
-            engine_text = _tr("mpv 已就绪", 'mpv Ready') if executable is not None else _tr("mpv 未安装", 'mpv Not Installed')
+            engine_text = (
+                _tr("mpv 已就绪", 'mpv Ready')
+                if executable is not None
+                else _mpv_provision_text(_mpv_provision_snapshot())
+            )
             scan_note = (
                 _tr(" · 后台慢扫描中…", ' · Indexing in background…')
                 if (scanning_set or uncached_all)

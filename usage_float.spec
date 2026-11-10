@@ -7,7 +7,11 @@ a = Analysis(
     [str(spec_dir / "usage_float.py")],
     pathex=[str(spec_dir)],
     binaries=[],
-    datas=[(str(spec_dir / "wallpaper-start.lua"), ".")],
+    datas=[
+        (str(spec_dir / "wallpaper-start.lua"), "."),
+        (str(spec_dir / "mpv-pin.json"), "."),
+        (str(spec_dir / "licenses" / "mpv"), "licenses/mpv"),
+    ],
     hiddenimports=[
         "tkinter",
         "tkinter.ttk",

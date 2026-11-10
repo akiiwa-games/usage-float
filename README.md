@@ -80,7 +80,7 @@ Live wallpaper folder random weights:
 
 **Release package (recommended)**: Download `usage-float-*-windows-x64.zip` from the repository's Releases page, extract it, and run `UsageFloat.exe`. No Python installation is required (`mpv` is bundled). If Windows SmartScreen prompts on an unsigned binary, choose **More info → Run anyway**. Toggle **Start at login** from the right-click context menu.
 
-**Run from source**: Requires Windows + Python 3.10+ (with `tkinter`). For video wallpapers, run `.\install-mpv.ps1` first or place `mpv.exe` under `vendor/mpv/`.
+**Run from source**: Requires Windows + Python 3.10+ (with `tkinter`). Video wallpapers need `mpv`: Usage Float downloads the pinned, SHA-256-verified build into `~/.usage-float/runtime/mpv` in the background the first time a wallpaper needs it (progress and a retry button are under Settings › Live Wallpaper). `python mpv_provision.py` or `.\install-mpv.ps1` (into `vendor/mpv/`) install it ahead of time.
 
 ```powershell
 python usage_float.py once          # Print a one-shot CLI usage summary (release binary: UsageFloat.exe once)
@@ -277,7 +277,7 @@ python -m unittest discover -p "test_*.py"
 
 ## License
 
-MIT License. `mpv` is distributed under the GPL: the source repository does not include the binary (`install-mpv.ps1` downloads it on demand); release archives bundle `mpv` alongside [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+MIT License. `mpv` is distributed under the GPL: the source repository does not include the binary (Usage Float downloads the build pinned in `mpv-pin.json` on demand); release archives bundle `mpv` alongside [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Related Projects
 

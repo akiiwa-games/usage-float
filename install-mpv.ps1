@@ -1,34 +1,50 @@
 $ErrorActionPreference = "Stop"
 
-$releaseTag = "20260814"
-$archiveName = "mpv-x86_64-20260814-git-7b8915bc1d.7z"
-$archiveUrl = "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/$releaseTag/$archiveName"
-$expectedSha256 = "1bf3b029da2c98e605e00e85f21ee3142f22a1dcc4ceb5c827b5c51e36e390f9"
+# The pin (URLs, size, SHA-256, files) lives in mpv-pin.json, shared with mpv_provision.py,
+# which usage-float runs itself into ~/.usage-float/runtime/mpv when mpv is missing.
+$pin = Get-Content -LiteralPath (Join-Path $PSScriptRoot "mpv-pin.json") -Raw -Encoding UTF8 | ConvertFrom-Json
+$expectedSha256 = $pin.sha256.ToLowerInvariant()
 $targetDir = Join-Path $PSScriptRoot "vendor\mpv"
+$licenseDir = Join-Path $PSScriptRoot "licenses\mpv"
 $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
 $tempArchive = Join-Path $tempRoot ("usage-float-mpv-" + [guid]::NewGuid().ToString("N") + ".7z")
 $tempExtract = Join-Path $tempRoot ("usage-float-mpv-" + [guid]::NewGuid().ToString("N"))
 
 try {
-    Write-Host "Downloading pinned mpv build $releaseTag..."
-    Invoke-WebRequest -Uri $archiveUrl -OutFile $tempArchive
-
-    $actualSha256 = (Get-FileHash -LiteralPath $tempArchive -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($actualSha256 -ne $expectedSha256) {
-        throw "mpv archive checksum mismatch: $actualSha256"
+    $downloaded = $false
+    foreach ($url in $pin.urls) {
+        try {
+            Write-Host "Downloading pinned mpv build $($pin.build) from $url ..."
+            Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $tempArchive -UserAgent "usage-float-mpv-provision"
+            $actualSha256 = (Get-FileHash -LiteralPath $tempArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualSha256 -ne $expectedSha256) {
+                Write-Warning "mpv archive checksum mismatch from ${url}: $actualSha256"
+                continue
+            }
+            $downloaded = $true
+            break
+        }
+        catch {
+            Write-Warning "Download failed from ${url}: $_"
+        }
+    }
+    if (-not $downloaded) {
+        throw "Could not download a verified mpv archive ($($pin.archive))"
     }
 
     New-Item -ItemType Directory -Path $tempExtract -Force | Out-Null
-    & tar.exe -xf $tempArchive -C $tempExtract mpv.exe d3dcompiler_43.dll
+    & tar.exe -xf $tempArchive -C $tempExtract @($pin.files)
     if ($LASTEXITCODE -ne 0) {
         throw "Failed to extract mpv archive (tar exit $LASTEXITCODE)"
     }
 
     New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
-    Copy-Item -LiteralPath (Join-Path $tempExtract "mpv.exe") -Destination (Join-Path $targetDir "mpv.exe") -Force
-    Copy-Item -LiteralPath (Join-Path $tempExtract "d3dcompiler_43.dll") -Destination (Join-Path $targetDir "d3dcompiler_43.dll") -Force
-    Invoke-WebRequest -Uri "https://raw.githubusercontent.com/mpv-player/mpv/master/LICENSE.GPL" -OutFile (Join-Path $targetDir "LICENSE.GPL")
-    Invoke-WebRequest -Uri "https://raw.githubusercontent.com/mpv-player/mpv/master/Copyright" -OutFile (Join-Path $targetDir "Copyright")
+    foreach ($name in $pin.files) {
+        Copy-Item -LiteralPath (Join-Path $tempExtract $name) -Destination (Join-Path $targetDir $name) -Force
+    }
+    foreach ($name in @("LICENSE.GPL", "Copyright")) {
+        Copy-Item -LiteralPath (Join-Path $licenseDir $name) -Destination (Join-Path $targetDir $name) -Force
+    }
 
     Write-Host "mpv installed to $targetDir"
     & (Join-Path $targetDir "mpv.exe") --version | Select-Object -First 2
