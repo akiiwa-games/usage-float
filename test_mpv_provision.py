@@ -116,7 +116,7 @@ class EnsureMpvTests(unittest.TestCase):
         pin = _pin(payload)
         opener = _Opener({pin["urls"][0]: OSError("connection reset"), pin["urls"][1]: payload})
 
-        mp.ensure_mpv(self.target, pin=pin, opener=opener, extractor=_fake_extractor)
+        mp.ensure_mpv(self.target, pin=pin, opener=opener, extractor=_fake_extractor, fallback=None)
 
         self.assertTrue(mp.installed(self.target, pin))
         self.assertEqual(opener.calls, pin["urls"])
@@ -126,11 +126,55 @@ class EnsureMpvTests(unittest.TestCase):
         opener = _Opener({url: OSError("getaddrinfo failed") for url in pin["urls"]})
 
         with self.assertRaises(mp.ProvisionError) as caught:
-            mp.ensure_mpv(self.target, pin=pin, opener=opener, extractor=_fake_extractor)
+            mp.ensure_mpv(self.target, pin=pin, opener=opener, extractor=_fake_extractor, fallback=None)
 
-        for url in pin["urls"]:
-            self.assertIn(url, str(caught.exception))
+        for host in ("a.example", "b.example"):
+            self.assertIn(host, str(caught.exception))
+        self.assertIn("getaddrinfo failed", str(caught.exception))
         self.assertFalse(self.target.exists())
+
+    def test_tls_failure_falls_back_to_curl_and_still_checks_the_hash(self) -> None:
+        """Fresh Windows: Python cannot verify the mirror's chain, Schannel curl.exe can."""
+        import ssl
+        import urllib.error
+
+        payload = b"archive via curl"
+        pin = _pin(payload)
+        tls = urllib.error.URLError(ssl.SSLCertVerificationError("certificate verify failed: unable to get local issuer certificate"))
+        opener = _Opener({url: tls for url in pin["urls"]})
+        fetched: list[str] = []
+
+        def curl(url, destination, progress, total, timeout):
+            fetched.append(url)
+            destination.write_bytes(payload)
+
+        mp.ensure_mpv(self.target, pin=pin, opener=opener, extractor=_fake_extractor, fallback=curl)
+        self.assertTrue(mp.installed(self.target, pin))
+        self.assertEqual(fetched, [pin["urls"][0]])
+
+        bad_target = self.root / "runtime" / "other"
+
+        def tampered(url, destination, progress, total, timeout):
+            destination.write_bytes(b"not the pinned archive")
+
+        with self.assertRaises(mp.ProvisionError) as caught:
+            mp.ensure_mpv(bad_target, pin=pin, opener=opener, extractor=_fake_extractor, fallback=tampered)
+        self.assertIn("SHA-256 mismatch", str(caught.exception))
+        self.assertFalse(bad_target.exists())
+
+    def test_tls_and_curl_failures_are_both_reported_briefly(self) -> None:
+        pin = _pin(b"x")
+        opener = _Opener({url: OSError("certificate verify failed") for url in pin["urls"]})
+
+        def curl(url, destination, progress, total, timeout):
+            raise mp.ProvisionError("curl exit 6: Could not resolve host")
+
+        with self.assertRaises(mp.ProvisionError) as caught:
+            mp.ensure_mpv(self.target, pin=pin, opener=opener, extractor=_fake_extractor, fallback=curl)
+        message = str(caught.exception)
+        self.assertIn("certificate verify failed", message)
+        self.assertIn("curl exit 6", message)
+        self.assertLess(len(message), 600)
 
     def test_extraction_failure_leaves_no_partial_install(self) -> None:
         payload = b"good"

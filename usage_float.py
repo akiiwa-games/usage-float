@@ -1521,6 +1521,11 @@ def _mpv_provision_text(snapshot: dict[str, Any]) -> str:
         return _tr(f"正在下载 mpv 播放后端…{percent}", f"Downloading the mpv playback backend…{percent}")
     if status == "failed":
         error = str(snapshot.get("error") or "")
+        for prefix in ("mpv download failed: ", "mpv install failed: "):
+            if error.startswith(prefix):
+                error = error[len(prefix):]
+        if len(error) > 220:
+            error = error[:217] + "…"
         return _tr(f"mpv 下载失败：{error}", f"mpv download failed: {error}")
     if status == "done":
         return _tr("mpv 已就绪", "mpv Ready")

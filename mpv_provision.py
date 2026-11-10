@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
@@ -60,13 +61,76 @@ def installed(target: Path | None = None, pin: dict[str, Any] | None = None) -> 
     return marker.get("sha256") == pin["sha256"] and all((target / name).is_file() for name in pin["files"])
 
 
+def _short_reason(exc: BaseException) -> str:
+    reason = getattr(exc, "reason", None) or exc
+    text = str(reason).strip() or exc.__class__.__name__
+    return text if len(text) <= 160 else text[:157] + "..."
+
+
+def _curl_executable() -> str | None:
+    """Windows 10+ ships curl.exe built on Schannel."""
+    system_curl = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "curl.exe"
+    if system_curl.is_file():
+        return str(system_curl)
+    return shutil.which("curl")
+
+
+def _download_with_curl(url: str, destination: Path, progress: Progress | None, total: int, timeout: float) -> None:
+    """Fallback for machines whose Python cannot verify the mirror's certificate.
+
+    A fresh Windows ships a minimal root store and downloads further roots on demand, but
+    only for Schannel/CryptoAPI clients; Python's OpenSSL never triggers that, so urllib
+    fails with CERTIFICATE_VERIFY_FAILED. curl.exe uses Schannel. The SHA-256 is still
+    checked by the caller.
+    """
+    curl = _curl_executable()
+    if not curl:
+        raise ProvisionError("curl.exe not available")
+    process = subprocess.Popen(
+        [curl, "-fsSL", "--retry", "2", "--connect-timeout", str(int(timeout)), "-A", USER_AGENT,
+         "-o", str(destination), url],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    deadline = time.monotonic() + max(600.0, timeout * 30)
+    try:
+        while process.poll() is None:
+            if time.monotonic() > deadline:
+                process.kill()
+                raise ProvisionError("curl timed out")
+            if progress is not None:
+                try:
+                    progress(destination.stat().st_size, total)
+                except OSError:
+                    pass
+            time.sleep(0.25)
+    finally:
+        if process.poll() is None:
+            process.kill()
+    stderr = (process.stderr.read() if process.stderr else b"").decode("utf-8", "replace").strip()
+    if process.stderr:
+        process.stderr.close()
+    if process.returncode != 0:
+        raise ProvisionError(f"curl exit {process.returncode}: {stderr[:160]}")
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(CHUNK), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def _download(pin: dict[str, Any], destination: Path, progress: Progress | None, opener: Callable[..., Any],
-              timeout: float) -> None:
+              timeout: float, fallback: Callable[..., None] | None = _download_with_curl) -> None:
     expected = str(pin["sha256"]).lower()
     total_hint = int(pin.get("size") or 0)
     errors: list[str] = []
     for url in pin["urls"]:
-        digest = hashlib.sha256()
+        host = urllib.parse.urlsplit(url).netloc or url
         done = 0
         try:
             request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
@@ -77,19 +141,25 @@ def _download(pin: dict[str, Any], destination: Path, progress: Progress | None,
                     if not block:
                         break
                     out.write(block)
-                    digest.update(block)
                     done += len(block)
                     if progress is not None:
                         progress(done, total)
-        except Exception as exc:  # network errors differ per platform; try the next mirror
-            errors.append(f"{url}: {exc}")
-            continue
-        actual = digest.hexdigest()
+        except Exception as exc:  # network and TLS errors differ per machine; try curl.exe, then the next mirror
+            reason = _short_reason(exc)
+            if fallback is None:
+                errors.append(f"{host}: {reason}")
+                continue
+            try:
+                fallback(url, destination, progress, total_hint, timeout)
+            except Exception as curl_exc:
+                errors.append(f"{host}: {reason}; curl: {_short_reason(curl_exc)}")
+                continue
+        actual = _sha256_file(destination)
         if actual != expected:
-            errors.append(f"{url}: SHA-256 mismatch ({actual})")
+            errors.append(f"{host}: SHA-256 mismatch ({actual[:16]}…)")
             continue
         return
-    raise ProvisionError("mpv download failed: " + "; ".join(errors))
+    raise ProvisionError("mpv download failed: " + " | ".join(errors))
 
 
 def _tar_executable() -> str:
@@ -175,6 +245,7 @@ def ensure_mpv(
     force: bool = False,
     pin: dict[str, Any] | None = None,
     opener: Callable[..., Any] = urllib.request.urlopen,
+    fallback: Callable[..., None] | None = _download_with_curl,
     extractor: Callable[[Path, Path, list[str]], None] | None = None,
     timeout: float = 60.0,
     lock_timeout: float = 900.0,
@@ -193,7 +264,7 @@ def ensure_mpv(
         work = Path(tempfile.mkdtemp(prefix=".mpv-provision-", dir=str(target.parent)))
         try:
             archive = work / str(pin["archive"])
-            _download(pin, archive, progress, opener, timeout)
+            _download(pin, archive, progress, opener, timeout, fallback)
             staged = work / "mpv"
             staged.mkdir()
             extractor(archive, staged, list(pin["files"]))
