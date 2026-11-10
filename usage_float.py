@@ -13467,6 +13467,12 @@ def run_ui() -> None:
 
         mpv_retry_btn.bind("<Button-1>", start_mpv_download)
         wp_subtab_state["start_mpv_download"] = start_mpv_download
+        # select_main_tab(initial_tab) ran before this card existed: when Settings opened
+        # straight onto the wallpaper tab, start the background download now.
+        if active_main_tab.get("title") == "动态壁纸":
+            win.after_idle(lambda: start_mpv_download(retry=False))
+        else:
+            win.after_idle(refresh_mpv_row)
 
         playback_card = make_card(directories_pad, pady=(0, 0), pady_inner=10)
         image_interval_row = tk.Frame(playback_card, bg=S_CARD_BG)
