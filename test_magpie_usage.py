@@ -49,6 +49,23 @@ class MagpieUsageTests(unittest.TestCase):
         row = usage.DisplayRow(title='Claude 2', used_pct=7, provider_id='claude-2', window_id='five_hour')
         self.assertFalse(usage.row_opens_reset_ui(row))
 
+    def test_model_scoped_week_shows_as_the_accounts_fable_row(self):
+        # 2026-11-10: Magpie lists "7 days · Fable"; it was dropped, so "Claude 2 fable 7d" never showed.
+        self.quota['windows'].append({'name': '7 days · Fable', 'used': 12, 'resetsAt': self.now})
+        with patch.object(usage, 'http_json', return_value=(200, {'data': [self.quota]})):
+            result = usage.fetch_claude_usage(provider_id='claude-2')
+        fable = next(w for w in result.windows if w.id == 'weekly_fable')
+        self.assertEqual((fable.label, fable.used_pct), ('fable 7d', 12))
+        rows = usage.iter_display_rows([result], ['claude-2:7d', 'claude-2:fable'])
+        self.assertIn('claude-2:fable', [usage.display_item(r) for r in rows])
+        self.assertNotIn('claude-2:fable', usage.items_without_window([result]))  # Settings: no "无此窗口"
+
+    def test_unknown_magpie_window_names_are_ignored(self):
+        self.assertIsNone(magpie_usage.window_name('30 days'))
+        self.assertIsNone(magpie_usage.window_name('7 days · '))
+        self.assertIsNone(magpie_usage.window_name(None))
+        self.assertEqual(magpie_usage.window_name('7 days · Fable'), ('weekly_fable', 'fable 7d'))
+
     def test_gateway_failure_never_falls_back_to_local_oauth(self):
         with patch.object(usage, 'http_json', return_value=(401, {})), \
                 patch.object(usage, 'claude_authorized_json', side_effect=AssertionError('local API call')):
