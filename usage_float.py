@@ -8125,6 +8125,16 @@ def fetch_all(providers: list[str], *, force: bool = False) -> list[ProviderUsag
     return collect_local_usage(providers, force=force)
 
 
+def get_usage(providers: list[str]) -> list[ProviderUsage]:
+    """Read usage for the requested providers; a host may bind this to its collector."""
+    return fetch_all(providers, force=False)
+
+
+def refresh_usage(providers: list[str]) -> list[ProviderUsage]:
+    """Force-refresh usage for the requested providers; a host may bind this to its collector."""
+    return fetch_all(providers, force=True)
+
+
 def merge_display_usage(
     observations: Any, previous: list[ProviderUsage], selected: list[str],
     error: str = '更新失败',
@@ -8146,7 +8156,7 @@ def fetch_display_usage(
 ) -> list[ProviderUsage]:
     """UI collection boundary, including exceptions from subprocess adapters."""
     try:
-        observations = fetch_all(selected, force=force)
+        observations = refresh_usage(selected) if force else get_usage(selected)
     except Exception as error:
         return merge_display_usage(None, previous, selected, f'更新失败 ({type(error).__name__})')
     return merge_display_usage(observations, previous, selected)
@@ -15174,7 +15184,7 @@ def run_ui() -> None:
 
             def work() -> None:
                 try:
-                    fresh: ProviderUsage | None = next(iter(fetch_all([account_id], force=True)), None)
+                    fresh: ProviderUsage | None = next(iter(refresh_usage([account_id])), None)
                 except Exception:
                     _log_exception("claude reset status")
                     fresh = None
@@ -16359,9 +16369,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if cmd == "once":
         once_cfg = load_config()
-        providers = fetch_all(
+        providers = refresh_usage(
             active_providers(list(once_cfg.get("providers") or DEFAULT_PROVIDERS), include_discovered=True, disabled=list(once_cfg.get("disabled_providers") or [])),
-            force=True,
         )
         for row in iter_display_rows(
             providers, list(once_cfg.get("providers") or DEFAULT_PROVIDERS)

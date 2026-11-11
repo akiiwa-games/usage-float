@@ -192,6 +192,61 @@ class UsageFallbackTests(unittest.TestCase):
             self.assertFalse(state['refreshing'])
         self.assertEqual(rendered.call_count, 3)
 
+    def test_standalone_seam_delegates_to_local_fetch_all(self):
+        with patch.object(usage, 'fetch_all', return_value=[self.good(value=31)]) as fetched:
+            [regular] = usage.fetch_display_usage(['claude'], [], force=False)
+            fetched.assert_called_once_with(['claude'], force=False)
+        self.assert_reading(regular, 31)
+
+        with patch.object(usage, 'fetch_all', return_value=[self.good(value=47)]) as fetched:
+            [forced] = usage.fetch_display_usage(['claude'], [], force=True)
+            fetched.assert_called_once_with(['claude'], force=True)
+        self.assert_reading(forced, 47)
+
+    def test_host_bound_seam_bypasses_all_plugin_fetchers_and_cache_writes(self):
+        calls = []
+        get_fn = lambda providers: (calls.append(('get', list(providers))) or [self.good(value=19)])
+        refresh_fn = lambda providers: (calls.append(('refresh', list(providers))) or [self.good(value=64)])
+        forbidden = AssertionError('Hosted mode must not invoke plugin fetchers or cache writers')
+        with patch.object(usage, 'get_usage', side_effect=get_fn), \
+                patch.object(usage, 'refresh_usage', side_effect=refresh_fn), \
+                patch.object(usage, 'fetch_all', side_effect=forbidden), \
+                patch.object(usage, 'collect_local_usage', side_effect=forbidden), \
+                patch.object(usage, 'fetch_claude_usage', side_effect=forbidden), \
+                patch.object(usage, 'update_usage_cache', side_effect=forbidden), \
+                patch.object(usage, 'save_usage_cache', side_effect=forbidden), \
+                patch.object(usage, 'load_config', return_value={'providers': ['claude']}), \
+                patch.object(usage, 'active_providers', return_value=['claude']):
+            [regular] = usage.fetch_display_usage(['claude'], [], force=False)
+            [forced] = usage.fetch_display_usage(['claude'], [], force=True)
+            rc = usage.main(['once'])
+        self.assertEqual(rc, 0)
+        self.assert_reading(regular, 19)
+        self.assert_reading(forced, 64)
+        self.assertFalse(self.path.exists())
+        self.assertEqual(calls, [('get', ['claude']), ('refresh', ['claude']), ('refresh', ['claude'])])
+
+    def test_only_seam_functions_call_fetch_all_directly(self):
+        tree = ast.parse(Path(usage.__file__).read_text(encoding='utf-8'))
+        callers = []
+
+        class Visitor(ast.NodeVisitor):
+            def __init__(self):
+                self.stack = []
+
+            def visit_FunctionDef(self, node):
+                self.stack.append(node.name)
+                self.generic_visit(node)
+                self.stack.pop()
+
+            def visit_Call(self, node):
+                if isinstance(node.func, ast.Name) and node.func.id == 'fetch_all':
+                    callers.append(tuple(self.stack))
+                self.generic_visit(node)
+
+        Visitor().visit(tree)
+        self.assertEqual(callers, [('get_usage',), ('refresh_usage',)])
+
 
 if __name__ == '__main__':
     unittest.main()
