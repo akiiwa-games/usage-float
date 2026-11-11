@@ -226,26 +226,166 @@ class UsageFallbackTests(unittest.TestCase):
         self.assertFalse(self.path.exists())
         self.assertEqual(calls, [('get', ['claude']), ('refresh', ['claude']), ('refresh', ['claude'])])
 
-    def test_only_seam_functions_call_fetch_all_directly(self):
+    def test_only_seam_functions_call_fetch_all_and_reach_writers_or_vendor_endpoints(self):
         tree = ast.parse(Path(usage.__file__).read_text(encoding='utf-8'))
-        callers = []
+        direct_fetch_all_callers = []
+        edges: dict[str, set[str]] = {'<module>': set()}
 
         class Visitor(ast.NodeVisitor):
             def __init__(self):
                 self.stack = []
 
-            def visit_FunctionDef(self, node):
+            def _enter_fn(self, node):
+                qual = '.'.join([*self.stack, node.name])
+                edges.setdefault(qual, set())
+                # Defining a nested callback inside a function makes it invokable from its parent scope.
+                if self.stack:
+                    parent = '.'.join(self.stack)
+                    edges.setdefault(parent, set()).add(qual)
                 self.stack.append(node.name)
                 self.generic_visit(node)
                 self.stack.pop()
 
+            visit_FunctionDef = _enter_fn
+            visit_AsyncFunctionDef = _enter_fn
+
             def visit_Call(self, node):
-                if isinstance(node.func, ast.Name) and node.func.id == 'fetch_all':
-                    callers.append(tuple(self.stack))
+                caller = '.'.join(self.stack) if self.stack else '<module>'
+                if isinstance(node.func, ast.Name):
+                    callee = node.func.id
+                    edges.setdefault(caller, set()).add(callee)
+                    if callee == 'fetch_all':
+                        direct_fetch_all_callers.append(tuple(self.stack) or ('<module>',))
                 self.generic_visit(node)
 
         Visitor().visit(tree)
-        self.assertEqual(callers, [('get_usage',), ('refresh_usage',)])
+        self.assertEqual(direct_fetch_all_callers, [('get_usage',), ('refresh_usage',)])
+
+        def reachable(roots: tuple[str, ...], blocked: set[str]) -> set[str]:
+            seen: set[str] = set()
+            queue = [r for r in roots if r not in blocked]
+            while queue:
+                cur = queue.pop()
+                if cur in seen or cur in blocked:
+                    continue
+                seen.add(cur)
+                for nxt in edges.get(cur, ()):
+                    if nxt not in seen and nxt not in blocked:
+                        queue.append(nxt)
+            return seen
+
+        roots = ('<module>', 'main', 'run_ui', 'fetch_display_usage')
+        writers_and_fetchers = {
+            'collect_local_usage',
+            'fetch_claude_usage',
+            'fetch_magpie_claude_usage',
+            'fetch_codex_usage',
+            'fetch_pi_usage',
+            'fetch_grok_usage',
+            'fetch_api_proxy_usage',
+            'fetch_antigravity_usage',
+            'save_usage_cache',
+            'update_usage_cache',
+            'cache_put_provider',
+            'mark_provider_stale',
+            'record_usage_attempt',
+            'set_claude_backoff',
+            'clear_claude_backoff',
+            'refresh_local_activity',
+        }
+        # In hosted mode get_usage and refresh_usage are replaced, blocking fetch_all.
+        without_fetch_all = reachable(roots, {'get_usage', 'refresh_usage', 'fetch_all'})
+        self.assertEqual(without_fetch_all & writers_and_fetchers, set())
+
+        # With reset seams also bound to the host, no UI/CLI path reaches vendor auth helpers directly.
+        without_seams = reachable(
+            roots,
+            {
+                'get_usage',
+                'refresh_usage',
+                'fetch_all',
+                'fetch_claude_session_reset',
+                'claim_claude_session_reset',
+                'claim_claude_reset',
+                'fetch_codex_reset_cards',
+                'consume_codex_reset_card',
+            },
+        )
+        self.assertEqual(without_seams & {'claude_authorized_json', 'codex_authorized_json'}, set())
+
+    def test_apply_data_merges_memory_only_without_disk_or_credential_io(self):
+        tree = ast.parse(Path(usage.__file__).read_text(encoding='utf-8'))
+        run_ui = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'run_ui')
+        apply_fn = [n for n in run_ui.body if isinstance(n, ast.FunctionDef) and n.name == 'apply_data']
+        state = {'providers': [self.good(value=37)], 'refreshing': True}
+        scope = dict(vars(usage), state=state, render=Mock())
+        exec(compile(ast.Module(body=apply_fn, type_ignores=[]), usage.__file__, 'exec'), scope)
+
+        failed = usage.ProviderUsage(
+            provider_id='claude', display_name='claude', available=False, stale=True,
+            error='等待后台采集', credential_key='account-a',
+        )
+        forbidden = AssertionError('apply_data on Tk main thread must not touch disk or credential key')
+        with patch.dict(
+            scope,
+            provider_credential_key=Mock(side_effect=forbidden),
+            cache_get_provider=Mock(side_effect=forbidden),
+            display_snapshot=Mock(side_effect=forbidden),
+            load_usage_cache=Mock(side_effect=forbidden),
+        ), patch.object(usage, 'provider_credential_key', side_effect=forbidden), \
+                patch.object(usage, 'cache_get_provider', side_effect=forbidden), \
+                patch.object(usage, 'display_snapshot', side_effect=forbidden), \
+                patch.object(usage, 'load_usage_cache', side_effect=forbidden):
+            scope['apply_data']([failed])
+
+        self.assert_reading(state['providers'][0], 37)
+        self.assertTrue(state['providers'][0].stale)
+
+    def test_filter_providers_excludes_disallowed_accounts_without_failed_rows(self):
+        with patch.object(usage, 'filter_providers', side_effect=lambda items: [i for i in items if not i.startswith('codex')]), \
+                patch.object(usage, 'get_usage', return_value=[self.good('claude', 28)]):
+            self.assertFalse(usage.provider_available('codex'))
+            items = usage.fetch_display_usage(['codex:7d', 'claude:7d'], [])
+        rows = usage.iter_display_rows(items, ['codex:7d', 'claude:7d'])
+        self.assertEqual([r.provider_id for r in rows], ['claude'])
+        self.assertFalse(any(r.failed for r in rows))
+
+    def test_codex_reset_helpers_resolve_dynamic_provider_id_without_default_fallback(self):
+        with TemporaryDirectory() as temp_dir:
+            codex_3 = Path(temp_dir) / '.codex-3'
+            codex_3.mkdir()
+            seen_homes = []
+
+            def fake_call(url, *, home=None, method='GET', body=None):
+                seen_homes.append(home)
+                return 200, {'credits': [{'id': 'c3', 'status': 'available'}]}
+
+            discovered = {'codex-3': usage.CodexAccount('codex-3', 'codex-3', codex_3)}
+            with patch.object(usage, 'discover_codex_accounts', return_value=discovered), \
+                    patch.object(usage, 'codex_authorized_json', side_effect=fake_call):
+                cards, err = usage.fetch_codex_reset_cards(provider_id='codex-3')
+                self.assertIsNone(err)
+                self.assertEqual([c.card_id for c in cards], ['c3'])
+                self.assertEqual(seen_homes, [codex_3])
+
+                missing_cards, missing_err = usage.fetch_codex_reset_cards(provider_id='codex-missing')
+                self.assertEqual(missing_cards, [])
+                self.assertIn('登录凭证', missing_err or '')
+                self.assertEqual(len(seen_homes), 1)
+
+    def test_collector_config_hooks_overlay_on_load_and_persist_on_save(self):
+        with TemporaryDirectory() as temp_dir:
+            cfg_path = Path(temp_dir) / 'config.json'
+            cfg_path.write_text(json.dumps({'llm_proxy_timezone': 'UTC+8'}), encoding='utf-8')
+            saved_collector = {}
+            with patch.object(usage, 'CONFIG_PATH', cfg_path), \
+                    patch.object(usage, 'read_collector_config', return_value={'llm_proxy_timezone': 'UTC'}), \
+                    patch.object(usage, 'write_collector_config', side_effect=lambda c: saved_collector.update(llm_proxy_timezone=c.get('llm_proxy_timezone'))):
+                loaded = usage.load_config()
+                self.assertEqual(loaded['llm_proxy_timezone'], 'UTC')
+                loaded['llm_proxy_timezone'] = 'UTC-5'
+                usage.save_config(loaded)
+            self.assertEqual(saved_collector, {'llm_proxy_timezone': 'UTC-5'})
 
 
 if __name__ == '__main__':

@@ -170,11 +170,13 @@ APP_DIR = (
 VERSION = "1.3.5"
 CLAUDE_HOME = Path(os.environ.get("CLAUDE_HOME", HOME / ".claude"))
 CLAUDE_HOME_2 = Path(os.environ.get("CLAUDE_HOME_2", HOME / ".claude-2"))
-CODEX_HOME = Path(os.environ.get("CODEX_HOME", HOME / ".codex"))
+# Default Codex uses ~/.codex, not an inherited worker session CODEX_HOME.
+CODEX_HOME = HOME / ".codex"
 CODEX_HOME_2 = Path(os.environ.get("CODEX_HOME_2", HOME / ".codex-2"))
 GROK_HOME = Path(os.environ.get("GROK_HOME", HOME / ".grok"))
 CONFIG_PATH = HOME / ".usage-float" / "config.json"
 CACHE_PATH = HOME / ".usage-float" / "usage-cache.json"
+PERIODIC_REFRESH = True
 WALLPAPER_INDEX_CACHE_PATH = HOME / ".usage-float" / "wallpaper-index.json"
 RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", str(APP_DIR))) if _OWN_FROZEN_BUILD else APP_DIR
 WALLPAPER_START_SCRIPT_PATH = RESOURCE_DIR / "wallpaper-start.lua"
@@ -421,12 +423,12 @@ def discover_codex_accounts() -> dict[str, CodexAccount]:
         if pid == "codex" or acc.home != HOME / f".{pid}" or acc.home.is_dir()
     }
     for pid, spec in _read_paseo_providers().items():
-        if spec.get("enabled") is False or pid in accounts:
+        env = spec.get("env") if isinstance(spec.get("env"), dict) else {}
+        cfg = str(env.get("CODEX_HOME") or "").strip()
+        if spec.get("enabled") is False or (pid in accounts and not (pid == "codex" and cfg)):
             continue
         extends = str(spec.get("extends") or "").strip().lower()
         if pid == "codex" or extends == "codex" or (not extends and pid.startswith("codex-")):
-            env = spec.get("env") if isinstance(spec.get("env"), dict) else {}
-            cfg = str(env.get("CODEX_HOME") or "").strip()
             home = Path(cfg).expanduser() if cfg else (HOME / (".codex" if pid == "codex" else f".{pid}"))
             accounts[pid] = CodexAccount(pid, pid, home)
             PROVIDER_LABELS.setdefault(pid, str(spec.get("label") or pid.replace("-", " ").title()).strip())
@@ -4719,6 +4721,26 @@ def scan_providers(
     ]
 
 
+COLLECTOR_CONFIG_KEYS: tuple[str, ...] = (
+    "llm_proxy_timezone",
+    "llm_proxy_budget_duration",
+    "llm_proxy_api_key",
+    "llm_proxy_endpoint",
+    "llm_proxy_provider_id",
+    "litellm_proxies",
+)
+
+
+def read_collector_config() -> dict[str, Any]:
+    """Overlay collector-owned settings when hosted; empty in standalone mode."""
+    return {}
+
+
+def write_collector_config(cfg: dict[str, Any]) -> None:
+    """Persist collector-owned settings when hosted; no-op in standalone mode."""
+    return None
+
+
 def load_config() -> dict[str, Any]:
     global _ACTIVE_LANGUAGE
     defaults: dict[str, Any] = {
@@ -4766,6 +4788,14 @@ def load_config() -> dict[str, Any]:
             if isinstance(data, dict):
                 file_data = data
                 defaults.update(data)
+    except Exception:
+        pass
+    try:
+        collector_data = read_collector_config()
+        if isinstance(collector_data, dict):
+            for key in COLLECTOR_CONFIG_KEYS:
+                if key in collector_data:
+                    defaults[key] = collector_data[key]
     except Exception:
         pass
     try:
@@ -5023,6 +5053,10 @@ def save_config(cfg: dict[str, Any]) -> None:
     try:
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    try:
+        write_collector_config(cfg)
     except Exception:
         pass
 
@@ -5371,6 +5405,9 @@ def _provider_from_dict(d: dict[str, Any]) -> ProviderUsage:
         home=d.get("home"),
         usage_details=d.get("usage_details") if isinstance(d.get("usage_details"), dict) else None,
     )
+
+
+provider_from_dict = _provider_from_dict
 
 
 def cache_get_provider(provider_id: str) -> ProviderUsage | None:
@@ -6032,25 +6069,31 @@ def claim_claude_session_reset(provider_id: str = "claude") -> ClaudeResetClaim:
 
 
 def display_fallback(
-    provider_id: str, error: str, previous: Iterable[ProviderUsage] = (),
+    provider_id: str,
+    error: str,
+    previous: Iterable[ProviderUsage] = (),
+    *,
+    memory_only: bool = False,
 ) -> ProviderUsage:
     """Recover presentation history without writing it into the quota cache."""
     candidates = [p for p in previous if isinstance(p, ProviderUsage)
                   and p.provider_id == provider_id and (p.windows or p.summary)]
-    try:
-        key = provider_credential_key(provider_id)
-        # Do not attribute a known previous login's quota to a new login.
-        if key is not None:
-            candidates = [p for p in candidates if p.credential_key in (None, key)]
-    except Exception:
-        pass  # Discovery/read failures must not erase the UI's last reading.
-    for reader in (cache_get_provider, display_snapshot):
+    key: str | None = None
+    if not memory_only:
         try:
-            item = reader(provider_id)
-            if item is not None:
-                candidates.append(item)
+            key = provider_credential_key(provider_id)
+            # Do not attribute a known previous login's quota to a new login.
+            if key is not None:
+                candidates = [p for p in candidates if p.credential_key in (None, key)]
         except Exception:
-            continue
+            pass  # Discovery/read failures must not erase the UI's last reading.
+        for reader in (cache_get_provider, display_snapshot):
+            try:
+                item = reader(provider_id)
+                if item is not None:
+                    candidates.append(item)
+            except Exception:
+                continue
     if candidates:
         cached = max(candidates, key=lambda p: _iso_epoch(p.fetched_at, 0))
         # Copy before marking stale: the UI may still be rendering this object.
@@ -6059,7 +6102,7 @@ def display_fallback(
         cached.error = error
         return cached
     return ProviderUsage(provider_id=provider_id, display_name=provider_id,
-                         available=False, error=error, stale=True)
+                         available=False, error=error, stale=True, credential_key=key)
 
 
 def stale_provider_usage(
@@ -6240,8 +6283,8 @@ def fetch_claude_usage(*, force: bool = False, provider_id: str = "claude") -> P
 # ---------------------------------------------------------------------------
 
 
-def read_codex_auth(home: Path = CODEX_HOME) -> tuple[dict[str, Any] | None, Path | None]:
-    auth_path = home / "auth.json"
+def read_codex_auth(home: Path | None = None) -> tuple[dict[str, Any] | None, Path | None]:
+    auth_path = (CODEX_HOME if home is None else home) / "auth.json"
     if not auth_path.exists():
         return None, None
     try:
@@ -6291,7 +6334,7 @@ def refresh_codex_token(refresh_token: str) -> dict[str, Any] | None:
 def codex_authorized_json(
     url: str,
     *,
-    home: Path = CODEX_HOME,
+    home: Path | None = None,
     method: str = "GET",
     body: dict[str, Any] | None = None,
 ) -> tuple[int, Any]:
@@ -6300,7 +6343,8 @@ def codex_authorized_json(
     Returns the same (status, payload) pair as http_json(); status 0 means the
     local credential is missing. Only the Codex CLI owns token rotation.
     """
-    auth, auth_path = read_codex_auth(home)
+    resolved_home = CODEX_HOME if home is None else home
+    auth, auth_path = read_codex_auth(resolved_home)
     if not auth:
         return 0, None
 
@@ -6318,7 +6362,7 @@ def codex_authorized_json(
 
     status, payload = call(access, account_id)
     if status in (401, 403) and method.upper() == 'GET':
-        latest, _ = read_codex_auth(home)
+        latest, _ = read_codex_auth(resolved_home)
         new = (latest or {}).get('tokens') or {}
         if new.get('access_token') and new['access_token'] != access:
             return call(new['access_token'], new.get('account_id'))
@@ -6492,35 +6536,55 @@ def codex_error_text(status: int, payload: Any) -> str:
     return f"HTTP {status}" if status else _tr("网络不可用", 'Network unavailable')
 
 
-def fetch_codex_reset_cards(
-    home: Path = CODEX_HOME,
-) -> tuple[list[CodexResetCard], str | None]:
-    """Return (cards, error). Cards include spent ones so counts stay honest."""
-    status, payload = codex_authorized_json(CODEX_RESET_CARDS_URL, home=home)
-    if status == 0:
-        return [], _tr("未找到可用的 Codex 登录凭证", 'No usable Codex login credentials found')
-    if status != 200 or not isinstance(payload, dict):
-        return [], _tr(f"读取重置卡失败：{codex_error_text(status, payload)}", f'Could not load reset credits: {codex_error_text(status, payload)}')
+def _resolve_codex_home(home: Path | None, provider_id: str | None) -> Path | None:
+    if provider_id is not None:
+        account = discover_codex_accounts().get(provider_id)
+        return account.home if account is not None else None
+    return CODEX_HOME if home is None else home
+
+
+def parse_codex_reset_cards(credits: Any) -> list[CodexResetCard]:
     cards: list[CodexResetCard] = []
-    for item in payload.get("credits") or []:
+    for item in credits or []:
         if not isinstance(item, dict):
             continue
         card = _codex_reset_card_from_dict(item)
         if card is not None:
             cards.append(card)
-    return sort_codex_reset_cards(cards), None
+    return sort_codex_reset_cards(cards)
+
+
+def fetch_codex_reset_cards(
+    home: Path | None = None,
+    *,
+    provider_id: str | None = None,
+) -> tuple[list[CodexResetCard], str | None]:
+    """Return (cards, error). Cards include spent ones so counts stay honest."""
+    target_home = _resolve_codex_home(home, provider_id)
+    if target_home is None:
+        return [], _tr("未找到可用的 Codex 登录凭证", 'No usable Codex login credentials found')
+    status, payload = codex_authorized_json(CODEX_RESET_CARDS_URL, home=target_home)
+    if status == 0:
+        return [], _tr("未找到可用的 Codex 登录凭证", 'No usable Codex login credentials found')
+    if status != 200 or not isinstance(payload, dict):
+        return [], _tr(f"读取重置卡失败：{codex_error_text(status, payload)}", f'Could not load reset credits: {codex_error_text(status, payload)}')
+    return parse_codex_reset_cards(payload.get("credits")), None
 
 
 def consume_codex_reset_card(
     card_id: str,
     *,
-    home: Path = CODEX_HOME,
+    home: Path | None = None,
     request_id: str | None = None,
+    provider_id: str | None = None,
 ) -> tuple[bool, str]:
     """Redeem one reset card. Returns (ok, message) for direct UI display."""
     card_id = str(card_id).strip()
     if not card_id:
         return False, _tr("没有选中任何重置卡", 'No reset credit selected')
+    target_home = _resolve_codex_home(home, provider_id)
+    if target_home is None:
+        return False, _tr("未找到可用的 Codex 登录凭证", 'No usable Codex login credentials found')
     body = {
         "credit_id": card_id,
         # The backend dedupes on this id, so a lost response cannot burn a
@@ -6529,7 +6593,7 @@ def consume_codex_reset_card(
     }
     status, payload = codex_authorized_json(
         CODEX_RESET_CONSUME_URL,
-        home=home,
+        home=target_home,
         method="POST",
         body=body,
     )
@@ -7857,6 +7921,11 @@ def read_opencode_auth() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def filter_providers(providers: Iterable[str]) -> list[str]:
+    """Filter display items or provider IDs permitted in the current runtime."""
+    return list(providers)
+
+
 def provider_available(provider_id: str) -> bool:
     """True when local credentials (or the Antigravity-managed CLI) are present.
 
@@ -7864,6 +7933,8 @@ def provider_available(provider_id: str) -> bool:
     secure login internally, so its installed CLI is checked by /usage instead.
     """
     provider_id = provider_fetch_id(provider_id)
+    if not filter_providers([provider_id]):
+        return False
     remote = claude_magpie_source(provider_id)
     if remote is not None:
         return bool(remote.valid)
@@ -8137,7 +8208,7 @@ def refresh_usage(providers: list[str]) -> list[ProviderUsage]:
 
 def merge_display_usage(
     observations: Any, previous: list[ProviderUsage], selected: list[str],
-    error: str = '更新失败',
+    error: str = '更新失败', *, memory_only: bool = False,
 ) -> list[ProviderUsage]:
     """Complete partial/failed refreshes using UI memory and disk history."""
     incoming = {p.provider_id: p for p in observations if isinstance(p, ProviderUsage)} \
@@ -8146,7 +8217,18 @@ def merge_display_usage(
     for pid in dict.fromkeys(provider_fetch_id(name) for name in selected):
         item = incoming.get(pid)
         if item is None or not (item.windows or item.summary):
-            item = display_fallback(pid, (item.error if item else None) or error, previous)
+            candidates = previous
+            if memory_only and item is not None and item.credential_key is not None:
+                candidates = [
+                    p for p in previous
+                    if isinstance(p, ProviderUsage) and p.credential_key in (None, item.credential_key)
+                ]
+            item = display_fallback(
+                pid,
+                (item.error if item else None) or error,
+                candidates,
+                memory_only=memory_only,
+            )
         result.append(item)
     return result
 
@@ -8155,6 +8237,9 @@ def fetch_display_usage(
     selected: list[str], previous: list[ProviderUsage], *, force: bool = False,
 ) -> list[ProviderUsage]:
     """UI collection boundary, including exceptions from subprocess adapters."""
+    selected = filter_providers(selected)
+    if not selected:
+        return []
     try:
         observations = refresh_usage(selected) if force else get_usage(selected)
     except Exception as error:
@@ -8306,7 +8391,7 @@ def display_item(row: DisplayRow) -> str | None:
     """
     if row.provider_id == "antigravity":
         return ANTIGRAVITY_WINDOW_ITEMS.get(row.window_id)
-    if row.provider_id in CODEX_ACCOUNT_BY_ID:
+    if is_codex_account(row.provider_id):
         suffix = CODEX_WINDOW_SUFFIXES.get(row.window_id)
         return f"{row.provider_id}:{suffix}" if suffix else None
     if not is_claude_provider(row.provider_id):
@@ -10913,7 +10998,7 @@ def run_ui() -> None:
                 open_reset_ui(provider_id)
 
     def shown_items() -> list[str]:
-        return list(cfg.get("providers") or DEFAULT_PROVIDERS)
+        return filter_providers(list(cfg.get("providers") or DEFAULT_PROVIDERS))
 
     def _right_text(dr: DisplayRow) -> tuple[str, str, str | None]:
         """Return (pct_text, time_text, fail_or_summary) for right side."""
@@ -11566,6 +11651,7 @@ def run_ui() -> None:
         try:
             render_lines()
             render_footer()
+            state["last_render_at"] = time.time()
             if relayout:
                 apply_geometry()
             # Second measure after fonts/layout settle (fixes last-row clip)
@@ -11752,18 +11838,24 @@ def run_ui() -> None:
                 # Credential discovery can temporarily return no accounts while
                 # login files are being replaced. Keep enabled UI history.
                 selected += [p.provider_id for p in previous if p.provider_id in configured]
+                selected = filter_providers(selected)
                 providers = fetch_display_usage(selected, previous, force=force)
             except Exception as error:
                 # Discovery itself can fail before collection starts.
-                selected = [p.provider_id for p in previous] or list(cfg.get("providers") or DEFAULT_PROVIDERS)
-                providers = merge_display_usage(None, previous, selected, f'更新失败 ({type(error).__name__})')
+                selected = filter_providers([p.provider_id for p in previous] or list(cfg.get("providers") or DEFAULT_PROVIDERS))
+                providers = merge_display_usage(None, previous, selected, f'更新失败 ({type(error).__name__})') if selected else []
             root.after(0, lambda p=providers: apply_data(p))
 
         threading.Thread(target=work, daemon=True).start()
 
     def apply_data(providers: list[ProviderUsage]) -> None:
         state["refreshing"] = False
-        providers = merge_display_usage(providers, state["providers"], [p.provider_id for p in providers])
+        providers = merge_display_usage(
+            providers,
+            state["providers"],
+            [p.provider_id for p in providers],
+            memory_only=True,
+        )
         state["providers"] = providers
         # Mark successful overall refresh time if at least one provider is OK
         fresh_times = [_iso_epoch(p.fetched_at, 0) for p in providers if p.available and not p.stale]
@@ -11786,7 +11878,18 @@ def run_ui() -> None:
     # Relative time ticker
     def tick_footer() -> None:
         if not state["refreshing"]:
-            render_footer()
+            now_ts = time.time()
+            last_render = float(state.get("last_render_at") or 0.0)
+            crossed = any(
+                last_render < _iso_epoch(w.resets_at, 0) <= now_ts
+                for p in state.get("providers") or []
+                for w in p.windows
+                if w.resets_at
+            )
+            if crossed:
+                render(relayout=not state.get("panel_active"))
+            else:
+                render_footer()
         root.after(15_000, tick_footer)
 
     # Match Windows shell context menu: Segoe UI ~9pt (system menu font)
@@ -15596,12 +15699,14 @@ def run_ui() -> None:
         load_reset()
 
     def open_codex_reset_cards(provider_id: str = "codex") -> None:
-        account = CODEX_ACCOUNT_BY_ID.get(provider_id) or CODEX_ACCOUNTS[0]
+        account = discover_codex_accounts().get(provider_id)
+        account_id = account.provider_id if account is not None else provider_id
+        display_name = account.display_name if account is not None else PROVIDER_LABELS.get(provider_id, provider_id)
         existing = state.get("reset_cards_win")
         if existing is not None:
             try:
                 if existing.winfo_exists():
-                    if state.get("reset_cards_account") == account.provider_id:
+                    if state.get("reset_cards_account") == account_id:
                         place_settings_on_primary(existing)
                         existing.deiconify()
                         existing.lift()
@@ -15617,9 +15722,9 @@ def run_ui() -> None:
         # Same reason as the settings dialog: map once, at the final position.
         win.withdraw()
         state["reset_cards_win"] = win
-        state["reset_cards_account"] = account.provider_id
+        state["reset_cards_account"] = account_id
         state["reset_cards_busy"] = False
-        win.title(_tr(f"{account.display_name} 重置卡", f'{account.display_name} Reset Credits'))
+        win.title(_tr(f"{display_name} 重置卡", f'{display_name} Reset Credits'))
         win.configure(bg=BG)
         win.resizable(False, False)
 
@@ -15632,7 +15737,7 @@ def run_ui() -> None:
 
         tk.Label(
             shell,
-            text=_tr(f"选择一张重置卡，立即重置 {account.display_name} 的用量窗口。", f'Select a reset credit to restart {account.display_name} usage windows immediately.'),
+            text=_tr(f"选择一张重置卡，立即重置 {display_name} 的用量窗口。", f'Select a reset credit to restart {display_name} usage windows immediately.'),
             fg=FG,
             bg=BG,
             font=dialog_font,
@@ -15780,7 +15885,7 @@ def run_ui() -> None:
 
             def work() -> None:
                 try:
-                    cards, error = fetch_codex_reset_cards(account.home)
+                    cards, error = fetch_codex_reset_cards(provider_id=account_id)
                 except Exception:
                     _log_exception("codex reset cards")
                     cards, error = [], _tr("读取重置卡失败", 'Could not load reset credits')
@@ -15818,8 +15923,8 @@ def run_ui() -> None:
 
             if not messagebox.askokcancel(
                 _tr("使用重置卡", 'Redeem Reset'),
-                _tr(f"使用后这张重置卡立即作废，{account.display_name} 的用量窗口会重新开始计算。\n"
-                "确定要使用吗？", f'This credit will be consumed immediately and {account.display_name} usage windows will restart.\nRedeem this reset?'),
+                _tr(f"使用后这张重置卡立即作废，{display_name} 的用量窗口会重新开始计算。\n"
+                "确定要使用吗？", f'This credit will be consumed immediately and {display_name} usage windows will restart.\nRedeem this reset?'),
                 parent=win,
             ):
                 return
@@ -15829,7 +15934,7 @@ def run_ui() -> None:
 
             def work() -> None:
                 try:
-                    ok, message = consume_codex_reset_card(card_id, home=account.home)
+                    ok, message = consume_codex_reset_card(card_id, provider_id=account_id)
                 except Exception:
                     _log_exception("codex reset consume")
                     ok, message = False, _tr("使用失败", 'Redemption failed')
@@ -16337,7 +16442,8 @@ def run_ui() -> None:
     else:
         # Reopening the panel is not a request to re-query every subscription.
         refresh_async(force=False)
-        root.after(interval_ms, tick_refresh)
+        if PERIODIC_REFRESH:
+            root.after(interval_ms, tick_refresh)
         root.after(15_000, tick_footer)
     root.mainloop()
 
