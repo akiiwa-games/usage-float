@@ -5,7 +5,7 @@ description: Inspect live multi-account AI subscription quotas, 5-hour/7-day rat
 
 # Check Quota
 
-Read the live remaining quota of every subscription you have signed in to (Claude Code, Codex / ChatGPT, Grok, Antigravity, LiteLLM proxy) before starting a sub-agent, worker or long-running job, so work lands on an account that still has headroom and does not stall on a rate-limit wall.
+Read the live remaining quota of every subscription you have signed in to (Claude Code, Codex / ChatGPT, Grok, Antigravity) and the spent dollars of a metered USD API account before starting a sub-agent, worker or long-running job, so work lands on an account that still has headroom and does not stall on a rate-limit wall.
 
 ## What it does
 
@@ -28,7 +28,7 @@ Read the live remaining quota of every subscription you have signed in to (Claud
    | `.plan_label` | Subscription tier when known (for example `max`, `pro`) |
    | `.fetched_at` | When this reading was taken |
    | `.stale`, `.error` | `stale: true` or a non-null `error` means the last refresh failed and the numbers are an older reading |
-   | `.summary` | Free-text figure for budget-style rows (for example `$0/200`) |
+   | `.summary` | Spent dollars for a metered USD account (`已用 $2.65 / $200`, or `已用 $12.30` when there is no budget). That row's window id is `balance` and `resets_at` is null |
 
    Remaining quota is `100 - used_pct`. Check `fetched_at` and `stale` before trusting a number.
 
@@ -45,6 +45,6 @@ Read the live remaining quota of every subscription you have signed in to (Claud
 ## Permissions & network disclosure
 
 - Read-only: usage-float reads the local login state of the providers you already use (`~/.claude*`, `~/.codex*`, `~/.grok`, the `agy` CLI). It never rotates, writes or exports tokens or API keys.
-- Network: it sends read-only quota queries only to each provider's own official usage endpoint (and your own LiteLLM/Magpie endpoint if configured). Nothing is sent to any third-party server.
+- Network: it sends read-only quota queries only to each provider's own official usage endpoint (and your own Magpie or metered USD endpoint if configured). Nothing is sent to any third-party server.
 - Local writes: its own files under `~/.usage-float/` (`config.json`, `usage-cache.json`). The JSON cache contains one-way credential fingerprints, not credentials.
 - Reading the cache file needs no network and no credentials.

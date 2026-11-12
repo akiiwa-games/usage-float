@@ -1,6 +1,6 @@
 # usage-float
 
-A headless multi-subscription quota collector for coding-agent routing workflows: a CLI (`python usage_float.py once`), a local JSON telemetry cache (`~/.usage-float/usage-cache.json`) and a [`check-quota` Agent Skill](skills/check-quota/SKILL.md) that let Claude Code, Codex, Antigravity, Paseo and routers read live 5-hour and 7-day rate-limit windows and reset timers across **Claude Code** (Claude Max / Pro), **OpenAI Codex CLI** / **ChatGPT Pro**, **Grok**, **Google Antigravity** (`agy` / Gemini CLI), **Magpie**, and **LiteLLM / OpenAI-compatible API proxies**. It also ships a borderless Windows desktop quota HUD (no title bar, no taskbar entry), an auxiliary-screen dashboard, and an optional live-wallpaper player toggled with a double-tap of `Ctrl`.
+A headless multi-subscription quota collector for coding-agent routing workflows: a CLI (`python usage_float.py once`), a local JSON telemetry cache (`~/.usage-float/usage-cache.json`) and a [`check-quota` Agent Skill](skills/check-quota/SKILL.md) that let Claude Code, Codex, Antigravity, Paseo and routers read live 5-hour and 7-day rate-limit windows and reset timers across **Claude Code** (Claude Max / Pro), **OpenAI Codex CLI** / **ChatGPT Pro**, **Grok**, **Google Antigravity** (`agy` / Gemini CLI), and **Magpie**, plus spent dollars for a **metered USD** API account. It also ships a borderless Windows desktop quota HUD (no title bar, no taskbar entry), an auxiliary-screen dashboard, and an optional live-wallpaper player toggled with a double-tap of `Ctrl`.
 
 - **Multi-Account Local Quota Discovery**: Reads multiple local credentials (`~/.claude`, `~/.claude-2`, `~/.claude-*`, `~/.codex`, `~/.codex-2`, `~/.codex-*`, `~/.grok`, `agy`, Paseo provider directories, and remote Magpie `/v1/magpie/quotas`) directly on your machine without rotating OAuth tokens.
 - **One-Click Rate-Limit Reset Redemption**: Inspects and redeems **Claude weekly rate-limit resets (`cedar_ember`)**, **Claude 5-hour session wall resets (`juniper_tide`)**, and **ChatGPT / Codex rate-limit reset credits (`/backend-api/wham/rate-limit-reset-credits`)** directly from the HUD.
@@ -44,7 +44,7 @@ A headless multi-subscription quota collector for coding-agent routing workflows
 | `windows[].resets_at` | ISO-8601 time the window resets |
 | `plan_label` | Subscription tier when known (for example `max`, `pro`) |
 | `fetched_at`, `stale`, `error` | Freshness of the reading; `stale: true` or a non-null `error` means the last refresh failed and the numbers are older |
-| `summary` | Free-text figure for budget-style rows such as the LiteLLM proxy |
+| `summary` | Spent-dollar figure for a metered USD account, for example `已用 $2.65 / $200` or `已用 $12.30` |
 
 The cache also holds bookkeeping keys (`display_snapshots`, `attempts`, `poll`, per-provider `*_backoff_until`) that consumers can ignore.
 
@@ -101,7 +101,7 @@ All credentials stay on your local machine and are read directly without third-p
 | **Additional Codex Accounts** | `~/.codex-2/auth.json` (`CODEX_HOME_2`), `~/.codex-*`, or Paseo provider `CODEX_HOME` bindings |
 | **Grok** | `~/.grok` login state |
 | **Antigravity** | Official `agy` CLI (`1.1.11+`) login state via `PATH`, `%LOCALAPPDATA%\agy\bin\agy.exe`, or `ANTIGRAVITY_CLI_PATH` |
-| **LiteLLM / API Proxy** | Environment variables `LLM_PROXY_API_KEY` + `LLM_PROXY_ENDPOINT`, or `llm_proxy_api_key` / `llm_proxy_endpoint` in `~/.usage-float/config.json` |
+| **Metered USD** | AgentCompass `accounts-override.json` entry with `billing: metered`, `endpoint`, `api_key`, and optional `budget_usd` |
 
 ### Signing in to a Second Codex Account
 
@@ -156,7 +156,7 @@ Use the **Language** selector at the top of Settings to switch between Simplifie
   - Each Claude account splits into independent `fable 7d`, `claude 7d`, and `claude 5h` rows (e.g., `Claude 2 fable 7d`, `Claude 2 7d`, `Claude 2 5h`).
   - Antigravity splits into four independent rows sharing a single CLI probe: `agy gemini 7d`, `agy gemini 5h`, `agy claude 7d`, and `agy claude 5h` (abbreviated to `gem` in compact floating mode).
 - **Clean Failure Handling**: Providers without local credentials take no space. When a refresh fails, an error label is shown only if no prior valid snapshot exists for that credential.
-- **API Proxy Reset Timezone**: Configurable timezone for weekly LiteLLM proxy budget resets (defaults to `UTC+8`).
+- **Metered USD**: A dollar account shows what has already been spent. With a budget the row reads `已用 $2.65 / $200` (English: `used $2.65 / $200`). Without a budget it reads `已用 $12.30`. There is no reset countdown.
 
 ### Auxiliary Display Tab
 
@@ -230,9 +230,9 @@ agy -p /usage --output-format json
 
 Runs inside an empty temporary directory using the CLI's own login state without reading or copying tokens, enforces a 60-second timeout and 1 MiB output cap, and cleans up child processes on exit. Requires `agy` `1.1.11+` so older CLI versions never mistake `/usage` for a model prompt.
 
-### LiteLLM Proxy Usage
+### Metered USD usage
 
-Since LiteLLM virtual keys rarely have permission to call `/key/info`, `usage-float` sends a lightweight embeddings probe (falling back to a minimal chat completion) and reads `x-litellm-key-spend` and `x-litellm-key-max-budget` from the response headers.
+Spend is read from the account in AgentCompass `accounts-override.json`. The first request is `GET {origin}/key/info`. Many virtual keys cannot call that route. When it does not return a spend number, one chat completion against the account's first declared model reads `x-litellm-key-spend` and `x-litellm-key-max-budget`. Those headers are attached to a completion, not to `/key/info`. One extra completion runs only when the returned spend still looks like this request. No model is guessed, and nothing about the balance resets.
 
 ## Configuration & Caching Architecture
 
@@ -256,11 +256,7 @@ Set `"language": "en"` for English or `"language": "zh"` for Simplified Chinese.
   "shortcut_combo": ["ctrl", "alt"],
   "wallpaper_folders": ["D:\\Wallpapers"],
   "wallpaper_image_seconds": 10,
-  "wallpaper_audio": true,
-  "llm_proxy_api_key": "",
-  "llm_proxy_endpoint": "",
-  "llm_proxy_budget_duration": "7d",
-  "llm_proxy_timezone": "UTC+8"
+  "wallpaper_audio": true
 }
 ```
 

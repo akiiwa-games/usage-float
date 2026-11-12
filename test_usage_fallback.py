@@ -22,7 +22,7 @@ class UsageFallbackTests(unittest.TestCase):
             patch.object(usage, 'provider_credential_key', return_value='account-a'),
             patch.object(usage, 'discover_claude_homes', return_value={'claude': Path(folder.name)}),
             patch.object(usage, 'discover_codex_accounts', return_value={}),
-            patch.object(usage, 'discover_litellm_proxies', return_value={}),
+            patch.object(usage, 'discover_metered_usd_accounts', return_value={}),
             patch.object(usage, 'provider_poll_seconds', return_value=300),
             patch.object(usage, 'http_json', side_effect=AssertionError('Unexpected network')),
         ):
@@ -282,7 +282,7 @@ class UsageFallbackTests(unittest.TestCase):
             'fetch_codex_usage',
             'fetch_pi_usage',
             'fetch_grok_usage',
-            'fetch_api_proxy_usage',
+            'fetch_metered_usd_usage',
             'fetch_antigravity_usage',
             'save_usage_cache',
             'update_usage_cache',
@@ -373,19 +373,28 @@ class UsageFallbackTests(unittest.TestCase):
                 self.assertIn('登录凭证', missing_err or '')
                 self.assertEqual(len(seen_homes), 1)
 
-    def test_collector_config_hooks_overlay_on_load_and_persist_on_save(self):
+    def test_old_proxy_settings_are_named_and_not_rewritten(self):
         with TemporaryDirectory() as temp_dir:
             cfg_path = Path(temp_dir) / 'config.json'
-            cfg_path.write_text(json.dumps({'llm_proxy_timezone': 'UTC+8'}), encoding='utf-8')
+            raw = json.dumps({'language': 'zh', 'llm_proxy_timezone': 'UTC+8'})
+            cfg_path.write_text(raw, encoding='utf-8')
             saved_collector = {}
             with patch.object(usage, 'CONFIG_PATH', cfg_path), \
-                    patch.object(usage, 'read_collector_config', return_value={'llm_proxy_timezone': 'UTC'}), \
-                    patch.object(usage, 'write_collector_config', side_effect=lambda c: saved_collector.update(llm_proxy_timezone=c.get('llm_proxy_timezone'))):
+                    patch.object(usage, 'read_collector_config', return_value={'language': 'en'}), \
+                    patch.object(usage, 'write_collector_config', side_effect=lambda c: saved_collector.update(c)):
+                with self.assertRaises(ValueError) as raised:
+                    usage.load_config()
+                self.assertIn('llm_proxy_timezone', str(raised.exception))
+                self.assertEqual(cfg_path.read_text(encoding='utf-8'), raw)
+                self.assertEqual(saved_collector, {})
+                cfg_path.write_text(json.dumps({'language': 'zh'}), encoding='utf-8')
                 loaded = usage.load_config()
-                self.assertEqual(loaded['llm_proxy_timezone'], 'UTC')
-                loaded['llm_proxy_timezone'] = 'UTC-5'
+                self.assertEqual(loaded['language'], 'en')
+                self.assertNotIn('llm_proxy_timezone', loaded)
+                loaded['language'] = 'zh'
                 usage.save_config(loaded)
-            self.assertEqual(saved_collector, {'llm_proxy_timezone': 'UTC-5'})
+            self.assertEqual(saved_collector.get('language'), 'zh')
+            self.assertNotIn('llm_proxy_timezone', saved_collector)
 
 
 if __name__ == '__main__':

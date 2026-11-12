@@ -14,7 +14,6 @@ import usage_float as usage_float_module
 from usage_float import (
     BG_OPACITY_DEFAULT,
     DEFAULT_PROVIDERS,
-    LLM_PROXY_TIMEZONE_DEFAULT,
     MonitorInfo,
     TEXT_OPACITY_DEFAULT,
     WALLPAPER_RANDOM_MODE_DIRECTORY,
@@ -1363,24 +1362,19 @@ class AntigravityUsageTests(unittest.TestCase):
                                 kernel.CloseHandle(handle)
 
 
-class LlmProxyUsageTests(unittest.TestCase):
+class MeteredUsdUsageTests(unittest.TestCase):
     def test_openai_base_keeps_or_adds_v1(self) -> None:
         self.assertEqual(
-            usage_float_module._llm_proxy_openai_base(
-                "https://llm-proxy.example.com/v1"
-            ),
-            "https://llm-proxy.example.com/v1",
+            usage_float_module._metered_usd_urls("https://proxy.example.test/v1"),
+            ("https://proxy.example.test", "https://proxy.example.test/v1"),
         )
         self.assertEqual(
-            usage_float_module._llm_proxy_openai_base(
-                "https://llm-proxy.example.com"
-            ),
-            "https://llm-proxy.example.com/v1",
+            usage_float_module._metered_usd_urls("https://proxy.example.test"),
+            ("https://proxy.example.test", "https://proxy.example.test/v1"),
         )
-        self.assertEqual(usage_float_module._llm_proxy_openai_base(""), "")
 
     def test_spend_headers_are_read_case_insensitively(self) -> None:
-        spend, budget, cost = usage_float_module.parse_llm_proxy_spend_headers(
+        spend, budget, cost = usage_float_module._parse_spend_headers(
             {
                 "X-Litellm-Key-Spend": "10.5",
                 "X-Litellm-Key-Max-Budget": "200",
@@ -1391,13 +1385,19 @@ class LlmProxyUsageTests(unittest.TestCase):
         self.assertAlmostEqual(budget or 0, 200)
         self.assertAlmostEqual(cost or 0, 0.01)
 
-    def test_spend_is_shown_as_integer_dollars(self) -> None:
-        self.assertEqual(usage_float_module.format_llm_proxy_spend(2.65, 200), "$197/200")
-        self.assertEqual(usage_float_module.format_llm_proxy_spend(2.5, 200), "$198/200")
-        self.assertEqual(usage_float_module.format_llm_proxy_spend(2.4, 200), "$198/200")
-        self.assertEqual(usage_float_module.format_llm_proxy_spend(2.0, 200), "$198/200")
-        self.assertEqual(usage_float_module.format_llm_proxy_spend(12.3), "$12")
-        self.assertEqual(usage_float_module.format_llm_proxy_spend(230, 200), "$0/200")  # over budget: nothing left
+    def test_spent_first_text_keeps_cents(self) -> None:
+        previous = usage_float_module._ACTIVE_LANGUAGE
+        usage_float_module._ACTIVE_LANGUAGE = "zh"
+        try:
+            self.assertEqual(usage_float_module.format_metered_usd(2.65, 200), "已用 $2.65 / $200")
+            self.assertEqual(usage_float_module.format_metered_usd(12.3, None), "已用 $12.30")
+            self.assertEqual(usage_float_module.format_usd_amount(200), "$200")
+            self.assertEqual(usage_float_module.format_usd_amount(2.5), "$2.50")
+            self.assertNotIn("reset", usage_float_module.format_metered_usd(2.65, 200).lower())
+            usage_float_module._ACTIVE_LANGUAGE = "en"
+            self.assertEqual(usage_float_module.format_metered_usd(2.65, 200), "used $2.65 / $200")
+        finally:
+            usage_float_module._ACTIVE_LANGUAGE = previous
 
     def test_stale_spend_is_the_current_request_cost(self) -> None:
         self.assertTrue(
@@ -1407,145 +1407,129 @@ class LlmProxyUsageTests(unittest.TestCase):
             usage_float_module._spend_looks_like_this_request(0.1047, 2e-07)
         )
 
-    def test_config_proxy_key_makes_the_row_available(self) -> None:
+    def test_old_settings_are_named_and_not_rewritten(self) -> None:
         with TemporaryDirectory() as temp_dir:
             cfg = Path(temp_dir) / "config.json"
-            cfg.write_text(
-                json.dumps(
-                    {
-                        "llm_proxy_api_key": "sk-test-key",
-                        "llm_proxy_endpoint": "https://llm-proxy.example.com/v1",
-                    }
-                ),
-                encoding="utf-8",
-            )
-            with patch.dict(
-                "os.environ",
-                {"LLM_PROXY_API_KEY": "", "LLM_PROXY_ENDPOINT": ""},
-                clear=False,
-            ), patch.object(usage_float_module, "CONFIG_PATH", cfg):
-                self.assertTrue(usage_float_module.provider_available("api-proxy"))
-                key, base = usage_float_module.read_llm_proxy_credentials()
-        self.assertEqual(key, "sk-test-key")
-        self.assertEqual(base, "https://llm-proxy.example.com/v1")
+            raw = json.dumps({"language": "zh", "llm_proxy_api_key": "sk-test-key", "llm_proxy_timezone": "UTC+8"})
+            cfg.write_text(raw, encoding="utf-8")
+            with patch.object(usage_float_module, "CONFIG_PATH", cfg):
+                with self.assertRaises(ValueError) as raised:
+                    usage_float_module.load_config()
+                self.assertIn("llm_proxy_api_key", str(raised.exception))
+                self.assertIn("llm_proxy_timezone", str(raised.exception))
+                self.assertEqual(cfg.read_text(encoding="utf-8"), raw)
+                with self.assertRaises(ValueError):
+                    usage_float_module.save_config({"language": "en"})
+                self.assertEqual(cfg.read_text(encoding="utf-8"), raw)
 
-    def test_missing_key_hides_the_row(self) -> None:
+    def test_account_override_is_the_only_source(self) -> None:
         with TemporaryDirectory() as temp_dir:
-            with patch.object(
-                usage_float_module, "CONFIG_PATH", Path(temp_dir) / "cfg.json"
-            ), patch.dict(
-                "os.environ",
-                {"LLM_PROXY_API_KEY": "", "LLM_PROXY_ENDPOINT": ""},
+            override = Path(temp_dir) / "accounts-override.json"
+            override.write_text(json.dumps({"accounts": {"usd": {
+                "billing": "metered",
+                "endpoint": "https://proxy.example.test/v1",
+                "api_key": "sk-team-proxy",
+                "budget_usd": 200,
+                "models": ["declared-model"],
+            }}}), encoding="utf-8")
+            with patch.dict(
+                usage_float_module.os.environ,
+                {"AGENTCOMPASS_ACCOUNTS_OVERRIDE": str(override)},
                 clear=False,
             ):
+                self.assertTrue(usage_float_module.provider_available("usd"))
                 self.assertFalse(usage_float_module.provider_available("api-proxy"))
+                found = usage_float_module.discover_metered_usd_accounts()["usd"]
+                self.assertEqual(found.openai_base, "https://proxy.example.test/v1")
+                self.assertEqual(found.origin, "https://proxy.example.test")
+                self.assertEqual(found.models, ("declared-model",))
+                self.assertNotIn("sk-team-proxy", found.openai_base)
 
-    def test_fetch_retries_when_spend_equals_this_request(self) -> None:
-        calls: list[int] = []
+    def test_key_info_is_enough_and_a_balance_has_no_countdown(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            override = Path(temp_dir) / "accounts-override.json"
+            override.write_text(json.dumps({"accounts": {"usd": {
+                "billing": "metered", "label": "USD",
+                "endpoint": "https://proxy.example.test/v1",
+                "api_key": "sk-team-proxy",
+                "budget_usd": 200,
+                "models": ["declared-model"],
+            }}}), encoding="utf-8")
+            calls = []
 
-        def fake_probe(_base, _key, *, model, kind):
-            calls.append(len(calls) + 1)
-            if len(calls) == 1:
-                return 200, {
-                    "x-litellm-key-spend": "0.0000002",
-                    "x-litellm-key-max-budget": "200.0",
+            def fake(url, method="GET", headers=None, body=None, timeout=20):
+                calls.append((method, url, (body or {}).get("model")))
+                self.assertNotIn("sk-team-proxy", url)
+                return 200, {"info": {"spend": 2.65, "max_budget": 50}}, {}
+
+            with patch.dict(
+                usage_float_module.os.environ,
+                {"AGENTCOMPASS_ACCOUNTS_OVERRIDE": str(override)},
+                clear=False,
+            ), patch.object(usage_float_module, "http_json_response", side_effect=fake):
+                row = usage_float_module.fetch_metered_usd_usage("usd")
+        self.assertEqual(calls, [("GET", "https://proxy.example.test/key/info", None)])
+        self.assertEqual(row.summary, "已用 $2.65 / $200")
+        self.assertIsNone(row.windows[0].resets_at)
+        self.assertAlmostEqual(row.windows[0].used_pct, 1.325)
+        shown = iter_display_rows([row])
+        self.assertEqual(shown[0].summary, "已用 $2.65 / $200")
+        self.assertEqual(format_remaining(shown[0].resets_at), "")
+
+    def test_one_declared_model_completion_then_one_flush_retry(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            override = Path(temp_dir) / "accounts-override.json"
+            override.write_text(json.dumps({"accounts": {"usd": {
+                "billing": "metered",
+                "endpoint": "https://proxy.example.test/v1",
+                "api_key": "sk-team-proxy",
+                "budget_usd": 200,
+                "models": ["declared-model"],
+            }}}), encoding="utf-8")
+            calls = []
+
+            def fake(url, method="GET", headers=None, body=None, timeout=20):
+                calls.append((method, url, (body or {}).get("model")))
+                if url.endswith("/key/info"):
+                    return 403, {}, {}
+                spend = "0.0000002" if len(calls) == 2 else "12.3"
+                return 200, {}, {
+                    "x-litellm-key-spend": spend,
+                    "x-litellm-key-max-budget": "80",
                     "x-litellm-response-cost": "0.0000002",
                 }
-            return 200, {
-                "x-litellm-key-spend": "20.0",
-                "x-litellm-key-max-budget": "200.0",
-                "x-litellm-response-cost": "0.0000002",
-            }
 
-        with patch.object(
-            usage_float_module,
-            "read_llm_proxy_credentials",
-            return_value=("sk-test", "https://llm-proxy.example.com/v1"),
-        ), patch.object(
-            usage_float_module, "_llm_proxy_probe", fake_probe
-        ), patch.object(
-            usage_float_module, "_llm_proxy_budget_settings", return_value=("7d", "UTC")
-        ), patch.object(usage_float_module, "cache_put_provider", lambda _p: None):
-            usage = usage_float_module.fetch_api_proxy_usage()
+            with patch.dict(
+                usage_float_module.os.environ,
+                {"AGENTCOMPASS_ACCOUNTS_OVERRIDE": str(override)},
+                clear=False,
+            ), patch.object(usage_float_module, "http_json_response", side_effect=fake):
+                row = usage_float_module.fetch_metered_usd_usage("usd")
+        self.assertEqual([call[2] for call in calls if call[0] == "POST"], ["declared-model", "declared-model"])
+        self.assertEqual(len(calls), 3)
+        self.assertNotIn("gemini-embedding", json.dumps(calls))
+        self.assertEqual(row.summary, "已用 $12.30 / $200")
+        self.assertIsNone(row.windows[0].resets_at)
 
-        self.assertEqual(len(calls), 2)
-        self.assertTrue(usage.available)
-        self.assertAlmostEqual(usage.windows[0].used_pct, 10.0)
-        self.assertEqual(usage.summary, "$180/200")
-        self.assertIsNotNone(usage.windows[0].resets_at)
-        rows = iter_display_rows([usage])
-        self.assertEqual(rows[0].title, "api-proxy")
-        self.assertEqual(rows[0].summary, "$180/200")
-        self.assertIsNotNone(rows[0].resets_at)
-        self.assertTrue(format_remaining(rows[0].resets_at))
-
-    def test_default_budget_duration_is_weekly(self) -> None:
-        self.assertEqual(usage_float_module.LLM_PROXY_BUDGET_DURATION_DEFAULT, "7d")
-        with patch.object(
-            usage_float_module, "CONFIG_PATH", Path("/missing.json")
-        ), patch.dict(
-            "os.environ",
-            {"LLM_PROXY_BUDGET_DURATION": "", "LLM_PROXY_TIMEZONE": ""},
-            clear=False,
-        ):
-            duration, timezone_name = usage_float_module._llm_proxy_budget_settings()
-        self.assertEqual(duration, "7d")
-        self.assertEqual(timezone_name, "UTC+8")
-        self.assertEqual(LLM_PROXY_TIMEZONE_DEFAULT, "UTC+8")
-
-    def test_utc_plus_eight_weekly_reset_is_monday_local_midnight(self) -> None:
-        now = datetime(2026, 9, 17, 12, 0, tzinfo=timezone.utc)
-        reset = usage_float_module.next_llm_proxy_budget_reset(
-            "7d", now=now, timezone_name="UTC+8"
-        )
-        self.assertIsNotNone(reset)
-        assert reset is not None
-        self.assertEqual(reset.utcoffset(), timedelta(hours=8))
-        self.assertEqual(reset.weekday(), 0)
-        self.assertEqual(reset.hour, 0)
-        self.assertEqual(
-            reset.astimezone(timezone.utc),
-            datetime(2026, 9, 20, 16, 0, tzinfo=timezone.utc),
-        )
-
-    def test_monthly_budget_resets_on_the_first(self) -> None:
-        now = datetime(2026, 9, 17, 12, 0, tzinfo=timezone.utc)
-        reset = usage_float_module.next_llm_proxy_budget_reset(
-            "30d", now=now, timezone_name="UTC"
-        )
-        self.assertEqual(reset, datetime(2026, 10, 1, 0, 0, tzinfo=timezone.utc))
-        on_the_first = usage_float_module.next_llm_proxy_budget_reset(
-            "1mo",
-            now=datetime(2026, 10, 1, 0, 0, tzinfo=timezone.utc),
-            timezone_name="UTC",
-        )
-        self.assertEqual(on_the_first, datetime(2026, 11, 1, 0, 0, tzinfo=timezone.utc))
-
-    def test_daily_and_weekly_budget_resets_align_to_midnight(self) -> None:
-        wednesday = datetime(2026, 9, 16, 15, 30, tzinfo=timezone.utc)
-        self.assertEqual(
-            usage_float_module.next_llm_proxy_budget_reset(
-                "1d", now=wednesday, timezone_name="UTC"
-            ),
-            datetime(2026, 9, 17, 0, 0, tzinfo=timezone.utc),
-        )
-        self.assertEqual(
-            usage_float_module.next_llm_proxy_budget_reset(
-                "7d", now=wednesday, timezone_name="UTC"
-            ),
-            datetime(2026, 9, 21, 0, 0, tzinfo=timezone.utc),
-        )
-
-    def test_header_reset_timestamp_wins_over_duration(self) -> None:
-        iso = usage_float_module.resolve_llm_proxy_resets_at(
-            {"x-litellm-key-budget-reset-at": "2026-10-01T00:00:00Z"},
-            now=datetime(2026, 9, 17, tzinfo=timezone.utc),
-            duration="1d",
-            timezone_name="UTC",
-        )
-        self.assertIsNotNone(iso)
-        parsed = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
-        self.assertEqual(parsed.date(), datetime(2026, 10, 1).date())
+    def test_display_reformats_spent_dollars_and_does_not_refill(self) -> None:
+        previous = usage_float_module._ACTIVE_LANGUAGE
+        usage_float_module._ACTIVE_LANGUAGE = "zh"
+        try:
+            item = ProviderUsage(
+                provider_id="usd", display_name="USD", backend_kind="metered_usd",
+                summary="used $12.34 / $200",
+                windows=[UsageWindow("balance", "used", 6.17, "2026-01-01T00:00:00+00:00")],
+                usage_details={"kind": "metered_usd", "spent_usd": 12.34, "budget_usd": 200},
+                fetched_at="2026-01-01T00:00:00+00:00",
+            )
+            rows = iter_display_rows([item])
+            self.assertEqual(rows[0].summary, "已用 $12.34 / $200")
+            self.assertIsNone(rows[0].resets_at)
+            self.assertAlmostEqual(rows[0].used_pct, 6.17)
+            self.assertEqual(format_remaining(rows[0].resets_at), "")
+            self.assertEqual(item.windows[0].resets_at, "2026-01-01T00:00:00+00:00")
+        finally:
+            usage_float_module._ACTIVE_LANGUAGE = previous
 
 
     def test_shortcut_config_migrates_legacy_double_ctrl_flag(self) -> None:
@@ -1673,7 +1657,7 @@ class ProviderConfigTests(unittest.TestCase):
         self.assertFalse(rows[3]["available"])
         self.assertFalse(rows[5]["available"])
 
-    def test_discover_litellm_proxies_from_router_override_and_pi_usage(self) -> None:
+    def test_discover_metered_usd_from_accounts_override_and_pi_usage(self) -> None:
         with TemporaryDirectory() as temp_dir:
             override = Path(temp_dir) / "accounts-override.json"
             override.write_text(
@@ -1681,7 +1665,7 @@ class ProviderConfigTests(unittest.TestCase):
                     {
                         "accounts": {
                             "team-proxy": {
-                                "backend_kind": "litellm",
+                                "billing": "metered",
                                 "endpoint": "https://proxy.example.test",
                                 "api_key": "sk-team-proxy",
                                 "label": "Team Proxy",
@@ -1709,18 +1693,18 @@ class ProviderConfigTests(unittest.TestCase):
             with patch.dict(
                 usage_float_module.os.environ,
                 {
-                    "ROUTE_MANAGER_ACCOUNTS_OVERRIDE": str(override),
+                    "AGENTCOMPASS_ACCOUNTS_OVERRIDE": str(override),
                     "PI_CODING_AGENT_DIR": str(pi_home),
                 },
                 clear=False,
             ), patch.object(usage_float_module, "HOME", Path(temp_dir)), patch.object(
                 usage_float_module, "CONFIG_PATH", Path(temp_dir) / "config.json"
             ):
-                proxies = usage_float_module.discover_litellm_proxies()
+                proxies = usage_float_module.discover_metered_usd_accounts()
                 self.assertIn("team-proxy", proxies)
                 self.assertEqual(
-                    usage_float_module.read_llm_proxy_credentials("team-proxy"),
-                    ("sk-team-proxy", "https://proxy.example.test/v1"),
+                    proxies["team-proxy"].openai_base,
+                    "https://proxy.example.test/v1",
                 )
                 self.assertTrue(usage_float_module.provider_available("team-proxy"))
                 self.assertTrue(usage_float_module.provider_available("pi"))
@@ -2765,7 +2749,7 @@ class SharedGrokDisplayTests(unittest.TestCase):
                      patch.object(native, 'CACHE_PATH', Path(directory) / 'usage.json'), \
                      patch.object(native, 'discover_claude_homes', return_value={}), \
                      patch.object(native, 'discover_codex_accounts', return_value={}), \
-                     patch.object(native, 'discover_litellm_proxies', return_value={}), \
+                     patch.object(native, 'discover_metered_usd_accounts', return_value={}), \
                      patch.object(native, 'provider_poll_seconds', return_value=300), \
                      patch.object(native, 'provider_credential_key', return_value=None), \
                      patch.object(native, 'fetch_grok_usage', return_value=item) as fetch:
