@@ -232,7 +232,7 @@ Runs inside an empty temporary directory using the CLI's own login state without
 
 ### Metered USD usage
 
-Spend is read from the account in AgentCompass `accounts-override.json`. The first request is `GET {origin}/key/info`. Many virtual keys cannot call that route. When it does not return a spend number, one chat completion against the account's first declared model reads `x-litellm-key-spend` and `x-litellm-key-max-budget`. Those headers are attached to a completion, not to `/key/info`. One extra completion runs only when the returned spend still looks like this request. No model is guessed, and nothing about the balance resets.
+Spend is read from the account in AgentCompass `accounts-override.json`, and only from `GET {origin}/key/info`. When that route returns a spend number, the row shows it (with the budget when one exists). A 401 or 403 shows no usage number; the hover says there is no permission to query usage. A network error, a timeout, or any other response stays an ordinary read failure and the hover names that reason. Nothing about the balance resets. Old `llm_proxy_*` settings no longer apply. The window still starts, shows that old settings remain, and saving settings once (or `agentcompass setup`) removes those keys.
 
 ## Configuration & Caching Architecture
 

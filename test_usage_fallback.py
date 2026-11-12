@@ -373,7 +373,7 @@ class UsageFallbackTests(unittest.TestCase):
                 self.assertIn('登录凭证', missing_err or '')
                 self.assertEqual(len(seen_homes), 1)
 
-    def test_old_proxy_settings_are_named_and_not_rewritten(self):
+    def test_old_proxy_settings_do_not_block_load_and_save_clears_them(self):
         with TemporaryDirectory() as temp_dir:
             cfg_path = Path(temp_dir) / 'config.json'
             raw = json.dumps({'language': 'zh', 'llm_proxy_timezone': 'UTC+8'})
@@ -382,19 +382,23 @@ class UsageFallbackTests(unittest.TestCase):
             with patch.object(usage, 'CONFIG_PATH', cfg_path), \
                     patch.object(usage, 'read_collector_config', return_value={'language': 'en'}), \
                     patch.object(usage, 'write_collector_config', side_effect=lambda c: saved_collector.update(c)):
-                with self.assertRaises(ValueError) as raised:
-                    usage.load_config()
-                self.assertIn('llm_proxy_timezone', str(raised.exception))
+                loaded = usage.load_config()
                 self.assertEqual(cfg_path.read_text(encoding='utf-8'), raw)
                 self.assertEqual(saved_collector, {})
-                cfg_path.write_text(json.dumps({'language': 'zh'}), encoding='utf-8')
-                loaded = usage.load_config()
                 self.assertEqual(loaded['language'], 'en')
                 self.assertNotIn('llm_proxy_timezone', loaded)
-                loaded['language'] = 'zh'
+                self.assertIn('llm_proxy_timezone', usage._OBSOLETE_SETTINGS_KEYS)
+                self.assertEqual(
+                    usage._obsolete_settings_notice(),
+                    'Old settings remain. Save once in settings to clear them, or run agentcompass setup.',
+                )
                 usage.save_config(loaded)
-            self.assertEqual(saved_collector.get('language'), 'zh')
+            saved = json.loads(cfg_path.read_text(encoding='utf-8'))
+            self.assertEqual(saved['language'], 'en')
+            self.assertNotIn('llm_proxy_timezone', saved)
+            self.assertEqual(saved_collector.get('language'), 'en')
             self.assertNotIn('llm_proxy_timezone', saved_collector)
+            self.assertEqual(usage._OBSOLETE_SETTINGS_KEYS, [])
 
 
 if __name__ == '__main__':

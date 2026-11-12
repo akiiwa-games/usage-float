@@ -1373,17 +1373,22 @@ class MeteredUsdUsageTests(unittest.TestCase):
             ("https://proxy.example.test", "https://proxy.example.test/v1"),
         )
 
-    def test_spend_headers_are_read_case_insensitively(self) -> None:
-        spend, budget, cost = usage_float_module._parse_spend_headers(
-            {
-                "X-Litellm-Key-Spend": "10.5",
-                "X-Litellm-Key-Max-Budget": "200",
-                "X-Litellm-Response-Cost": "0.01",
-            }
+    def _override(self, directory: str, models: list[str]) -> None:
+        override = Path(directory) / "accounts-override.json"
+        override.write_text(json.dumps({"accounts": {"usd": {
+            "billing": "metered", "label": "USD",
+            "endpoint": "https://proxy.example.test/v1",
+            "api_key": "sk-team-proxy",
+            "budget_usd": 200,
+            "models": models,
+        }}}), encoding="utf-8")
+        self._override_patch = patch.dict(
+            usage_float_module.os.environ,
+            {"AGENTCOMPASS_ACCOUNTS_OVERRIDE": str(override)},
+            clear=False,
         )
-        self.assertAlmostEqual(spend or 0, 10.5)
-        self.assertAlmostEqual(budget or 0, 200)
-        self.assertAlmostEqual(cost or 0, 0.01)
+        self._override_patch.start()
+        self.addCleanup(self._override_patch.stop)
 
     def test_spent_first_text_keeps_cents(self) -> None:
         previous = usage_float_module._ACTIVE_LANGUAGE
@@ -1399,28 +1404,49 @@ class MeteredUsdUsageTests(unittest.TestCase):
         finally:
             usage_float_module._ACTIVE_LANGUAGE = previous
 
-    def test_stale_spend_is_the_current_request_cost(self) -> None:
-        self.assertTrue(
-            usage_float_module._spend_looks_like_this_request(2e-07, 2e-07)
-        )
-        self.assertFalse(
-            usage_float_module._spend_looks_like_this_request(0.1047, 2e-07)
-        )
-
-    def test_old_settings_are_named_and_not_rewritten(self) -> None:
+    def test_old_settings_do_not_block_startup_and_save_clears_them(self) -> None:
         with TemporaryDirectory() as temp_dir:
             cfg = Path(temp_dir) / "config.json"
-            raw = json.dumps({"language": "zh", "llm_proxy_api_key": "sk-test-key", "llm_proxy_timezone": "UTC+8"})
+            raw = json.dumps({
+                "language": "zh",
+                "llm_proxy_api_key": "sk-test-key",
+                "llm_proxy_timezone": "UTC+8",
+                "llm_proxy_provider_id": "usd",
+            })
             cfg.write_text(raw, encoding="utf-8")
-            with patch.object(usage_float_module, "CONFIG_PATH", cfg):
-                with self.assertRaises(ValueError) as raised:
-                    usage_float_module.load_config()
-                self.assertIn("llm_proxy_api_key", str(raised.exception))
-                self.assertIn("llm_proxy_timezone", str(raised.exception))
-                self.assertEqual(cfg.read_text(encoding="utf-8"), raw)
-                with self.assertRaises(ValueError):
-                    usage_float_module.save_config({"language": "en"})
-                self.assertEqual(cfg.read_text(encoding="utf-8"), raw)
+            previous = usage_float_module._ACTIVE_LANGUAGE
+            try:
+                with patch.object(usage_float_module, "CONFIG_PATH", cfg):
+                    loaded = usage_float_module.load_config()
+                    self.assertEqual(cfg.read_text(encoding="utf-8"), raw)
+                    self.assertEqual(loaded["language"], "zh")
+                    self.assertNotIn("llm_proxy_api_key", loaded)
+                    self.assertNotIn("llm_proxy_timezone", loaded)
+                    self.assertIn("llm_proxy_api_key", usage_float_module._OBSOLETE_SETTINGS_KEYS)
+                    self.assertIn("llm_proxy_timezone", usage_float_module._OBSOLETE_SETTINGS_KEYS)
+                    self.assertEqual(usage_float_module._OBSOLETE_SETTINGS_PROVIDER, "usd")
+                    usage_float_module._ACTIVE_LANGUAGE = "zh"
+                    self.assertEqual(
+                        usage_float_module._obsolete_settings_notice(),
+                        "旧设置残留。在设置里保存一次即可清掉，或运行 agentcompass setup。",
+                    )
+                    usage_float_module._ACTIVE_LANGUAGE = "en"
+                    self.assertEqual(
+                        usage_float_module._obsolete_settings_notice(),
+                        "Old settings remain. Save once in settings to clear them, or run agentcompass setup.",
+                    )
+                    loaded["language"] = "en"
+                    usage_float_module.save_config(loaded)
+                saved = json.loads(cfg.read_text(encoding="utf-8"))
+                self.assertEqual(saved["language"], "en")
+                self.assertNotIn("llm_proxy_api_key", saved)
+                self.assertNotIn("llm_proxy_timezone", saved)
+                self.assertNotIn("llm_proxy_provider_id", saved)
+                self.assertNotIn("sk-test-key", cfg.read_text(encoding="utf-8"))
+                self.assertEqual(usage_float_module._OBSOLETE_SETTINGS_KEYS, [])
+                self.assertIsNone(usage_float_module._OBSOLETE_SETTINGS_PROVIDER)
+            finally:
+                usage_float_module._ACTIVE_LANGUAGE = previous
 
     def test_account_override_is_the_only_source(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -1476,40 +1502,77 @@ class MeteredUsdUsageTests(unittest.TestCase):
         self.assertEqual(shown[0].summary, "已用 $2.65 / $200")
         self.assertEqual(format_remaining(shown[0].resets_at), "")
 
-    def test_one_declared_model_completion_then_one_flush_retry(self) -> None:
-        with TemporaryDirectory() as temp_dir:
-            override = Path(temp_dir) / "accounts-override.json"
-            override.write_text(json.dumps({"accounts": {"usd": {
-                "billing": "metered",
-                "endpoint": "https://proxy.example.test/v1",
-                "api_key": "sk-team-proxy",
-                "budget_usd": 200,
-                "models": ["declared-model"],
-            }}}), encoding="utf-8")
-            calls = []
+    def test_permission_denial_shows_no_number_and_the_hover_says_why(self) -> None:
+        previous = usage_float_module._ACTIVE_LANGUAGE
+        try:
+            with TemporaryDirectory() as temp_dir:
+                self._override(temp_dir, ["declared-model"])
+                calls = []
 
-            def fake(url, method="GET", headers=None, body=None, timeout=20):
-                calls.append((method, url, (body or {}).get("model")))
-                if url.endswith("/key/info"):
+                def fake(url, method="GET", headers=None, body=None, timeout=20):
+                    calls.append((method, url, body))
+                    self.assertNotIn("sk-team-proxy", url)
                     return 403, {}, {}
-                spend = "0.0000002" if len(calls) == 2 else "12.3"
-                return 200, {}, {
-                    "x-litellm-key-spend": spend,
-                    "x-litellm-key-max-budget": "80",
-                    "x-litellm-response-cost": "0.0000002",
-                }
 
-            with patch.dict(
-                usage_float_module.os.environ,
-                {"AGENTCOMPASS_ACCOUNTS_OVERRIDE": str(override)},
-                clear=False,
-            ), patch.object(usage_float_module, "http_json_response", side_effect=fake):
-                row = usage_float_module.fetch_metered_usd_usage("usd")
-        self.assertEqual([call[2] for call in calls if call[0] == "POST"], ["declared-model", "declared-model"])
-        self.assertEqual(len(calls), 3)
-        self.assertNotIn("gemini-embedding", json.dumps(calls))
-        self.assertEqual(row.summary, "已用 $12.30 / $200")
-        self.assertIsNone(row.windows[0].resets_at)
+                with patch.object(usage_float_module, "http_json_response", side_effect=fake):
+                    row = usage_float_module.fetch_metered_usd_usage("usd")
+            self.assertEqual([call[0] for call in calls], ["GET"])
+            self.assertIsNone(calls[0][2])
+            self.assertIsNone(row.summary)
+            self.assertEqual(row.windows, [])
+            self.assertFalse(row.available)
+            self.assertIsNone(row.error)
+            self.assertEqual(row.usage_details, {"kind": "metered_usd", "query": "no_permission"})
+            usage_float_module._ACTIVE_LANGUAGE = "zh"
+            shown = iter_display_rows([row])
+            self.assertIsNone(shown[0].used_pct)
+            self.assertIsNone(shown[0].summary)
+            self.assertFalse(shown[0].failed)
+            self.assertEqual(shown[0].detail, "无查询权限")
+            blob = json.dumps(shown[0].__dict__, ensure_ascii=False)
+            self.assertNotIn("$", blob)
+            self.assertNotIn("已用", blob)
+            self.assertNotIn("读不到", blob)
+            usage_float_module._ACTIVE_LANGUAGE = "en"
+            shown_en = iter_display_rows([row])
+            self.assertEqual(shown_en[0].detail, "No permission to query usage")
+            self.assertIsNone(shown_en[0].summary)
+            self.assertFalse(shown_en[0].failed)
+        finally:
+            usage_float_module._ACTIVE_LANGUAGE = previous
+
+    def test_other_misses_name_the_reason_and_are_not_permission(self) -> None:
+        cases = (
+            (500, {"error": "nope"}, "/key/info 返回 500"),
+            (0, "timed out", "timed out"),
+            (0, "", "网络错误"),
+            (0, "reset sk-team-proxy Bearer secret", "读取失败"),
+        )
+        previous = usage_float_module._ACTIVE_LANGUAGE
+        usage_float_module._ACTIVE_LANGUAGE = "zh"
+        try:
+            for status, payload, reason in cases:
+                with self.subTest(status=status, reason=reason):
+                    with TemporaryDirectory() as temp_dir:
+                        self._override(temp_dir, [])
+                        calls = []
+
+                        def fake(url, method="GET", headers=None, body=None, timeout=20, status=status, payload=payload):
+                            calls.append(method)
+                            return status, payload, {}
+
+                        with patch.object(usage_float_module, "http_json_response", side_effect=fake):
+                            row = usage_float_module.fetch_metered_usd_usage("usd")
+                    self.assertEqual(calls, ["GET"])
+                    self.assertEqual(row.usage_details["query"], "failed")
+                    self.assertEqual(row.usage_details["read_error"], reason)
+                    shown = iter_display_rows([row])
+                    self.assertTrue(shown[0].failed)
+                    self.assertEqual(shown[0].detail, reason)
+                    self.assertNotEqual(shown[0].detail, "无查询权限")
+                    self.assertNotIn("sk-", shown[0].detail or "")
+        finally:
+            usage_float_module._ACTIVE_LANGUAGE = previous
 
     def test_display_reformats_spent_dollars_and_does_not_refill(self) -> None:
         previous = usage_float_module._ACTIVE_LANGUAGE

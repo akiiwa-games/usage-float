@@ -118,6 +118,11 @@ _EN_TEXT = {
     '正在读取重置额度…': 'Loading reset credits…',
     '额度': 'Quota',
     '已用': 'used',
+    '无查询权限': 'No permission to query usage',
+    '旧的额度字段残留。运行 agentcompass setup，或在托盘里对该账号操作一次，即可清掉这些字段。':
+        'Old quota fields remain. Run agentcompass setup, or act on this account once in the tray, to clear them.',
+    '旧设置残留。在设置里保存一次即可清掉，或运行 agentcompass setup。':
+        'Old settings remain. Save once in settings to clear them, or run agentcompass setup.',
     '正在由其他采集器更新': 'Another collector is updating usage',
     '读取重置额度失败': 'Could not load reset credits',
     '当前订阅方案不包含 5 小时重置': 'Your subscription does not include 5-hour resets',
@@ -4714,6 +4719,32 @@ OBSOLETE_LLM_PROXY_KEYS = (
 COLLECTOR_CONFIG_KEYS: tuple[str, ...] = (
     "language",
 )
+# Noted on load. A read does not rewrite the file; saving settings, or agentcompass setup, clears the keys.
+_OBSOLETE_SETTINGS_KEYS: list[str] = []
+_OBSOLETE_SETTINGS_PROVIDER: str | None = None
+
+
+def _note_obsolete_settings(data: dict[str, Any]) -> None:
+    """Remember leftover llm-proxy keys and drop them from this in-memory dict."""
+    global _OBSOLETE_SETTINGS_PROVIDER
+    stale = _obsolete_proxy_keys(data)
+    if not stale:
+        return
+    for key in stale:
+        if key not in _OBSOLETE_SETTINGS_KEYS:
+            _OBSOLETE_SETTINGS_KEYS.append(key)
+    provider = data.get("llm_proxy_provider_id")
+    if _OBSOLETE_SETTINGS_PROVIDER is None and isinstance(provider, str) and provider.strip():
+        _OBSOLETE_SETTINGS_PROVIDER = provider.strip()
+    for key in stale:
+        data.pop(key, None)
+
+
+def _obsolete_settings_notice() -> str:
+    return _tr(
+        "旧设置残留。在设置里保存一次即可清掉，或运行 agentcompass setup。",
+        "Old settings remain. Save once in settings to clear them, or run agentcompass setup.",
+    )
 
 
 def _obsolete_proxy_keys(data: Any) -> list[str]:
@@ -4742,7 +4773,9 @@ def write_collector_config(cfg: dict[str, Any]) -> None:
 
 
 def load_config() -> dict[str, Any]:
-    global _ACTIVE_LANGUAGE
+    global _ACTIVE_LANGUAGE, _OBSOLETE_SETTINGS_KEYS, _OBSOLETE_SETTINGS_PROVIDER
+    _OBSOLETE_SETTINGS_KEYS = []
+    _OBSOLETE_SETTINGS_PROVIDER = None
     defaults: dict[str, Any] = {
         "language": "zh",
         "always_on_top": True,
@@ -4787,9 +4820,8 @@ def load_config() -> dict[str, Any]:
                 file_data = data
     except Exception:
         file_data = {}
-    stale = _obsolete_proxy_keys(file_data)
-    if stale:
-        raise ValueError(_obsolete_proxy_message(stale))
+    if isinstance(file_data, dict):
+        _note_obsolete_settings(file_data)
     defaults.update(file_data)
     try:
         collector_data = read_collector_config()
@@ -4799,9 +4831,7 @@ def load_config() -> dict[str, Any]:
         collector_data = {}
     if not isinstance(collector_data, dict):
         collector_data = {}
-    stale = _obsolete_proxy_keys(collector_data)
-    if stale:
-        raise ValueError(_obsolete_proxy_message(stale))
+    _note_obsolete_settings(collector_data)
     for key in COLLECTOR_CONFIG_KEYS:
         if key in collector_data:
             defaults[key] = collector_data[key]
@@ -5045,19 +5075,9 @@ def _capture_widget_png(widget: Any, path: Path) -> None:
 
 
 def save_config(cfg: dict[str, Any]) -> None:
-    global _ACTIVE_LANGUAGE
-    stale = _obsolete_proxy_keys(cfg)
-    if CONFIG_PATH.is_file():
-        try:
-            disk = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
-        except (OSError, ValueError):
-            disk = None
-        if isinstance(disk, dict):
-            for key in _obsolete_proxy_keys(disk):
-                if key not in stale:
-                    stale.append(key)
-    if stale:
-        raise ValueError(_obsolete_proxy_message(stale))
+    global _ACTIVE_LANGUAGE, _OBSOLETE_SETTINGS_KEYS, _OBSOLETE_SETTINGS_PROVIDER
+    for key in _obsolete_proxy_keys(cfg):
+        cfg.pop(key, None)
     cfg["language"] = _lang(cfg)
     _ACTIVE_LANGUAGE = cfg["language"]
     if _docs_shot_active():
@@ -5065,6 +5085,8 @@ def save_config(cfg: dict[str, Any]) -> None:
     try:
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+        _OBSOLETE_SETTINGS_KEYS = []
+        _OBSOLETE_SETTINGS_PROVIDER = None
     except Exception:
         pass
     try:
@@ -7326,33 +7348,6 @@ def discover_metered_usd_accounts() -> dict[str, MeteredUsdAccount]:
     return found
 
 
-def _header_float(headers: dict[str, str], name: str) -> float | None:
-    raw = headers.get(name)
-    if raw is None or raw == "":
-        return None
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return None
-
-
-def _spend_looks_like_this_request(spend: float | None, cost: float | None) -> bool:
-    """True when the proxy has not flushed cumulative key spend yet."""
-    if spend is None:
-        return False
-    if cost is None:
-        return spend <= 1e-5
-    return spend <= max(cost * 2.0, 1e-5)
-
-
-def _parse_spend_headers(headers: dict[str, str]) -> tuple[float | None, float | None, float | None]:
-    lowered = {str(k).lower(): str(v) for k, v in headers.items()}
-    spend = _header_float(lowered, "x-litellm-key-spend")
-    budget = _header_float(lowered, "x-litellm-key-max-budget")
-    cost = _header_float(lowered, "x-litellm-response-cost")
-    return spend, budget, cost
-
-
 def _parse_key_info(payload: Any) -> tuple[float | None, float | None]:
     if not isinstance(payload, dict):
         return None, None
@@ -7383,18 +7378,98 @@ def format_metered_usd(spend: float, budget: float | None = None) -> str:
     return _tr(f"已用 {spent} / {cap}", f"used {spent} / {cap}")
 
 
-def _metered_usd_completion(openai_base: str, key: str, model: str) -> tuple[int, dict[str, str]]:
-    status, _payload, headers = http_json_response(
-        f"{openai_base}/chat/completions",
-        method="POST",
-        headers={"Authorization": f"Bearer {key}"},
-        body={
-            "model": model,
-            "messages": [{"role": "user", "content": "."}],
-            "max_tokens": 1,
-        },
+def _public_read_error(text: str) -> str:
+    """A hover reason that never repeats a key or a bearer token."""
+    cleaned = " ".join(str(text or "").split())
+    if not cleaned or "sk-" in cleaned or "Bearer " in cleaned:
+        return "读取失败"
+    return cleaned[:160]
+
+
+def _cached_permission_usage(provider_id: str, raw: Any, key: str | None) -> ProviderUsage | None:
+    """The last /key/info permission denial, within the poll, without turning it into a read failure."""
+    if not isinstance(raw, dict):
+        return None
+    details = raw.get("usage_details")
+    if not isinstance(details, dict) or details.get("query") != "no_permission" or details.get("kind") != "metered_usd":
+        return None
+    if raw.get("credential_key") not in (None, key):
+        return None
+    try:
+        item = _provider_from_dict(raw)
+    except (TypeError, ValueError):
+        return None
+    item.provider_id = provider_id
+    item.credential_key = key
+    item.available = False
+    item.error = None
+    item.summary = None
+    item.windows = []
+    item.usage_details = {"kind": "metered_usd", "query": "no_permission"}
+    return item
+
+
+def _cache_metered_usd_failure(provider_id: str, *, query: str, read_error: str | None) -> None:
+    """Remember a /key/info miss. No spend number is stored."""
+    key = provider_credential_key(provider_id)
+    details: dict[str, Any] = {"kind": "metered_usd", "query": query}
+    if read_error:
+        details["read_error"] = read_error
+    snap = ProviderUsage(
+        provider_id=provider_id,
+        display_name=provider_id,
+        available=False,
+        windows=[],
+        fetched_at=datetime.now(timezone.utc).isoformat(),
+        backend_kind="metered_usd",
+        billing="metered",
+        credential_key=key,
+        usage_details=details,
+        error=read_error,
     )
-    return status, headers
+
+    def update(cache):
+        cache.setdefault("providers", {})[provider_id] = _provider_to_dict(snap)
+
+    try:
+        update_usage_cache(update)
+    except Exception:
+        pass
+
+
+def _metered_usd_miss(provider_id: str, display_name: str, status: int, payload: Any) -> ProviderUsage:
+    """No spend number. 401/403 is a permission hover; every other miss is a normal read failure."""
+    if status in (401, 403):
+        _cache_metered_usd_failure(provider_id, query="no_permission", read_error=None)
+        return ProviderUsage(
+            provider_id=provider_id,
+            display_name=display_name,
+            available=False,
+            windows=[],
+            backend_kind="metered_usd",
+            billing="metered",
+            usage_details={"kind": "metered_usd", "query": "no_permission"},
+            fetched_at=datetime.now(timezone.utc).isoformat(),
+        )
+    if status == 0:
+        raw_reason = str(payload or "").strip()
+        reason = "网络错误" if not raw_reason else _public_read_error(raw_reason)
+    elif status != 200:
+        reason = f"/key/info 返回 {status}"
+    else:
+        reason = "/key/info 没有已用金额"
+    _cache_metered_usd_failure(provider_id, query="failed", read_error=reason)
+    return ProviderUsage(
+        provider_id=provider_id,
+        display_name=display_name,
+        available=False,
+        error=reason,
+        windows=[],
+        backend_kind="metered_usd",
+        billing="metered",
+        usage_details={"kind": "metered_usd", "query": "failed", "read_error": reason},
+        fetched_at=datetime.now(timezone.utc).isoformat(),
+    )
 
 
 def _reading_budget(account: MeteredUsdAccount, reported: float | None) -> float | None:
@@ -7407,17 +7482,7 @@ def _reading_budget(account: MeteredUsdAccount, reported: float | None) -> float
 
 
 def fetch_metered_usd_usage(provider_id: str) -> ProviderUsage:
-    """Read spent dollars for one metered USD account.
-
-    Prefer GET {origin}/key/info. That route returns the key's spend and
-    max_budget without a model call. Many virtual keys cannot call it. When it
-    does not return a spend number, one chat completion against the account's
-    first declared model reads x-litellm-key-spend and x-litellm-key-max-budget.
-    Those headers are attached on a completion, not on /key/info or /models, so
-    the completion is the only fallback. One extra completion runs only when the
-    returned spend still looks like this request's own cost. No model is guessed:
-    an account that declares none stops after /key/info.
-    """
+    """Read spent dollars for one metered USD account from GET {origin}/key/info only."""
     account = discover_metered_usd_accounts().get(provider_id)
     display_name = account.display_name if account is not None else provider_id
     if account is None:
@@ -7427,17 +7492,8 @@ def fetch_metered_usd_usage(provider_id: str) -> ProviderUsage:
         headers={"Authorization": f"Bearer {account.api_key}"},
     )
     spend, reported_budget = _parse_key_info(payload) if status == 200 else (None, None)
-    if spend is None and account.models:
-        model = account.models[0]
-        status, headers = _metered_usd_completion(account.openai_base, account.api_key, model)
-        if status == 200:
-            spend, reported_budget, cost = _parse_spend_headers(headers)
-            if _spend_looks_like_this_request(spend, cost):
-                status, headers = _metered_usd_completion(account.openai_base, account.api_key, model)
-                if status == 200:
-                    spend, reported_budget, _cost = _parse_spend_headers(headers)
     if spend is None:
-        return ProviderUsage(provider_id=provider_id, display_name=display_name, available=False, error="更新失败")
+        return _metered_usd_miss(provider_id, display_name, status, payload)
     budget = _reading_budget(account, reported_budget)
     details: dict[str, Any] = {"kind": "metered_usd", "spent_usd": spend, "budget_usd": budget}
     windows: list[UsageWindow] = []
@@ -7472,6 +7528,7 @@ def _display_metered_usd(provider: ProviderUsage) -> ProviderUsage:
     metered = provider.backend_kind == "metered_usd" or (isinstance(details, dict) and details.get("kind") == "metered_usd")
     if not metered:
         return provider
+    permission = isinstance(details, dict) and details.get("query") == "no_permission"
     windows = [
         UsageWindow(
             id=window.id,
@@ -7490,13 +7547,16 @@ def _display_metered_usd(provider: ProviderUsage) -> ProviderUsage:
             budget = details.get("budget_usd")
             budget_usd = float(budget) if isinstance(budget, (int, float)) and not isinstance(budget, bool) and budget > 0 else None
             summary = format_metered_usd(float(spent), budget_usd)
+    if permission:
+        windows = []
+        summary = None
     return ProviderUsage(
         provider_id=provider.provider_id,
         display_name=provider.display_name,
-        plan_label=provider.plan_label,
+        plan_label=None if permission else provider.plan_label,
         windows=windows,
-        error=provider.error,
-        available=provider.available,
+        error=None if permission else provider.error,
+        available=False if permission else provider.available,
         stale=provider.stale,
         fetched_at=provider.fetched_at,
         summary=summary,
@@ -7938,6 +7998,10 @@ def merge_display_usage(
     result = []
     for pid in dict.fromkeys(provider_fetch_id(name) for name in selected):
         item = incoming.get(pid)
+        details = item.usage_details if isinstance(item, ProviderUsage) and isinstance(item.usage_details, dict) else {}
+        if details.get("kind") == "metered_usd" and details.get("query") == "no_permission":
+            result.append(item)
+            continue
         if item is None or not (item.windows or item.summary):
             candidates = previous
             if memory_only and item is not None and item.credential_key is not None:
@@ -7984,9 +8048,11 @@ def collect_local_usage(providers: list[str], *, force: bool = False) -> list[Pr
         try:
             with file_lock(CACHE_PATH.with_name(f'{CACHE_PATH.name}.{pid}.fetch.lock'), timeout=1):
                 key = provider_credential_key(pid)
-                cached = cache_get_provider(pid) or display_snapshot(pid)
                 cache = load_usage_cache()
                 raw = (cache.get('providers') or {}).get(pid) or {}
+                # A permission denial replaces an older spend snapshot. Other misses still keep that snapshot.
+                remembered = _cached_permission_usage(pid, raw, key)
+                cached = remembered or cache_get_provider(pid) or display_snapshot(pid)
                 attempt = (cache.get('attempts') or {}).get(pid) or {}
                 last_attempt = attempt.get('at', 0) if attempt.get('credential_key') == key else 0
                 observed = _iso_epoch(cached.fetched_at, 0) if cached else 0
@@ -8003,7 +8069,8 @@ def collect_local_usage(providers: list[str], *, force: bool = False) -> list[Pr
                         cached.stale = bool(raw.get('stale', True)) or time.time() - observed >= REFRESH_SECONDS
                         out.append(cached)
                     else:
-                        out.append(ProviderUsage(provider_id=pid, display_name=pid,
+                        remembered = _cached_permission_usage(pid, raw, key)
+                        out.append(remembered or ProviderUsage(provider_id=pid, display_name=pid,
                                                  available=False, stale=True, error='更新失败'))
                     continue
                 record_usage_attempt(pid, key)
@@ -8022,6 +8089,11 @@ def collect_local_usage(providers: list[str], *, force: bool = False) -> list[Pr
                 elif pid == 'antigravity':
                     item = fetch_antigravity_usage()
                 else:
+                    continue
+                details = item.usage_details if isinstance(item.usage_details, dict) else {}
+                if details.get("kind") == "metered_usd" and details.get("query") == "no_permission":
+                    item.credential_key = key
+                    out.append(item)
                     continue
                 if key != provider_credential_key(pid):
                     item = stale_provider_usage(pid, _tr('登录凭据已变化，等待下次更新', 'Login credentials changed; waiting for the next update'))
@@ -8276,11 +8348,41 @@ def iter_display_rows(
     return [row for _position, row in ranked]
 
 
+def _metered_miss_row(provider: ProviderUsage, name: str) -> DisplayRow | None:
+    """Permission denial shows no number. Any other metered miss keeps the failure line and puts the reason on the hover."""
+    details = provider.usage_details if isinstance(provider.usage_details, dict) else {}
+    if details.get("kind") != "metered_usd" and provider.backend_kind != "metered_usd":
+        return None
+    if details.get("query") == "no_permission":
+        return DisplayRow(
+            title=name,
+            provider_id=provider.provider_id,
+            detail=_tr("无查询权限", "No permission to query usage"),
+        )
+    if details.get("query") != "failed":
+        return None
+    reason = details.get("read_error") if isinstance(details.get("read_error"), str) else provider.error
+    detail = reason.strip() if isinstance(reason, str) and reason.strip() and reason.strip() != "更新失败" else None
+    if detail == "无查询权限":
+        detail = None
+    return DisplayRow(
+        title=name,
+        failed=True,
+        summary=_ui("更新失败"),
+        provider_id=provider.provider_id,
+        detail=detail,
+    )
+
+
 def _expand_display_rows(providers: list[ProviderUsage]) -> list[DisplayRow]:
     rows: list[DisplayRow] = []
     for p in providers:
         p = _display_metered_usd(p)
         name = (p.display_name or p.provider_id).lower()
+        miss = _metered_miss_row(p, name)
+        if miss is not None:
+            rows.append(miss)
+            continue
 
         if not p.windows and not p.summary:
             rows.append(
@@ -8349,6 +8451,11 @@ def _expand_display_rows(providers: list[ProviderUsage]) -> list[DisplayRow]:
                 provider_id=p.provider_id,
             )
         )
+    notice = _obsolete_settings_notice() if _OBSOLETE_SETTINGS_KEYS else ""
+    if notice and _OBSOLETE_SETTINGS_PROVIDER:
+        for row in rows:
+            if row.provider_id == _OBSOLETE_SETTINGS_PROVIDER:
+                row.detail = notice if not row.detail else f"{row.detail}\n{notice}"
     return rows
 
 
@@ -10739,7 +10846,7 @@ def run_ui() -> None:
             value_color = panel_tone_color(dr.used_pct or 0)
             value_font = font_panel_value
         else:
-            value_text = extra or "—"
+            value_text = extra if extra else ("—" if dr.failed else "")
             value_color = PANEL_RED if dr.failed else PANEL_FG
             value_font = font_panel_title
         meta_text = reset_text if reset_text else (_tr("数据不可用", 'Data unavailable') if dr.failed else "")
@@ -11107,7 +11214,7 @@ def run_ui() -> None:
             # Pack RIGHT first so usage is always fully visible
             right_box.pack(side="right", padx=(8, 0))
 
-            if extra is not None and not pct_t:
+            if extra and not pct_t:
                 color = RED if dr.failed else FG
                 s = tk.Label(
                     right_box,
@@ -11930,6 +12037,17 @@ def run_ui() -> None:
                 reopened._select_wallpaper_tab(wallpaper_tab)
 
         language_combo.bind("<<ComboboxSelected>>", change_language)
+
+        if _OBSOLETE_SETTINGS_KEYS:
+            tk.Label(
+                shell,
+                text=_obsolete_settings_notice(),
+                fg=S_TEXT,
+                bg=S_PAGE_BG,
+                font=settings_font,
+                wraplength=420,
+                justify="left",
+            ).pack(fill="x", pady=(0, 10))
 
         def make_card(
             parent: tk.Misc,
