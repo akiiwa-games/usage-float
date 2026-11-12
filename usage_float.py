@@ -12127,44 +12127,62 @@ def run_ui() -> None:
         except Exception:
             pass
 
+        hint_state: dict[str, Any] = {"window": None, "job": None}
+        hints: dict[Any, Any] = {}
+
+        def hide_hint(_event: Any = None) -> None:
+            if hint_state["job"] is not None:
+                win.after_cancel(hint_state["job"])
+                hint_state["job"] = None
+            if hint_state["window"] is not None:
+                hint_state["window"].withdraw()
+
+        def add_hint(widget: Any, text: Any) -> None:
+            already_bound = widget in hints
+            hints[widget] = text
+            if already_bound:
+                return
+            def enter(event: Any) -> None:
+                hide_hint()
+                x, y = event.x_root + 12, event.y_root + 18
+                def show() -> None:
+                    hint_state["job"] = None
+                    tip = hint_state["window"]
+                    if tip is None:
+                        tip = tk.Toplevel(win)
+                        tip.withdraw()
+                        tip.overrideredirect(True)
+                        label = tk.Label(tip, bg=S_CARD_BG, fg=S_TEXT,
+                                         font=settings_font_small, wraplength=360,
+                                         justify="left", padx=10, pady=8)
+                        label.pack()
+                        tip._label = label
+                        hint_state["window"] = tip
+                    current = hints[widget]
+                    tip._label.configure(text=current() if callable(current) else current)
+                    tip.geometry(f"+{x}+{y}")
+                    tip.deiconify()
+                hint_state["job"] = win.after(450, show)
+            widget.bind("<Enter>", enter, add="+")
+            widget.bind("<Leave>", hide_hint, add="+")
+            widget.bind("<ButtonPress>", hide_hint, add="+")
+
+        def detail(parent: Any, text: Any) -> None:
+            # Put the explanation on existing section headings and controls.
+            add_hint(parent, text)
+            def bind_children(widget: Any) -> None:
+                for child in widget.winfo_children():
+                    add_hint(child, text)
+                    bind_children(child)
+            bind_children(parent)
+
         shell = tk.Frame(win, bg=S_PAGE_BG, padx=18, pady=16)
         shell.pack(fill="both", expand=True)
-
-        # Top header bar + flat pill navigation
-        header_frame = tk.Frame(shell, bg=S_PAGE_BG)
-        header_frame.pack(fill="x", pady=(0, 12))
-        header_left = tk.Frame(header_frame, bg=S_PAGE_BG)
-        header_left.pack(side="left", fill="x", expand=True)
-        tk.Label(
-            header_left,
-            text="UsageFloat",
-            fg=S_TEXT,
-            bg=S_PAGE_BG,
-            font=settings_font_title,
-            anchor="w",
-        ).pack(side="left")
-        tk.Label(
-            header_left,
-            text="  SETTINGS",
-            fg=S_ACCENT,
-            bg=S_PAGE_BG,
-            font=settings_font_badge,
-            anchor="w",
-        ).pack(side="left", pady=(4, 0))
-        tk.Label(
-            header_left,
-            text=_tr("   双栏排布 · 副屏仪表盘 · 动态壁纸", '   Two-Column Layout · Aux Display · Live Wallpaper'),
-            wraplength=370, justify="left",
-            fg=S_MUTED,
-            bg=S_PAGE_BG,
-            font=settings_font_small,
-            anchor="w",
-        ).pack(side="left", pady=(3, 0))
 
         language_row = tk.Frame(shell, bg=S_PAGE_BG)
         language_row.pack(fill="x", pady=(0, 10))
         tk.Label(
-            language_row, text="语言 / Language", fg=S_TEXT, bg=S_PAGE_BG,
+            language_row, text=_tr("语言", "Language"), fg=S_TEXT, bg=S_PAGE_BG,
             font=settings_font,
         ).pack(side="left")
         language_var = tk.StringVar(value="English" if _lang(cfg) == "en" else "简体中文")
@@ -12310,6 +12328,7 @@ def run_ui() -> None:
         def select_main_tab(title: str) -> None:
             if active_main_tab.get("initialized") and active_main_tab["title"] == title:
                 return
+            hide_hint()
             active_main_tab["title"] = title
             active_main_tab["initialized"] = True
             with _freeze_redraw(content_host):
@@ -12555,7 +12574,7 @@ def run_ui() -> None:
         prov_header_row.pack(fill="x", pady=(0, 2))
         tk.Label(
             prov_header_row,
-            text=_tr("显示的用量（双列拖动排布）", 'Usage layout (drag between columns)'),
+            text=_tr("用量布局", 'Usage layout'),
             fg=S_TEXT,
             bg=S_CARD_BG,
             font=settings_font_section,
@@ -12569,17 +12588,12 @@ def run_ui() -> None:
             font=settings_font_small,
             anchor="e",
         )
-        provider_status.pack(side="right")
+        add_hint(prov_header_row, lambda: provider_status.cget("text"))
 
-        tk.Label(
-            providers_card,
-            text=_tr("按住任意栏可在左右两列间自由拖动，直接决定面板显示位置；未勾选默认置灰。", 'Drag rows between columns to set their panel position. Unchecked rows are dimmed.'),
-            fg=S_MUTED,
-            bg=S_CARD_BG,
-            font=settings_font_small,
-            anchor="w",
-            justify="left",
-        ).pack(fill="x", pady=(0, 8))
+        detail(providers_card, lambda: _tr(
+            "拖动用量行调整位置；点击方框或双击切换显示。",
+            "Drag rows to rearrange them. Click the checkbox or double-click to toggle.")
+            + "\n" + provider_status.cget("text"))
 
         # Two-column board container (scrollable list area, direct grid children on board_inner)
         board_wrap = tk.Frame(
@@ -12626,7 +12640,7 @@ def run_ui() -> None:
 
         col_hdr_frames: list[tk.Frame] = []
         col_count_labels: list[tk.Label] = []
-        for col_idx, col_title in enumerate((_tr("左栏 · COLUMN 1", 'Left Column · COLUMN 1'), _tr("右栏 · COLUMN 2", 'Right Column · COLUMN 2'))):
+        for col_idx, col_title in enumerate((_tr("左栏", 'Left column'), _tr("右栏", 'Right column'))):
             hdr = tk.Frame(board_inner, bg=S_COL_BG, padx=6, pady=2)
             hdr.grid(row=0, column=col_idx, sticky="ew", pady=(0, 4))
             tk.Label(
@@ -12645,7 +12659,7 @@ def run_ui() -> None:
                 font=settings_font_badge,
                 anchor="e",
             )
-            cnt_lbl.pack(side="right")
+            add_hint(hdr, lambda label=cnt_lbl: label.cget("text"))
             col_hdr_frames.append(hdr)
             col_count_labels.append(cnt_lbl)
 
@@ -13051,9 +13065,9 @@ def run_ui() -> None:
                     elif checked and no_window:
                         badge_text = _tr("无此窗口", 'No such window')
                     elif checked:
-                        badge_text = _tr("已就绪", 'Ready') if available else _tr("未检测", 'Not Detected')
+                        badge_text = '' if available else _tr("未检测", 'Missing')
                     else:
-                        badge_text = _tr("未启用", 'Disabled') if available else _tr("未检测", 'Not Detected')
+                        badge_text = '' if available else _tr("未检测", 'Missing')
 
                     rec["bar"].configure(
                         bg=card_bg,
@@ -13086,7 +13100,10 @@ def run_ui() -> None:
                             "This account's latest reading has no such window, so the float shows no row "
                             "for it; it shows again when the window comes back. Windows read: {0}").format(
                             ", ".join(has_windows) if has_windows else "—")
-                        if no_window and checked and not is_dragging else ""
+                        if no_window and checked and not is_dragging else
+                        _tr("未检测到此账号，扫描账号可更新检测结果。",
+                            "Account not detected. Scan accounts to update its status.")
+                        if not available else ""
                     )
 
             cols_now = (tuple(left_col_items), tuple(right_col_items))
@@ -13194,13 +13211,7 @@ def run_ui() -> None:
             padx=10,
             pady=4,
         ).pack(side="left", padx=(8, 0))
-        tk.Label(
-            provider_button_row,
-            text=_tr("双击或点左侧方框可快速勾选/置灰", 'Double-click or check the box to toggle'),
-            fg=S_SUBTLE,
-            bg=S_CARD_BG,
-            font=settings_font_badge,
-        ).pack(side="right")
+        detail(provider_button_row, _tr("双击或点左侧方框可快速勾选/置灰", 'Double-click or check the box to toggle'))
 
         def seed_provider_scan() -> None:
             """Fill the board from what is already known, so opening never waits on credential checks.
@@ -13266,14 +13277,7 @@ def run_ui() -> None:
             font=settings_font_section,
             anchor="w",
         ).pack(fill="x")
-        tk.Label(
-            tz_left,
-            text=_tr("用于 LLM Proxy 重置倒计时（支持 UTC+8、UTC 或 IANA 名称）", 'LLM Proxy reset countdown (UTC+8, UTC or IANA name)'),
-            fg=S_MUTED,
-            bg=S_CARD_BG,
-            font=settings_font_small,
-            anchor="w",
-        ).pack(fill="x", pady=(1, 0))
+        detail(tz_left, _tr("用于 LLM Proxy 重置倒计时（支持 UTC+8、UTC 或 IANA 名称）", 'LLM Proxy reset countdown (UTC+8, UTC or IANA name)'))
 
         timezone_var = tk.StringVar(
             value=_normalize_llm_proxy_timezone(
@@ -13339,7 +13343,7 @@ def run_ui() -> None:
             display_card = make_card(display_pad, pady=(0, 10))
             tk.Label(
                 display_card,
-                text=_tr("目标显示器与整屏仪表盘", 'Monitor & Full-Screen Dashboard'),
+                text=_tr("显示器", 'Display'),
                 fg=S_TEXT,
                 bg=S_CARD_BG,
                 font=settings_font_section,
@@ -13361,17 +13365,17 @@ def run_ui() -> None:
                 requested = bool(panel_mode_var.get())
                 if requested and active:
                     panel_status.configure(
-                        text=_tr("● 已铺满所选副屏；在副屏任意位置右键可随时打开菜单。", '● Dashboard fills the selected display. Right-click anywhere for the menu.'),
+                        text=_tr("● 已启用", '● Active'),
                         fg=S_ACCENT,
                     )
                 elif requested:
                     panel_status.configure(
-                        text=_tr("● 所选副屏未连接，当前临时回退为桌面悬浮窗。", '● Selected display disconnected. Using the floating HUD temporarily.'),
+                        text=_tr("● 显示器未连接", '● Display disconnected'),
                         fg="#fbbf24",
                     )
                 else:
                     panel_status.configure(
-                        text=_tr("开启后将自动铺满所选副屏；拔下副屏时自动回到桌面悬浮窗。", 'Fills the selected display. Returns to the floating HUD when disconnected.'),
+                        text=_tr("● 未启用", '● Off'),
                         fg=S_MUTED,
                     )
                 if sync_floating_controls is not None:
@@ -13393,7 +13397,7 @@ def run_ui() -> None:
 
             panel_checkbox = tk.Checkbutton(
                 display_card,
-                text=_tr("启用专用副屏模式（整屏双列仪表盘）", 'Enable Dedicated Aux Display Mode'),
+                text=_tr("启用专用副屏模式", 'Enable Aux Display mode'),
                 variable=panel_mode_var,
                 command=on_panel_mode_toggle,
                 bg=S_CARD_BG,
@@ -13456,6 +13460,9 @@ def run_ui() -> None:
                 wraplength=510,
             )
             panel_status.pack(fill="x", pady=(4, 0))
+            add_hint(panel_checkbox, _tr(
+                "铺满所选副屏；断开时自动回到悬浮窗。在副屏任意位置右键打开菜单。",
+                "Fills the selected display; returns to the floating HUD when disconnected. Right-click the display for the menu."))
 
             # Shortcut card in Tab 2
             shortcut_card = make_card(display_pad, pady=(0, 0))
@@ -13522,7 +13529,7 @@ def run_ui() -> None:
             ).pack(fill="x", pady=(0, 4))
             tk.Checkbutton(
                 shortcut_card,
-                text=_tr("启用全局快捷键，一键切换「用量面板 / 动态壁纸」", 'Enable a global shortcut to toggle Usage Panel / Live Wallpaper'),
+                text=_tr("启用全局快捷键", 'Enable a global shortcut to toggle Usage Panel / Live Wallpaper'),
                 variable=shortcut_enabled_var,
                 command=persist_shortcut_from_ui,
                 bg=S_CARD_BG,
@@ -13684,16 +13691,7 @@ def run_ui() -> None:
             capture_btn.pack(side="left", padx=(8, 0))
             shortcut_combo_widgets.extend((combo_label, capture_btn))
 
-            tk.Label(
-                shortcut_card,
-                text=_tr("连按默认两次 Ctrl；组合键按下后立即切换。仅在专用副屏模式下生效，Ctrl+C 等正常组合键不会误触。", 'Default: press Ctrl twice. Key combos toggle immediately. Only active in Aux Display mode; normal combos such as Ctrl+C are ignored.'),
-                fg=S_MUTED,
-                bg=S_CARD_BG,
-                font=settings_font_small,
-                anchor="w",
-                wraplength=510,
-                justify="left",
-            ).pack(fill="x")
+            detail(shortcut_card, _tr("连按默认两次 Ctrl；组合键按下后立即切换。仅在专用副屏模式下生效，Ctrl+C 等正常组合键不会误触。", 'Default: press Ctrl twice. Key combos toggle immediately. Only active in Aux Display mode; normal combos such as Ctrl+C are ignored.'))
             update_shortcut_controls()
             update_panel_status()
 
@@ -13749,22 +13747,13 @@ def run_ui() -> None:
             dirs_hdr.pack(fill="x", pady=(0, 2))
             tk.Label(
                 dirs_hdr,
-                text=_tr("媒体目录与递归层数", 'Media Folders & Recursion Depth'),
+                text=_tr("媒体目录", 'Media folders'),
                 fg=S_TEXT,
                 bg=S_CARD_BG,
                 font=settings_font_section,
                 anchor="w",
             ).pack(side="left")
-            tk.Label(
-                dirs_card,
-                text=_tr("添加目录后立即生效并在后台慢速建立缓存索引；可为每个目录设置子目录递归层数（用于「随机权重」分组显示）。", 'Folders take effect immediately and are indexed slowly in the background. Set recursion depth per folder to group Random Weights.'),
-                fg=S_MUTED,
-                bg=S_CARD_BG,
-                font=settings_font_small,
-                anchor="w",
-                justify="left",
-                wraplength=510,
-            ).pack(fill="x", pady=(0, 8))
+            detail(dirs_card, _tr("添加目录后立即生效并在后台慢速建立缓存索引；可为每个目录设置子目录递归层数（用于「随机权重」分组显示）。", 'Folders take effect immediately and are indexed slowly in the background. Set recursion depth per folder to group Random Weights.'))
 
             folder_list_frame = tk.Frame(
                 dirs_card,
@@ -13819,6 +13808,7 @@ def run_ui() -> None:
                 wraplength=510,
             )
             folder_status.pack(fill="x")
+            add_hint(folder_status, lambda: getattr(folder_status, "_detail", ""))
             # The summary line above names the mpv state (downloading / failed / ready); the
             # Download / Retry link sits in the always-visible button row, because the card's
             # lower edge is clipped when the folder list takes the page height.
@@ -13988,14 +13978,17 @@ def run_ui() -> None:
                 font=settings_font_section,
                 anchor="w",
             ).pack(fill="x", pady=(0, 4))
+            detail(weights_mode_card, _tr(
+                "单目录随机按权重选择目录后在其中播放；全目录随机每次从所有目录按权重选择。",
+                "Single folder chooses one folder by weight for the session. All folders chooses across folders at each transition."))
             for mode, label in (
                 (
                     WALLPAPER_RANDOM_MODE_DIRECTORY,
-                    _tr("单目录随机：按权重抽中某个目录后，本轮只在其中播放", 'Single folder: pick a folder by weight, then play only that folder this session'),
+                    _tr("单目录随机", 'Single folder'),
                 ),
                 (
                     WALLPAPER_RANDOM_MODE_GLOBAL,
-                    _tr("全目录混合随机：每次切换都在所有目录中按权重随机抽取", 'All folders: pick media across all folders by weight at each transition'),
+                    _tr("全目录随机", 'All folders'),
                 ),
             ):
                 tk.Radiobutton(
@@ -14025,22 +14018,13 @@ def run_ui() -> None:
             w_hdr.pack(fill="x", pady=(0, 2))
             tk.Label(
                 w_hdr,
-                text=_tr("子目录抽中权重（基于缓存索引与递归层数）", 'Subfolder Weights (cached index)'),
+                text=_tr("子目录权重", 'Subfolder weights'),
                 fg=S_TEXT,
                 bg=S_CARD_BG,
                 font=settings_font_section,
                 anchor="w",
             ).pack(side="left")
-            tk.Label(
-                weights_list_card,
-                text=_tr("10 为默认基准，20 约为两倍概率，0 表示禁用首选；直接读取缓存索引，不重复全盘扫描。", '10 is the default; 20 doubles the chance; 0 disables preference. Uses the cached index without scanning again.'),
-                fg=S_MUTED,
-                bg=S_CARD_BG,
-                font=settings_font_small,
-                anchor="w",
-                justify="left",
-                wraplength=510,
-            ).pack(fill="x", pady=(0, 6))
+            detail(weights_list_card, _tr("10 为默认基准，20 约为两倍概率，0 表示禁用首选；直接读取缓存索引，不重复全盘扫描。", '10 is the default; 20 doubles the chance; 0 disables preference. Uses the cached index without scanning again.'))
 
             weight_list_frame = tk.Frame(
                 weights_list_card,
@@ -14366,10 +14350,19 @@ def run_ui() -> None:
                     if (scanning_set or uncached_all)
                     else ""
                 )
-                status_text = (
+                folder_status._detail = (
                     _tr(f"已启用 {len(enabled_folders)} / 共 {len(wallpaper_folders)} 个目录"
                     f" · 已缓存 {total_cached_media} 个媒体 · {engine_text}{scan_note}", f'Enabled {len(enabled_folders)} / {len(wallpaper_folders)} folders · Cached {total_cached_media} media files · {engine_text}{scan_note}')
                 )
+                engine_state = (_tr("就绪", "Ready") if executable is not None
+                                else _tr("下载失败", "Download failed") if _mpv_provision_snapshot().get("status") == "failed"
+                                else _tr("下载中", "Downloading") if _mpv_provision_snapshot().get("status") == "running"
+                                else _tr("待下载", "Not installed"))
+                status_text = _tr(
+                    f"{len(enabled_folders)} 个目录 · {total_cached_media} 个媒体 · mpv {engine_state}",
+                    f"{len(enabled_folders)} folders · {total_cached_media} media · mpv {engine_state}")
+                if scanning_set or uncached_all:
+                    status_text += _tr(" · 索引中", " · Indexing")
                 if str(folder_status.cget("text")) != status_text:
                     folder_status.configure(text=status_text)
 
@@ -14509,7 +14502,7 @@ def run_ui() -> None:
                 if not wallpaper_folders:
                     tk.Label(
                         folder_rows,
-                        text=_tr("尚未添加壁纸目录，点击下方「＋ 添加目录」即可立刻添加并后台慢扫描。", 'No wallpaper folders yet. Click “＋ Add Folder” to add and index a folder.'),
+                        text=_tr("尚无媒体目录", 'No wallpaper folders yet. Click “＋ Add Folder” to add and index a folder.'),
                         fg=S_MUTED,
                         bg=S_COL_BG,
                         font=settings_font_small,
@@ -14936,7 +14929,7 @@ def run_ui() -> None:
                 wraplength=510,
                 justify="left",
             )
-            opacity_hint.pack(fill="x")
+            detail(float_style_card, lambda: opacity_hint.cget("text"))
 
             float_size_card = make_card(floating_pad, pady=(0, 0))
             tk.Label(
@@ -14968,16 +14961,7 @@ def run_ui() -> None:
                 highlightthickness=0,
             )
             chk.pack(fill="x", pady=(0, 4))
-            tk.Label(
-                float_size_card,
-                text=_tr("开启后，拖动悬浮窗右下角 ◢ 可自由改变宽度和高度；高度不会小于内容所需，避免上下裁切。", 'Drag the bottom-right ◢ to resize width and height. Height stays large enough to show all content.'),
-                fg=S_MUTED,
-                bg=S_CARD_BG,
-                font=settings_font_small,
-                wraplength=510,
-                justify="left",
-                anchor="w",
-            ).pack(fill="x")
+            detail(float_size_card, _tr("开启后，拖动悬浮窗右下角 ◢ 可自由改变宽度和高度；高度不会小于内容所需，避免上下裁切。", 'Drag the bottom-right ◢ to resize width and height. Height stays large enough to show all content.'))
 
             def sync_floating_controls(requested: bool) -> None:
                 try:
@@ -15011,6 +14995,7 @@ def run_ui() -> None:
             state["wallpaper_scan_callback"] = None
             state["settings_readings_changed"] = None
             hide_badge_tip()
+            hide_hint()
             if commit_all_directory_weights is not None and apply_wallpaper_image_seconds is not None:
                 _commit_wallpaper_settings_before_close(
                     commit_all_directory_weights,

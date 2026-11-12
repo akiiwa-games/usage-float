@@ -2897,12 +2897,13 @@ class SettingsWindowStatusTests(unittest.TestCase):
         self.assertEqual(errors, [])
         first = captured['first']
         self.assertEqual(first['Claude 2 fable 7d'], '无此窗口')
-        self.assertEqual(first['Claude 2 7d'], '已就绪')
+        # Enabled checkboxes already convey readiness; only exceptional states need a badge.
+        self.assertEqual(first['Claude 2 7d'], '')
         self.assertEqual(first['agy gemini 5h'], '无此窗口')
-        self.assertEqual(first['agy gemini 7d'], '已就绪')
-        self.assertEqual(captured['window_back']['agy gemini 5h'], '已就绪')
+        self.assertEqual(first['agy gemini 7d'], '')
+        self.assertEqual(captured['window_back']['agy gemini 5h'], '')
         self.assertEqual(captured['window_back']['Claude 2 fable 7d'], '无此窗口')
-        self.assertEqual(captured['no_reading']['Claude 2 fable 7d'], '已就绪')
+        self.assertEqual(captured['no_reading']['Claude 2 fable 7d'], '')
         self.assertIsNone(captured['scan_callback_before'])
         self.assertGreater(captured['grew'], 20)
         self.assertTrue(callable(captured['scan_callback_after']))
