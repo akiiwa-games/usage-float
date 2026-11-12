@@ -1363,14 +1363,14 @@ class AntigravityUsageTests(unittest.TestCase):
 
 
 class MeteredUsdUsageTests(unittest.TestCase):
-    def test_openai_base_keeps_or_adds_v1(self) -> None:
+    def test_key_info_origin_drops_a_trailing_v1(self) -> None:
         self.assertEqual(
-            usage_float_module._metered_usd_urls("https://proxy.example.test/v1"),
-            ("https://proxy.example.test", "https://proxy.example.test/v1"),
+            usage_float_module._metered_usd_origin("https://proxy.example.test/v1"),
+            "https://proxy.example.test",
         )
         self.assertEqual(
-            usage_float_module._metered_usd_urls("https://proxy.example.test"),
-            ("https://proxy.example.test", "https://proxy.example.test/v1"),
+            usage_float_module._metered_usd_origin("https://proxy.example.test"),
+            "https://proxy.example.test",
         )
 
     def _override(self, directory: str, models: list[str]) -> None:
@@ -1448,6 +1448,36 @@ class MeteredUsdUsageTests(unittest.TestCase):
             finally:
                 usage_float_module._ACTIVE_LANGUAGE = previous
 
+    def test_timezone_only_old_settings_show_on_the_status_line(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            cfg = Path(temp_dir) / "config.json"
+            cfg.write_text(
+                json.dumps({"language": "en", "llm_proxy_timezone": "UTC+8"}),
+                encoding="utf-8",
+            )
+            previous = usage_float_module._ACTIVE_LANGUAGE
+            try:
+                with patch.object(usage_float_module, "CONFIG_PATH", cfg):
+                    usage_float_module.load_config()
+                    self.assertEqual(usage_float_module._OBSOLETE_SETTINGS_KEYS, ["llm_proxy_timezone"])
+                    self.assertIsNone(usage_float_module._OBSOLETE_SETTINGS_PROVIDER)
+                    self.assertEqual(
+                        usage_float_module.float_status_line(),
+                        "Old settings remain. Save once in settings to clear them, or run agentcompass setup.",
+                    )
+                    rows = usage_float_module._expand_display_rows([
+                        usage_float_module.ProviderUsage("claude", "claude", available=False, error="更新失败"),
+                    ])
+                    self.assertTrue(rows)
+                    notice = usage_float_module.float_status_line()
+                    self.assertTrue(all(notice not in (row.detail or "") for row in rows))
+                    self.assertTrue(all(notice not in (row.summary or "") for row in rows))
+                    self.assertNotIn("", [row.provider_id for row in rows])
+            finally:
+                usage_float_module._ACTIVE_LANGUAGE = previous
+                usage_float_module._OBSOLETE_SETTINGS_KEYS = []
+                usage_float_module._OBSOLETE_SETTINGS_PROVIDER = None
+
     def test_account_override_is_the_only_source(self) -> None:
         with TemporaryDirectory() as temp_dir:
             override = Path(temp_dir) / "accounts-override.json"
@@ -1466,10 +1496,10 @@ class MeteredUsdUsageTests(unittest.TestCase):
                 self.assertTrue(usage_float_module.provider_available("usd"))
                 self.assertFalse(usage_float_module.provider_available("api-proxy"))
                 found = usage_float_module.discover_metered_usd_accounts()["usd"]
-                self.assertEqual(found.openai_base, "https://proxy.example.test/v1")
                 self.assertEqual(found.origin, "https://proxy.example.test")
-                self.assertEqual(found.models, ("declared-model",))
-                self.assertNotIn("sk-team-proxy", found.openai_base)
+                self.assertFalse(hasattr(found, "openai_base"))
+                self.assertFalse(hasattr(found, "models"))
+                self.assertNotIn("sk-team-proxy", found.origin)
 
     def test_key_info_is_enough_and_a_balance_has_no_countdown(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -1766,9 +1796,11 @@ class ProviderConfigTests(unittest.TestCase):
                 proxies = usage_float_module.discover_metered_usd_accounts()
                 self.assertIn("team-proxy", proxies)
                 self.assertEqual(
-                    proxies["team-proxy"].openai_base,
-                    "https://proxy.example.test/v1",
+                    proxies["team-proxy"].origin,
+                    "https://proxy.example.test",
                 )
+                self.assertFalse(hasattr(proxies["team-proxy"], "openai_base"))
+                self.assertFalse(hasattr(proxies["team-proxy"], "models"))
                 self.assertTrue(usage_float_module.provider_available("team-proxy"))
                 self.assertTrue(usage_float_module.provider_available("pi"))
                 discovered = usage_float_module.discovered_default_providers()

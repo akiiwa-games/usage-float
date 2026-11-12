@@ -119,8 +119,8 @@ _EN_TEXT = {
     '额度': 'Quota',
     '已用': 'used',
     '无查询权限': 'No permission to query usage',
-    '旧的额度字段残留。运行 agentcompass setup，或在托盘里对该账号操作一次，即可清掉这些字段。':
-        'Old quota fields remain. Run agentcompass setup, or act on this account once in the tray, to clear them.',
+    '旧的额度字段残留。运行 agentcompass setup 清掉旧字段。':
+        'Old quota fields remain. Run agentcompass setup to clear the old fields.',
     '旧设置残留。在设置里保存一次即可清掉，或运行 agentcompass setup。':
         'Old settings remain. Save once in settings to clear them, or run agentcompass setup.',
     '正在由其他采集器更新': 'Another collector is updating usage',
@@ -4747,19 +4747,20 @@ def _obsolete_settings_notice() -> str:
     )
 
 
+def float_status_line() -> str:
+    """Leftover-settings notice for the status line and the settings page.
+
+    It does not depend on an account row. Empty when the file has no leftover keys.
+    """
+    if not _OBSOLETE_SETTINGS_KEYS:
+        return ""
+    return _obsolete_settings_notice()
+
+
 def _obsolete_proxy_keys(data: Any) -> list[str]:
     if not isinstance(data, dict):
         return []
     return [key for key in OBSOLETE_LLM_PROXY_KEYS if key in data]
-
-
-def _obsolete_proxy_message(keys: list[str]) -> str:
-    listed = ", ".join(keys)
-    return (
-        f"settings still have llm-proxy keys that no longer apply ({listed}). "
-        "A metered USD account is an accounts-override.json entry with endpoint, api_key and optional budget_usd, "
-        "and it does not reset. Remove those keys from the settings file."
-    )
 
 
 def read_collector_config() -> dict[str, Any]:
@@ -7263,10 +7264,8 @@ class MeteredUsdAccount:
     display_name: str
     api_key: str
     endpoint: str
-    openai_base: str
     origin: str
     budget_usd: float | None
-    models: tuple[str, ...]
 
 
 def _accounts_override_path() -> Path:
@@ -7276,12 +7275,12 @@ def _accounts_override_path() -> Path:
     return HOME / ".agent-compass" / "accounts-override.json"
 
 
-def _metered_usd_urls(endpoint: str) -> tuple[str, str]:
-    """(origin for /key/info, OpenAI base that ends in /v1)."""
+def _metered_usd_origin(endpoint: str) -> str:
+    """Origin for GET /key/info. A trailing /v1 is not part of the origin."""
     base = endpoint.strip().rstrip("/")
     if base.endswith("/v1"):
-        return base[:-3], base
-    return base, f"{base}/v1"
+        return base[:-3]
+    return base
 
 
 def _usd_number(value: Any, *, allow_zero: bool) -> float | None:
@@ -7296,13 +7295,6 @@ def _usd_number(value: Any, *, allow_zero: bool) -> float | None:
     if number < 0 or (number == 0 and not allow_zero):
         return None
     return number
-
-
-def _account_models(spec: dict[str, Any]) -> tuple[str, ...]:
-    raw = spec.get("models")
-    if not isinstance(raw, list):
-        return ()
-    return tuple(item.strip() for item in raw if isinstance(item, str) and item.strip())
 
 
 def discover_metered_usd_accounts() -> dict[str, MeteredUsdAccount]:
@@ -7330,8 +7322,8 @@ def discover_metered_usd_accounts() -> dict[str, MeteredUsdAccount]:
         key = str(spec.get("api_key") or "").strip()
         if not endpoint or not key:
             continue
-        origin, openai_base = _metered_usd_urls(endpoint)
-        if not origin or not openai_base:
+        origin = _metered_usd_origin(endpoint)
+        if not origin:
             continue
         label = str(spec.get("label") or pid).strip() or pid
         PROVIDER_LABELS.setdefault(pid, label)
@@ -7340,10 +7332,8 @@ def discover_metered_usd_accounts() -> dict[str, MeteredUsdAccount]:
             display_name=label,
             api_key=key,
             endpoint=endpoint,
-            openai_base=openai_base,
             origin=origin,
             budget_usd=_usd_number(spec.get("budget_usd"), allow_zero=False),
-            models=_account_models(spec),
         )
     return found
 
@@ -8451,11 +8441,6 @@ def _expand_display_rows(providers: list[ProviderUsage]) -> list[DisplayRow]:
                 provider_id=p.provider_id,
             )
         )
-    notice = _obsolete_settings_notice() if _OBSOLETE_SETTINGS_KEYS else ""
-    if notice and _OBSOLETE_SETTINGS_PROVIDER:
-        for row in rows:
-            if row.provider_id == _OBSOLETE_SETTINGS_PROVIDER:
-                row.detail = notice if not row.detail else f"{row.detail}\n{notice}"
     return rows
 
 
@@ -10900,7 +10885,9 @@ def run_ui() -> None:
             _configure_font_if_changed(font_panel_value, size=metrics.value_points)
             _configure_font_if_changed(font_panel_meta, size=metrics.meta_points)
             _configure_font_if_changed(font_panel_footer, size=metrics.footer_points)
-            message = _tr("正在读取用量…", 'Loading usage…') if state["refreshing"] else _tr("暂无用量数据", 'No usage data yet')
+            message = float_status_line() or (
+                _tr("正在读取用量…", 'Loading usage…') if state["refreshing"] else _tr("暂无用量数据", 'No usage data yet')
+            )
             empty = state.get("panel_empty_label")
             try:
                 if empty is not None and empty.winfo_exists():
@@ -11182,16 +11169,25 @@ def run_ui() -> None:
         content_w = max(120, cw - CARD_PADX * 2)
         row_h = int(state["row_height"])
 
-        if not providers and state["refreshing"]:
+        if not providers and state["refreshing"] and not _OBSOLETE_SETTINGS_KEYS:
             row = tk.Frame(lines_frame, bg=ui_bg)
             row.pack(fill="x", anchor="w")
             tk.Label(row, text=_tr("加载中…", 'Loading…'), fg=FG_MUTED, bg=ui_bg, font=font_main).pack(side="left")
             bind_drag(row)
             return
-        if not providers:
+        if not providers and not _OBSOLETE_SETTINGS_KEYS:
             row = tk.Frame(lines_frame, bg=ui_bg)
             row.pack(fill="x", anchor="w")
             tk.Label(row, text=_tr("暂无数据", 'No data yet'), fg=FG_MUTED, bg=ui_bg, font=font_main).pack(side="left")
+            bind_drag(row)
+            return
+        if not providers:
+            row = tk.Frame(lines_frame, bg=ui_bg)
+            row.pack(fill="x", anchor="w")
+            tk.Label(
+                row, text=float_status_line(), fg=FG_MUTED, bg=ui_bg, font=font_main,
+                wraplength=max(120, int(state["card_width"]) - CARD_PADX * 2), justify="left",
+            ).pack(side="left")
             bind_drag(row)
             return
 
@@ -11355,6 +11351,41 @@ def run_ui() -> None:
             refresh_control.bind("<Enter>", lambda _e: set_refresh_hover(True))
             refresh_control.bind("<Leave>", lambda _e: set_refresh_hover(False))
         state["refresh_control"] = refresh_control
+        notice = float_status_line()
+        status_label = state.get("obsolete_settings_label")
+        status_exists = False
+        try:
+            status_exists = bool(status_label is not None and status_label.winfo_exists())
+        except Exception:
+            status_exists = False
+        if notice and state.get("providers"):
+            if status_exists:
+                status_label.configure(
+                    text=notice,
+                    fg=PANEL_MUTED if state.get("panel_active") else FG_MUTED,
+                    bg=ui_bg,
+                    font=font_panel_footer if state.get("panel_active") else font_footer,
+                )
+            else:
+                status_label = tk.Label(
+                    footer,
+                    text=notice,
+                    fg=PANEL_MUTED if state.get("panel_active") else FG_MUTED,
+                    bg=ui_bg,
+                    font=font_panel_footer if state.get("panel_active") else font_footer,
+                    anchor="e",
+                    justify="right",
+                    wraplength=max(160, int(state.get("card_width") or 280) - 24),
+                )
+                status_label.pack(side="right", padx=(8, 0))
+                bind_drag(status_label)
+            state["obsolete_settings_label"] = status_label
+        elif status_exists:
+            try:
+                status_label.destroy()
+            except Exception:
+                pass
+            state["obsolete_settings_label"] = None
 
         def update_refresh_hitbox() -> None:
             if state.get("refresh_control") is not refresh_control:
@@ -12038,10 +12069,10 @@ def run_ui() -> None:
 
         language_combo.bind("<<ComboboxSelected>>", change_language)
 
-        if _OBSOLETE_SETTINGS_KEYS:
+        if float_status_line():
             tk.Label(
                 shell,
-                text=_obsolete_settings_notice(),
+                text=float_status_line(),
                 fg=S_TEXT,
                 bg=S_PAGE_BG,
                 font=settings_font,
