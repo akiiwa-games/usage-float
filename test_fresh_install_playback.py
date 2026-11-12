@@ -255,6 +255,15 @@ class WallpaperSourceChangeTests(unittest.TestCase):
         self.assertEqual(result["status_after_revisit"], "done", "mpv is present; no second download")
 
     def test_a_failed_download_shows_a_visible_retry_link(self) -> None:
+        """A failed download keeps the retry link on screen and records why.
+
+        233ea78 (Simplify settings copy and move details into hover hints) is the
+        rule for the folder summary in ``update_wallpaper_folder_status``: the
+        visible line is ``{enabled} 个目录 · {cached} 个媒体 · mpv {state}``, and
+        the long line, including ``mpv 下载失败：{error}``, is that label's hover
+        hint (``_detail``). 899c067 keeps the retry control in the button row so
+        the clipped lower edge of the folder card cannot hide it.
+        """
         import tkinter as tk
 
         def find_label(widget, prefix):
@@ -275,9 +284,10 @@ class WallpaperSourceChangeTests(unittest.TestCase):
             result["status"] = uf._MPV_PROVISIONER.snapshot().get("status")
             link = find_label(win, "重试下载 mpv")
             result["link_mapped"] = bool(link is not None and link.winfo_ismapped())
-            summary = find_label(win, "已启用 0 / 共 0 个目录")
-            result["summary_failed"] = summary is not None and "mpv 下载失败：test: download failed" in str(
-                summary.cget("text"))
+            # No folders and a failed provisioner: the short line names the state.
+            status_label = find_label(win, "0 个目录 · 0 个媒体 · mpv 下载失败")
+            result["status_text"] = None if status_label is None else str(status_label.cget("text"))
+            result["status_detail"] = None if status_label is None else str(getattr(status_label, "_detail", ""))
             if link is not None:
                 link.event_generate("<Button-1>")
                 pump(0.3)
@@ -286,7 +296,11 @@ class WallpaperSourceChangeTests(unittest.TestCase):
         result, calls = self.run_scenario(scenario, fail_download=True)
         self.assertEqual(result["status"], "failed")
         self.assertTrue(result["link_mapped"], "the retry link must be on screen, not clipped")
-        self.assertTrue(result["summary_failed"])
+        self.assertEqual(result["status_text"], "0 个目录 · 0 个媒体 · mpv 下载失败")
+        self.assertEqual(
+            result["status_detail"],
+            "已启用 0 / 共 0 个目录 · 已缓存 0 个媒体 · mpv 下载失败：test: download failed",
+        )
         self.assertEqual(calls["downloads"], 2, "clicking the link retries the download")
 
     def test_opening_settings_straight_onto_the_wallpaper_tab_starts_the_download(self) -> None:
