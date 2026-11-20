@@ -228,7 +228,7 @@ Queries the official `agy` CLI's structured output:
 agy -p /usage --output-format json
 ```
 
-Runs inside an empty temporary directory using the CLI's own login state without reading or copying tokens, enforces a 60-second timeout and 1 MiB output cap, and cleans up child processes on exit. Requires `agy` `1.1.11+` so older CLI versions never mistake `/usage` for a model prompt.
+Runs inside an empty temporary directory using the CLI's own login state without reading or copying tokens, enforces a 60-second timeout and 1 MiB output cap, and on Windows holds the query to its one process: when agy cannot refresh its sign-in it would open a browser page by starting another program, which a background read is refused, so the reading is reported as failed instead. A failed read is run once more after 8 seconds (the token-refresh gap); a read that used its whole time is not. Requires `agy` `1.1.11+` so older CLI versions never mistake `/usage` for a model prompt.
 
 ### Metered USD usage
 

@@ -1208,6 +1208,42 @@ class AntigravityUsageTests(unittest.TestCase):
                 self.assertTrue(rows[0].failed)
                 self.assertIsNone(rows[0].used_pct)
 
+    def test_a_read_that_used_its_whole_time_is_not_run_again(self) -> None:
+        """Rule (fetch_antigravity_usage): the retry is for the token gap, which answers at once; a run that
+        reached its time limit is waiting for a sign-in or a network, so it is reported and not repeated."""
+        with TemporaryDirectory() as directory, patch.object(
+            usage_float_module, "CACHE_PATH", Path(directory) / "cache.json"
+        ), patch.object(
+            usage_float_module, "ANTIGRAVITY_USAGE_RETRY_SECONDS", 0
+        ), patch.object(
+            usage_float_module, "find_antigravity_cli", return_value=Path("agy.exe")
+        ), patch.object(
+            usage_float_module, "_run_antigravity_cli", side_effect=[
+                "1.3.2", subprocess.TimeoutExpired("agy", 60), AssertionError("run again"),
+            ]
+        ) as run:
+            result = usage_float_module.fetch_antigravity_usage()
+
+        self.assertFalse(result.available)
+        self.assertEqual([call.args[1] for call in run.call_args_list], [
+            ["--version"], ["-p", "/usage", "--output-format", "json"],
+        ])
+
+    @unittest.skipUnless(os.name == "nt", "the job object is the Windows form of the rule")
+    def test_the_read_cannot_start_another_program(self) -> None:
+        """Rule (_antigravity_windows_job): a background read never opens a sign-in page. agy opens it by
+        starting a program, so the program the read runs is refused every start of another one."""
+        attempt = "\n".join((
+            "import subprocess, sys",
+            "try:",
+            '    subprocess.run([sys.executable, "-c", "pass"], check=True)',
+            '    print("started")',
+            "except OSError:",
+            '    print("refused")',
+        ))
+        answer = usage_float_module._run_antigravity_cli(Path(sys.executable), ["-c", attempt], timeout=60)
+        self.assertEqual(answer.strip(), "refused")
+
     def test_usage_failure_retries_once_and_keeps_the_second_result(self) -> None:
         with TemporaryDirectory() as directory, patch.object(
             usage_float_module, "CACHE_PATH", Path(directory) / "cache.json"
@@ -1319,7 +1355,9 @@ class AntigravityUsageTests(unittest.TestCase):
             usage_float_module._run_antigravity_cli(Path(sys.executable), ["-c", "print('x' * 128)"], timeout=5)
 
     @unittest.skipUnless(os.name == "nt", "Windows process-tree cleanup")
-    def test_runner_reaps_plugin_children_on_success_and_timeout(self) -> None:
+    def test_runner_ends_the_query_at_its_time_limit(self) -> None:
+        """Rule (_run_antigravity_cli): a query that reaches its time limit is ended with its job. It has no
+        children to reap: the job refuses every start of another program."""
         import ctypes
         from ctypes import wintypes
 
@@ -1329,37 +1367,25 @@ class AntigravityUsageTests(unittest.TestCase):
         kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
         kernel.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
         kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-        code = (
-            "import subprocess,sys,time; from pathlib import Path; "
-            "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
-            "Path(sys.argv[1]).write_text(str(child.pid)); time.sleep(float(sys.argv[2]))"
-        )
-        for delay in (0.2, 60):
-            with self.subTest(delay=delay), TemporaryDirectory() as directory:
-                pid_file = Path(directory) / "child.pid"
-                try:
-                    if delay == 60:
-                        with self.assertRaises(subprocess.TimeoutExpired):
-                            usage_float_module._run_antigravity_cli(
-                                Path(sys.executable), ["-c", code, str(pid_file), str(delay)], timeout=2
-                            )
-                    else:
-                        usage_float_module._run_antigravity_cli(
-                            Path(sys.executable), ["-c", code, str(pid_file), str(delay)], timeout=5
-                        )
-                    self.assertTrue(pid_file.exists(), "Child process was not launched")
-                finally:
-                    if pid_file.exists():
-                        handle = kernel.OpenProcess(0x100001, False, int(pid_file.read_text()))
-                        if handle:
-                            try:
-                                stopped = kernel.WaitForSingleObject(handle, 2000) == 0
-                                if not stopped:
-                                    kernel.TerminateProcess(handle, 1)
-                                    kernel.WaitForSingleObject(handle, 2000)
-                                self.assertTrue(stopped, "CLI left its child running")
-                            finally:
-                                kernel.CloseHandle(handle)
+        code = "import os,sys,time; from pathlib import Path; Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(60)"
+        with TemporaryDirectory() as directory:
+            pid_file = Path(directory) / "query.pid"
+            try:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    usage_float_module._run_antigravity_cli(Path(sys.executable), ["-c", code, str(pid_file)], timeout=2)
+                self.assertTrue(pid_file.exists(), "The query was not launched")
+            finally:
+                if pid_file.exists():
+                    handle = kernel.OpenProcess(0x100001, False, int(pid_file.read_text()))
+                    if handle:
+                        try:
+                            stopped = kernel.WaitForSingleObject(handle, 2000) == 0
+                            if not stopped:
+                                kernel.TerminateProcess(handle, 1)
+                                kernel.WaitForSingleObject(handle, 2000)
+                            self.assertTrue(stopped, "The query outlived its time limit")
+                        finally:
+                            kernel.CloseHandle(handle)
 
 
 class MeteredUsdUsageTests(unittest.TestCase):

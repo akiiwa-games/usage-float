@@ -7067,7 +7067,11 @@ def _antigravity_windows_job() -> tuple[Any, Any]:
     if not handle:
         raise ctypes.WinError(ctypes.get_last_error())
     limits = ExtendedLimits()
-    limits.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    # A read made in the background must never open a sign-in page. When agy cannot refresh its token it starts an
+    # interactive sign-in and opens the browser by starting another program; a job of one process refuses that
+    # start, as it refuses every helper the read does not need.
+    limits.basic.flags = 0x2000 | 0x8  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+    limits.basic.active_processes = 1
     if not kernel.SetInformationJobObject(handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
         error = ctypes.WinError(ctypes.get_last_error())
         kernel.CloseHandle(handle)
@@ -7237,8 +7241,10 @@ def fetch_antigravity_usage() -> ProviderUsage:
             raw = _run_antigravity_cli(binary, usage_args, timeout=60)
             windows = _parse_antigravity_usage(json.loads(raw))
             break
-        except Exception:
-            if attempt == 0:
+        except Exception as error:
+            # The retry is for the token gap, which answers at once. A run that used its whole time is waiting for
+            # a sign-in or a network that a second run would wait for again.
+            if attempt == 0 and not isinstance(error, subprocess.TimeoutExpired):
                 time.sleep(ANTIGRAVITY_USAGE_RETRY_SECONDS)
                 continue
             cached = cache_get_provider("antigravity")
