@@ -293,8 +293,9 @@ PROVIDER_DISPLAY_ITEMS: dict[str, tuple[str, ...]] = {
     },
 }
 
-# Display order. A provider needs local credentials (Antigravity needs its CLI),
-# so a machine with one Codex account shows one Codex row.
+# The shipped order and names of rows. It puts no row on a layout: the float and Settings list the rows of
+# accounts this machine has (provider_available), and a row of one of them that no saved list holds joins in
+# this order (resolve_provider_config). A machine with one Codex account shows one Codex account's rows.
 DEFAULT_PROVIDERS: tuple[str, ...] = (
     *PROVIDER_DISPLAY_ITEMS["codex"],
     *PROVIDER_DISPLAY_ITEMS["codex-2"],
@@ -4558,15 +4559,56 @@ def _unique_provider_ids(values: Any) -> list[str]:
     return out
 
 
+def _account_family(account: str) -> str:
+    """Accounts of one kind sit together: every Codex home, every Claude home."""
+    if account == "codex" or account.startswith("codex-") or account in CODEX_ACCOUNT_BY_ID:
+        return "codex"
+    if account == "claude" or account.startswith("claude-"):
+        return "claude"
+    return account
+
+
+def _shipped_rank(row: str) -> int:
+    """Position in the shipped order; rows it does not name come after it, in the order they were found."""
+    try:
+        return DEFAULT_PROVIDERS.index(row)
+    except ValueError:
+        return len(DEFAULT_PROVIDERS)
+
+
+def _insert_new_row(known: list[str], row: str) -> None:
+    """Place a row the layout has not seen: next to its account's rows, else after its kind's rows, else last."""
+    account = row.partition(":")[0]
+    siblings = PROVIDER_DISPLAY_ITEMS.get(account) or ()
+    if row in siblings:
+        index = siblings.index(row)
+        for before in reversed(siblings[:index]):
+            if before in known:
+                known.insert(known.index(before) + 1, row)
+                return
+        for after in siblings[index + 1:]:
+            if after in known:
+                known.insert(known.index(after), row)
+                return
+    family = _account_family(account)
+    kin = [i for i, pid in enumerate(known) if _account_family(pid.partition(":")[0]) == family]
+    if kin and ":" in row:
+        known.insert(kin[-1] + 1, row)
+    else:
+        known.append(row)
+
+
 def resolve_provider_config(
     providers: Any,
     disabled: Any = None,
     order: Any = None,
+    present: Any = None,
 ) -> tuple[list[str], list[str], list[str]]:
-    """Return (order, enabled, disabled) for HUD + settings.
+    """Return (order, enabled, disabled) over the saved rows, for the float and Settings.
 
-    Newly added DEFAULT_PROVIDERS are inserted into order and stay enabled
-    unless they already appear in ``disabled``.
+    Only rows the lists already hold come back. With ``present`` (rows of accounts this machine has now), a
+    present row the lists do not hold joins: next to its account's rows, else after rows of its kind, else at
+    the end, in the shipped order, and switched on. DEFAULT_PROVIDERS orders such rows; it adds none.
     """
     enabled_in = _unique_provider_ids(providers)
     disabled_list = _unique_provider_ids(disabled)
@@ -4574,25 +4616,214 @@ def resolve_provider_config(
         if 'grok' not in enabled_in:
             enabled_in.append('grok')
         disabled_list = [pid for pid in disabled_list if pid != 'grok']
+        # The retired name's place is Grok's place.
+        order = ['grok' if pid == 'grok-bot' else pid for pid in (order or [])]
     disabled_in = set(disabled_list)
     known = _unique_provider_ids(list(order or []) + enabled_in + disabled_list)
-    if not known:
-        known = list(DEFAULT_PROVIDERS)
-    for index, must in enumerate(DEFAULT_PROVIDERS):
-        if must not in known:
-            previous = DEFAULT_PROVIDERS[index - 1] if index else None
-            # A new row joins its account's rows ("codex-2:7d" after "codex:5h", "claude:7d" after "claude:fable").
-            account, previous_account = must.partition(":")[0], (previous or "").partition(":")[0]
-            if previous and previous in known and (account == previous_account or account.startswith(previous_account + "-")):
-                known.insert(known.index(previous) + 1, must)
-            else:
-                known.append(must)
-        if must not in disabled_in and must not in enabled_in:
-            enabled_in.append(must)
+    joining = [pid for pid in _unique_provider_ids(present) if pid not in known]
+    for row in sorted(joining, key=_shipped_rank):
+        _insert_new_row(known, row)
+        enabled_in.append(row)
     enabled_set = set(enabled_in) - disabled_in
     enabled = [pid for pid in known if pid in enabled_set]
     disabled_out = [pid for pid in known if pid not in enabled_set]
     return known, enabled, disabled_out
+
+
+def layout_lists(cfg: dict[str, Any]) -> dict[str, Any]:
+    """A copy of the saved layout lists in ``cfg``."""
+    columns = cfg.get("provider_columns")
+    return {
+        "provider_order": list(cfg.get("provider_order") or []),
+        "providers": list(cfg.get("providers") or []),
+        "disabled_providers": list(cfg.get("disabled_providers") or []),
+        "provider_columns": [list(col) for col in columns] if isinstance(columns, (list, tuple)) else columns,
+    }
+
+
+def _row_account(row: str) -> str:
+    """The account a row is read from, without discovery ("claude:5h" -> "claude")."""
+    return "grok" if row == "grok-bot" else row.partition(":")[0]
+
+
+def adopt_present_rows(cfg: dict[str, Any], present: Iterable[str], *, whole_accounts: bool = False) -> bool:
+    """Add rows of present accounts that no saved list holds to ``cfg`` in memory. True when one was added.
+
+    ``present`` is every row of the accounts this machine has now. A row a list already holds keeps its place
+    and its on/off, so a row switched off stays off. With ``whole_accounts`` (the float, ``once`` and the scan
+    Settings starts by itself) only an account none of whose rows is saved joins: an account another program
+    or the user saved with some of its rows gets no row added unasked; the scan button adds the rest. A new
+    row that goes to the shorter column counts only rows of present accounts. When nothing is new nothing is read.
+    """
+    present = list(present)
+    columns = cfg.get("provider_columns")
+    saved = {*(cfg.get("provider_order") or []), *(cfg.get("providers") or []), *(cfg.get("disabled_providers") or [])}
+    if isinstance(columns, (list, tuple)):
+        saved.update(pid for col in columns if isinstance(col, (list, tuple)) for pid in col)
+    joining = present
+    if whole_accounts:
+        held = {_row_account(pid) for pid in saved if isinstance(pid, str)}
+        joining = [pid for pid in present if _row_account(pid) not in held]
+    if all(pid in saved for pid in joining):
+        return False
+    saved = set(_unique_provider_ids(list(saved)))
+    if all(pid in saved for pid in _unique_provider_ids(joining)):
+        return False
+    order, enabled, disabled = resolve_provider_config(
+        cfg.get("providers"), cfg.get("disabled_providers"), cfg.get("provider_order"), present=joining,
+    )
+    accounts = {_row_account(pid) for pid in present}
+    left, right = resolve_provider_columns(
+        enabled, disabled, order, columns, counted=[pid for pid in order if _row_account(pid) in accounts])
+    cfg["provider_order"] = order
+    cfg["providers"] = enabled
+    cfg["disabled_providers"] = disabled
+    cfg["provider_columns"] = [left, right]
+    return True
+
+
+def provider_rows(provider_id: str) -> tuple[str, ...]:
+    """The layout rows of one account ("claude" -> its fable, 7d and 5h rows)."""
+    return PROVIDER_DISPLAY_ITEMS.get(provider_id) or (provider_id,)
+
+
+def merge_hidden_rows(
+    full_left: list[str],
+    full_right: list[str],
+    shown_left: list[str],
+    shown_right: list[str],
+) -> tuple[list[str], list[str]]:
+    """Lay the shown columns back over the saved ones, which also hold rows of absent accounts.
+
+    A hidden row stays right after the shown row it followed, and goes where that row goes. A hidden row with
+    no shown row above it stays at the top of its column.
+    """
+    shown = set(shown_left) | set(shown_right)
+    top: tuple[list[str], list[str]] = ([], [])
+    after: dict[str, list[str]] = {}
+    for column, items in enumerate((full_left, full_right)):
+        anchor: str | None = None
+        for pid in items:
+            if pid in shown:
+                anchor = pid
+            elif anchor is None:
+                top[column].append(pid)
+            else:
+                after.setdefault(anchor, []).append(pid)
+    columns: tuple[list[str], list[str]] = (list(top[0]), list(top[1]))
+    for column, items in enumerate((shown_left, shown_right)):
+        for pid in items:
+            columns[column].append(pid)
+            columns[column].extend(after.pop(pid, []))
+    for rest in after.values():  # a shown row that left the layout: what followed it stays
+        columns[0].extend(rest)
+    return columns[0], columns[1]
+
+
+# What decides that a saved row belongs to no kind of account this program has, rather than to an account that
+# is absent today: the row's id names its kind (an Antigravity window, Grok, Pi, OpenCode, a Claude home's
+# fable/7d/5h, a Codex home's 7d/5h); an id of any other name is looked up where such accounts are declared
+# (Paseo for a Claude or Codex home under its own name, accounts-override.json for a metered account), whether
+# enabled there or not. Only a registry file that exists, can be read and lacks the entry decides "no kind": a
+# missing file, like one that cannot be read, decides nothing and its rows stay (hidden while absent).
+_CLAUDE_ROW_WINDOWS: tuple[str, ...] = tuple(item.partition(":")[2] for item in CLAUDE_DISPLAY_ITEMS)
+_CODEX_ROW_WINDOWS: tuple[str, ...] = tuple(CODEX_WINDOW_SUFFIXES.values())
+_SINGLE_ROW_ACCOUNTS: tuple[str, ...] = ("grok", "pi", "opencode")
+
+
+def _read_registry(path: Path) -> dict[str, Any] | None:
+    """A JSON registry object, or None when the file is missing or cannot be read: then it decides nothing."""
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def _declared_paseo_kinds() -> dict[str, str] | None:
+    doc = _read_registry(Path(os.environ.get("PASEO_CONFIG") or HOME / ".paseo" / "config.json"))
+    if doc is None:
+        return None
+    agents = doc.get("agents", {})
+    providers = agents.get("providers", {}) if isinstance(agents, dict) else None
+    if not isinstance(providers, dict):
+        return None  # a shape this program cannot read
+    kinds: dict[str, str] = {}
+    for pid, spec in providers.items():
+        if isinstance(pid, str) and isinstance(spec, dict):
+            extends = str(spec.get("extends") or "").strip().lower()
+            if extends in ("claude", "codex"):
+                kinds[pid] = extends
+    return kinds
+
+
+def _declared_metered_accounts() -> set[str] | None:
+    doc = _read_registry(_accounts_override_path())
+    if doc is None:
+        return None
+    accounts = doc.get("accounts", {})
+    if not isinstance(accounts, dict):
+        return None  # a shape this program cannot read
+    return {
+        pid for pid, spec in accounts.items()
+        if isinstance(spec, dict) and str(spec.get("billing") or "").strip().lower() == "metered"
+    }
+
+
+def rows_of_no_kind(rows: Iterable[str]) -> list[str]:
+    """Saved rows that no kind of account of this program can ever have (see the note above)."""
+    paseo: Any = ...
+    metered: Any = ...
+    out: list[str] = []
+    for row in dict.fromkeys(rows):
+        account, sep, window = row.partition(":")
+        if row in ANTIGRAVITY_DISPLAY_ITEMS or row in _SINGLE_ROW_ACCOUNTS or row == "antigravity":
+            continue
+        if account in ("antigravity", *_SINGLE_ROW_ACCOUNTS):
+            out.append(row)  # a window these accounts do not have
+            continue
+        family = _account_family(account)
+        if sep:
+            if family == "claude" and window in _CLAUDE_ROW_WINDOWS:
+                continue
+            if family == "codex" and window in _CODEX_ROW_WINDOWS:
+                continue
+            if family in ("claude", "codex") or window not in (*_CLAUDE_ROW_WINDOWS, *_CODEX_ROW_WINDOWS):
+                out.append(row)
+                continue
+            if paseo is ...:
+                paseo = _declared_paseo_kinds()
+            if paseo is None:
+                continue
+            kind = paseo.get(account)
+            if not (kind == "claude" and window in _CLAUDE_ROW_WINDOWS
+                    or kind == "codex" and window in _CODEX_ROW_WINDOWS):
+                out.append(row)
+            continue
+        if family in ("claude", "codex"):
+            continue  # an old entry for a whole account
+        if metered is ...:
+            metered = _declared_metered_accounts()
+        if metered is not None and row not in metered:
+            out.append(row)
+    return out
+
+
+def drop_rows_of_no_kind(cfg: dict[str, Any]) -> list[str]:
+    """Remove rows of no kind from the saved layout lists in ``cfg``; return them."""
+    lists = [key for key in ("provider_order", "providers", "disabled_providers") if isinstance(cfg.get(key), list)]
+    columns = cfg.get("provider_columns")
+    columns = [list(col) for col in columns[:2]] if isinstance(columns, (list, tuple)) and len(columns) >= 2 else None
+    saved = [pid for key in lists for pid in cfg[key] if isinstance(pid, str)]
+    saved += [pid for col in columns or [] for pid in col if isinstance(pid, str)]
+    gone = set(rows_of_no_kind(saved))
+    if not gone:
+        return []
+    for key in lists:
+        cfg[key] = [pid for pid in cfg[key] if pid not in gone]
+    if columns is not None:
+        cfg["provider_columns"] = [[pid for pid in col if pid not in gone] for col in columns]
+    return sorted(gone)
 
 
 def move_provider(order: list[str], source: str, target: str) -> list[str]:
@@ -4611,13 +4842,17 @@ def resolve_provider_columns(
     disabled: Any = None,
     order: Any = None,
     columns: Any = None,
+    counted: Any = None,
 ) -> tuple[list[str], list[str]]:
     """Return (left_column, right_column) for the two-column usage layout.
 
     When ``columns`` was already persisted, keep every item's column and row
-    position (including unchecked gray items). Otherwise seed the two columns so
-    enabled items match the panel's left/right split and disabled items balance
-    the remaining slots.
+    position (including unchecked gray items, and rows of absent accounts). A row
+    the saved columns do not hold joins the row before it in ``order`` when that
+    row is of the same account or kind, else the shorter column, counting only
+    ``counted`` rows when given (the rows the page shows). Otherwise seed
+    the two columns so enabled items match the panel's left/right split and
+    disabled items balance the remaining slots.
     """
     known, enabled, disabled_out = resolve_provider_config(providers, disabled, order)
     valid = set(known)
@@ -4629,7 +4864,10 @@ def resolve_provider_columns(
     elif isinstance(columns, (list, tuple)) and len(columns) >= 2:
         raw_left, raw_right = columns[0], columns[1]
 
-    if isinstance(raw_left, (list, tuple)) and isinstance(raw_right, (list, tuple)):
+    # Saved columns with no row (a first run) are seeded like no columns.
+    if isinstance(raw_left, (list, tuple)) and isinstance(raw_right, (list, tuple)) and (raw_left or raw_right):
+        if "grok-bot" in [*raw_left, *raw_right] and "grok" not in [*raw_left, *raw_right]:
+            raw_left, raw_right = (["grok" if pid == "grok-bot" else pid for pid in col] for col in (raw_left, raw_right))
         left = [pid for pid in _unique_provider_ids(raw_left) if pid in valid]
         left_set = set(left)
         right = [
@@ -4638,13 +4876,24 @@ def resolve_provider_columns(
             if pid in valid and pid not in left_set
         ]
         placed = left_set | set(right)
-        for pid in known:
-            if pid not in placed:
-                if len(left) <= len(right):
-                    left.append(pid)
-                else:
-                    right.append(pid)
-                placed.add(pid)
+        shown = set(counted) if counted is not None else None
+
+        def size(column: list[str]) -> int:
+            return len(column) if shown is None else sum(1 for item in column if item in shown)
+
+        for index, pid in enumerate(known):
+            if pid in placed:
+                continue
+            before = known[index - 1] if index else None
+            family = _account_family(pid.partition(":")[0])
+            if before in placed and _account_family(str(before).partition(":")[0]) == family:
+                column = left if before in left else right
+                column.insert(column.index(before) + 1, pid)
+            elif size(left) <= size(right):
+                left.append(pid)
+            else:
+                right.append(pid)
+            placed.add(pid)
         return left, right
 
     if not disabled_out or not enabled:
@@ -4689,23 +4938,23 @@ def scan_providers(
     configured: list[str] | None = None,
     order: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Scan known provider slots and report which ones have credentials."""
-    known, _enabled, _disabled = resolve_provider_config(
-        configured if configured is not None else discovered_default_providers(),
-        [],
-        order,
-    )
+    """Report, for each saved row and each row discovery can name, whether its account is on this machine now.
+
+    Saved rows come first in their order, then the rows discovery names, in the shipped order. The local check
+    runs once per account, not once per row.
+    """
+    known, _enabled, _disabled = resolve_provider_config(configured or [], [], order)
     for extra in discovered_default_providers():
-        if extra not in known and (configured is None or provider_available(extra)):
+        if extra not in known:
             known.append(extra)
-    return [
-        {
-            "id": pid,
-            "label": provider_label(pid),
-            "available": provider_available(pid),
-        }
-        for pid in known
-    ]
+    present: dict[str, bool] = {}
+    rows = []
+    for pid in known:
+        account = provider_fetch_id(pid)
+        if account not in present:
+            present[account] = provider_available(pid)
+        rows.append({"id": pid, "label": provider_label(pid), "available": present[account]})
+    return rows
 
 
 OBSOLETE_LLM_PROXY_KEYS = (
@@ -4782,8 +5031,9 @@ def load_config() -> dict[str, Any]:
         "always_on_top": True,
         "x": None,
         "y": None,
-        "providers": list(DEFAULT_PROVIDERS),
-        "provider_order": list(DEFAULT_PROVIDERS),
+        # Rows of this machine's accounts join when discovery or a reading finds them (adopt_present_rows).
+        "providers": [],
+        "provider_order": [],
         "disabled_providers": [],
         "provider_columns": None,
         "refresh_seconds": REFRESH_SECONDS,
@@ -5079,6 +5329,9 @@ def save_config(cfg: dict[str, Any]) -> None:
     global _ACTIVE_LANGUAGE, _OBSOLETE_SETTINGS_KEYS, _OBSOLETE_SETTINGS_PROVIDER
     for key in _obsolete_proxy_keys(cfg):
         cfg.pop(key, None)
+    # Like the keys above, a saved row no kind of account can have goes at the next save. Rows of an account
+    # that is only absent today stay, with their place and on/off.
+    drop_rows_of_no_kind(cfg)
     cfg["language"] = _lang(cfg)
     _ACTIVE_LANGUAGE = cfg["language"]
     if _docs_shot_active():
@@ -7738,6 +7991,7 @@ def provider_available(provider_id: str) -> bool:
 
 
 def discovered_default_providers() -> list[str]:
+    """Rows to check: the shipped rows, then rows of the accounts discovery found. Not all of them are present."""
     items = list(DEFAULT_PROVIDERS)
     for pid in discover_codex_accounts():
         for sub in PROVIDER_DISPLAY_ITEMS[pid]:
@@ -7764,7 +8018,11 @@ def active_providers(
     include_discovered: bool = False,
     disabled: list[str] | None = None,
 ) -> list[str]:
-    """Configured providers with local credentials or an installed agy CLI."""
+    """Configured providers with local credentials or an installed agy CLI.
+
+    With ``include_discovered``, a discovered row that neither list names (an account new to the layout) is
+    switched on; a row ``disabled`` names stays off, also while its account is absent.
+    """
     if configured is None:
         selected = discovered_default_providers()
     else:
@@ -7772,10 +8030,15 @@ def active_providers(
         if include_discovered:
             dis = set(disabled or [])
             for extra in discovered_default_providers():
-                if extra not in DEFAULT_PROVIDERS and extra not in dis and extra not in selected:
+                if extra not in dis and extra not in selected:
                     selected.append(extra)
     selected = list(dict.fromkeys('grok' if pid == 'grok-bot' else pid for pid in selected))
-    return [pid for pid in selected if provider_available(pid)]
+    present: dict[str, bool] = {}
+    for pid in selected:
+        account = provider_fetch_id(pid)
+        if account not in present:
+            present[account] = provider_available(pid)
+    return [pid for pid in selected if present[provider_fetch_id(pid)]]
 
 
 def refresh_local_activity(output: Path | None = None, now: float | None = None) -> dict[str, Any]:
@@ -10814,7 +11077,7 @@ def run_ui() -> None:
                 open_reset_ui(provider_id)
 
     def shown_items() -> list[str]:
-        return filter_providers(list(cfg.get("providers") or DEFAULT_PROVIDERS))
+        return filter_providers(list(cfg.get("providers") or []))
 
     def _right_text(dr: DisplayRow) -> tuple[str, str, str | None]:
         """Return (pct_text, time_text, fail_or_summary) for right side."""
@@ -11695,8 +11958,8 @@ def run_ui() -> None:
 
         def work() -> None:
             try:
-                selected = active_providers(list(cfg.get("providers") or DEFAULT_PROVIDERS), include_discovered=True, disabled=list(cfg.get("disabled_providers") or []))
-                configured = {provider_fetch_id(pid) for pid in cfg.get("providers") or DEFAULT_PROVIDERS}
+                selected = active_providers(list(cfg.get("providers") or []), include_discovered=True, disabled=list(cfg.get("disabled_providers") or []))
+                configured = {provider_fetch_id(pid) for pid in cfg.get("providers") or []}
                 # Credential discovery can temporarily return no accounts while
                 # login files are being replaced. Keep enabled UI history.
                 selected += [p.provider_id for p in previous if p.provider_id in configured]
@@ -11704,14 +11967,28 @@ def run_ui() -> None:
                 providers = fetch_display_usage(selected, previous, force=force)
             except Exception as error:
                 # Discovery itself can fail before collection starts.
-                selected = filter_providers([p.provider_id for p in previous] or list(cfg.get("providers") or DEFAULT_PROVIDERS))
+                selected = filter_providers([p.provider_id for p in previous] or list(cfg.get("providers") or []))
                 providers = merge_display_usage(None, previous, selected, f'更新失败 ({type(error).__name__})') if selected else []
-            root.after(0, lambda p=providers: apply_data(p))
+            # An account read for the first time joins the layout. Placing it may read discovery, so it is
+            # worked out here, off the Tk thread, and applied there.
+            before = layout_lists(cfg)
+            after = dict(before)
+            adopted = after if adopt_present_rows(
+                after, [row for p in providers for row in provider_rows(p.provider_id)], whole_accounts=True) else None
+            root.after(0, lambda p=providers, a=adopted, b=before: apply_data(p, a, b))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def apply_data(providers: list[ProviderUsage]) -> None:
+    def apply_data(
+        providers: list[ProviderUsage],
+        adopted: dict[str, Any] | None = None,
+        before: dict[str, Any] | None = None,
+    ) -> None:
         state["refreshing"] = False
+        # Rows of a newly read account join in memory; Settings saves them with the rest. Skipped when the
+        # layout changed meanwhile: the next refresh works it out again.
+        if adopted is not None and layout_lists(cfg) == before:
+            cfg.update(adopted)
         providers = merge_display_usage(
             providers,
             state["providers"],
@@ -11729,7 +12006,8 @@ def run_ui() -> None:
         # Avoid SetWindowPos(...SWP_SHOWWINDOW) on every refresh; it needlessly
         # invalidates the full-screen surface on mixed-DPI monitor layouts.
         render(relayout=not state.get("panel_active"))
-        # An open Settings window re-checks which rows the new readings can show.
+        # An open Settings window redraws: a new reading shows an account its last scan missed, and "无此窗口"
+        # follows the readings. It does not re-run the scan.
         on_readings = state.get("settings_readings_changed")
         if callable(on_readings):
             try:
@@ -12411,29 +12689,56 @@ def run_ui() -> None:
             return sync_scrollregion, on_mousewheel
 
         # ── Tab 1: 用量 (Two-column flat draggable bar grid) ──
-        provider_order = list(cfg.get("provider_order") or DEFAULT_PROVIDERS)
-        enabled_providers = list(cfg.get("providers") or DEFAULT_PROVIDERS)
-        disabled_seed = [pid for pid in provider_order if pid not in set(enabled_providers)]
-        init_order, init_enabled, _init_disabled = resolve_provider_config(
-            enabled_providers,
-            disabled_seed,
-            provider_order,
-        )
-        init_left, init_right = resolve_provider_columns(
-            init_enabled,
-            _init_disabled,
-            init_order,
-            cfg.get("provider_columns"),
-        )
-        left_col_items: list[str] = list(init_left)
-        right_col_items: list[str] = list(init_right)
-        provider_order[:] = list(left_col_items) + [
-            pid for pid in right_col_items if pid not in set(left_col_items)
-        ]
-        enabled_providers[:] = [
-            pid for pid in provider_order if pid in set(init_enabled)
-        ]
+        # cfg holds the whole saved layout, rows of absent accounts included. The page shows, and its drag,
+        # toggles and counts work on, only the rows of accounts this machine has: the lists below.
+        left_col_items: list[str] = []
+        right_col_items: list[str] = []
+        provider_order: list[str] = []
+        enabled_providers: list[str] = []
         scanned_cache: dict[str, dict[str, Any]] = {}
+        # answered: a scan has said which accounts are here (until then a saved row with no answer shows).
+        # seen: each account's reading time when that scan delivered; a later live reading is news to it.
+        scan_state: dict[str, Any] = {"answered": False, "seen": {}}
+
+        def reading_times() -> dict[str, Any]:
+            return {
+                p.provider_id: p.fetched_at for p in state.get("providers") or []
+                if p.available and not p.stale and (p.windows or p.summary)
+            }
+
+        def saved_layout() -> tuple[list[str], list[str], list[str]]:
+            """The saved columns, already normalized by load_config, persist and adoption; read, not resolved."""
+            columns = cfg.get("provider_columns")
+            if isinstance(columns, (list, tuple)) and len(columns) >= 2:
+                left, right = list(columns[0]), list(columns[1])
+            else:
+                left, right = [], []
+            placed = set(left) | set(right)
+            for pid in [*(cfg.get("provider_order") or []), *(cfg.get("providers") or []),
+                        *(cfg.get("disabled_providers") or [])]:
+                if pid not in placed:
+                    (left if len(left) <= len(right) else right).append(pid)
+                    placed.add(pid)
+            return left, right, list(cfg.get("providers") or [])
+
+        def sync_shown_rows() -> None:
+            seen = scan_state["seen"]
+            news = {account for account, at in reading_times().items() if seen.get(account) != at}
+
+            def row_shown(pid: str) -> bool:
+                row = scanned_cache.get(pid)
+                if row is not None and row.get("available"):
+                    return True
+                if _row_account(pid) in news:  # signed in after the scan: its reading says it is here
+                    return True
+                return row is None and not scan_state["answered"]
+
+            left, right, enabled = saved_layout()
+            left_col_items[:] = [pid for pid in left if row_shown(pid)]
+            right_col_items[:] = [pid for pid in right if row_shown(pid)]
+            provider_order[:] = left_col_items + right_col_items
+            on = set(enabled)
+            enabled_providers[:] = [pid for pid in provider_order if pid in on]
 
         providers_card = make_card(
             providers_pad,
@@ -12539,8 +12844,9 @@ def run_ui() -> None:
         bar_widgets_by_id: dict[str, tk.Frame] = {}
         bar_records: dict[str, dict[str, Any]] = {}
         slot_bounds: dict[str, tuple[int, int]] = {}
-        last_packed_cols: list[tuple[str, ...] | None] = [None, None]
+        last_packed_cols: list[Any] = [None, None, None]
         empty_boxes: list[tk.Frame] = []
+        empty_texts: list[tk.Label] = []
         for col_idx in range(2):
             eb = tk.Frame(
                 board_inner,
@@ -12549,14 +12855,16 @@ def run_ui() -> None:
                 padx=10,
                 pady=18,
             )
-            tk.Label(
+            empty_label = tk.Label(
                 eb,
                 text=_tr("拖动另一列的栏到此列", 'Drag rows from the other column here'),
                 fg=S_SUBTLE,
                 bg=S_BAR_OFF_BG,
                 font=settings_font_small,
-            ).pack()
+            )
+            empty_label.pack()
             empty_boxes.append(eb)
+            empty_texts.append(empty_label)
         bind_board_list_wheel(board_wrap)
 
         provider_drag: dict[str, Any] = {
@@ -12569,34 +12877,23 @@ def run_ui() -> None:
         }
 
         def persist_providers(*, refresh: bool = True, force_fetch: bool = False) -> None:
-            enabled_set = set(enabled_providers)
-            combined_order = list(left_col_items) + [
-                pid for pid in right_col_items if pid not in set(left_col_items)
-            ]
-            for pid in provider_order:
-                if pid not in combined_order:
-                    combined_order.append(pid)
-            disabled_list = [pid for pid in combined_order if pid not in enabled_set]
-            l_col, r_col = resolve_provider_columns(
-                [pid for pid in combined_order if pid in enabled_set],
-                disabled_list,
-                combined_order,
-                [left_col_items, right_col_items],
-            )
+            # Lay the shown rows over the saved layout: a hidden row keeps its on/off and stays after the row
+            # it followed (merge_hidden_rows); a row of no kind goes in save_config.
+            full_left, full_right, full_enabled = saved_layout()
+            shown = set(left_col_items) | set(right_col_items)
+            l_col, r_col = merge_hidden_rows(full_left, full_right, left_col_items, right_col_items)
+            enabled_set = {pid for pid in full_enabled if pid not in shown} | set(enabled_providers)
             order, enabled, disabled = resolve_provider_config(
                 [pid for pid in (l_col + r_col) if pid in enabled_set],
                 [pid for pid in (l_col + r_col) if pid not in enabled_set],
                 l_col + r_col,
             )
-            left_col_items[:] = l_col
-            right_col_items[:] = r_col
-            provider_order[:] = order
-            enabled_providers[:] = enabled
             cfg["provider_columns"] = [list(l_col), list(r_col)]
             cfg["provider_order"] = list(order)
             cfg["providers"] = list(enabled)
             cfg["disabled_providers"] = list(disabled)
             save_config(cfg)
+            sync_shown_rows()
             if refresh:
                 schedule_render(0)
                 loaded_ids = {
@@ -12673,8 +12970,7 @@ def run_ui() -> None:
                 enabled_set.remove(pid)
             else:
                 enabled_set.add(pid)
-            combined = list(left_col_items) + list(right_col_items)
-            enabled_providers[:] = [item for item in combined if item in enabled_set]
+            enabled_providers[:] = [item for item in left_col_items + right_col_items if item in enabled_set]
             persist_providers(refresh=True, force_fetch=False)
             render_provider_tree()
 
@@ -12879,11 +13175,14 @@ def run_ui() -> None:
                     if rid:
                         scanned_cache[rid] = row
                 state["provider_scan_cache"] = dict(scanned_cache)
-            elif not scanned_cache:
-                for row in scan_providers(enabled_providers, provider_order):
-                    rid = str(row.get("id") or "")
-                    if rid:
-                        scanned_cache[rid] = row
+                scan_state["answered"] = True
+                scan_state["seen"] = reading_times()
+                # A scan's new accounts join the layout in memory, like the float's readings do. The scan
+                # button has already added the missing rows of partly saved accounts (on_scan_providers).
+                adopt_present_rows(cfg, [rid for rid, row in scanned_cache.items() if row.get("available")],
+                                   whole_accounts=True)
+            if not provider_drag.get("item"):
+                sync_shown_rows()
 
             enabled_set = set(enabled_providers)
             dragging_id = provider_drag.get("item")
@@ -12897,18 +13196,13 @@ def run_ui() -> None:
                 )
 
                 for pid in col_list:
-                    info = scanned_cache.get(pid) or {
-                        "id": pid,
-                        "label": provider_label(pid),
-                        "available": provider_available(pid),
-                    }
+                    # Every listed row is of an account this machine has (sync_shown_rows).
                     checked = pid in enabled_set
                     is_dragging = pid == dragging_id
-                    available = bool(info.get("available"))
-                    lbl_text = str(info.get("label") or provider_label(pid))
-                    has_windows = windowless.get(pid) if available else None
+                    lbl_text = str((scanned_cache.get(pid) or {}).get("label") or provider_label(pid))
+                    has_windows = windowless.get(pid)
                     no_window = has_windows is not None
-                    sig = (checked, is_dragging, available, lbl_text, has_windows)
+                    sig = (checked, is_dragging, lbl_text, has_windows)
                     rec = _ensure_bar_record(pid)
                     if rec.get("sig") == sig:
                         continue
@@ -12924,7 +13218,7 @@ def run_ui() -> None:
                         card_bg = S_BAR_ON_BG
                         border_col = S_BAR_ON_BORDER
                         title_fg = S_TEXT
-                        meta_fg = S_ACCENT if available and not no_window else S_MUTED
+                        meta_fg = S_MUTED if no_window else S_ACCENT
                         check_fg = S_ACCENT
                     else:
                         card_bg = S_BAR_OFF_BG
@@ -12937,10 +13231,8 @@ def run_ui() -> None:
                         badge_text = _tr("拖动中", 'Dragging')
                     elif checked and no_window:
                         badge_text = _tr("无此窗口", 'No such window')
-                    elif checked:
-                        badge_text = '' if available else _tr("未检测", 'Missing')
                     else:
-                        badge_text = '' if available else _tr("未检测", 'Missing')
+                        badge_text = ''
 
                     rec["bar"].configure(
                         bg=card_bg,
@@ -12973,26 +13265,32 @@ def run_ui() -> None:
                             "This account's latest reading has no such window, so the float shows no row "
                             "for it; it shows again when the window comes back. Windows read: {0}").format(
                             ", ".join(has_windows) if has_windows else "—")
-                        if no_window and checked and not is_dragging else
-                        _tr("未检测到此账号，扫描账号可更新检测结果。",
-                            "Account not detected. Scan accounts to update its status.")
-                        if not available else ""
+                        if no_window and checked and not is_dragging else ""
                     )
 
-            cols_now = (tuple(left_col_items), tuple(right_col_items))
-            if (last_packed_cols[0], last_packed_cols[1]) != cols_now:
+            cols_now = (tuple(left_col_items), tuple(right_col_items), bool(scan_state["answered"]))
+            if (last_packed_cols[0], last_packed_cols[1], last_packed_cols[2]) != cols_now:
                 last_packed_cols[0] = cols_now[0]
                 last_packed_cols[1] = cols_now[1]
+                last_packed_cols[2] = cols_now[2]
                 active_ids = set(left_col_items) | set(right_col_items)
                 with _freeze_redraw(board_inner):
                     for pid, rec in bar_records.items():
                         if pid not in active_ids and rec.get("cell") is not None:
                             rec["bar"].grid_forget()
                             rec["cell"] = None
+                    # No row: one box across both columns. "暂无数据" once a scan found no account,
+                    # "加载中…" while no scan has answered yet.
+                    nothing = not left_col_items and not right_col_items
+                    empty_texts[0].configure(text=(
+                        (_tr("暂无数据", 'No data yet') if scan_state["answered"] else _tr("加载中…", 'Loading…'))
+                        if nothing else empty_texts[1].cget("text")))
                     for col_idx, col_list in enumerate((left_col_items, right_col_items)):
-                        if not col_list:
+                        if nothing and col_idx:
+                            empty_boxes[col_idx].grid_forget()
+                        elif not col_list:
                             empty_boxes[col_idx].grid(
-                                row=1, column=col_idx, sticky="ew", padx=4, pady=3
+                                row=1, column=col_idx, columnspan=2 if nothing else 1, sticky="ew", padx=4, pady=3
                             )
                         else:
                             empty_boxes[col_idx].grid_forget()
@@ -13016,37 +13314,29 @@ def run_ui() -> None:
                 else:
                     slot_bounds.clear()
 
-            available_count = sum(1 for row in scanned_cache.values() if row.get("available"))
-            text = (
-                _tr(f"已启用 {len(enabled_providers)} / {len(provider_order)}"
-                f"（左 {sum(1 for p in left_col_items if p in enabled_set)} · "
-                f"右 {sum(1 for p in right_col_items if p in enabled_set)}）"
-                f" · 可用 {available_count}", f'Enabled {len(enabled_providers)} / {len(provider_order)} (left {sum(1 for p in left_col_items if p in enabled_set)} · right {sum(1 for p in right_col_items if p in enabled_set)}) · Available {available_count}')
+            # Counts of the rows on the page. Each is of an account this machine has, so no separate "available" count.
+            on_left = sum(1 for p in left_col_items if p in enabled_set)
+            on_right = sum(1 for p in right_col_items if p in enabled_set)
+            shown_total = len(left_col_items) + len(right_col_items)
+            text = _tr(
+                f"已启用 {on_left + on_right} / {shown_total}（左 {on_left} · 右 {on_right}）",
+                f'Enabled {on_left + on_right} / {shown_total} (left {on_left} · right {on_right})',
             )
             if note:
                 text = f"{text} · {note}"
             provider_status.configure(text=text)
 
         def on_scan_providers() -> None:
-            scanned = scan_providers(enabled_providers, provider_order)
-            changed = False
-            for row in scanned:
-                pid = str(row.get("id") or "")
-                if not pid or pid in provider_order:
-                    continue
-                provider_order.append(pid)
-                if len(left_col_items) <= len(right_col_items):
-                    left_col_items.append(pid)
-                else:
-                    right_col_items.append(pid)
-                if pid not in enabled_providers:
-                    enabled_providers.append(pid)
-                changed = True
+            # A new account's rows join the saved layout and are saved. An absent account's rows leave the page
+            # and stay saved.
+            scanned = scan_providers(list(cfg.get("providers") or []), list(cfg.get("provider_order") or []))
+            changed = adopt_present_rows(cfg, [str(row.get("id")) for row in scanned if row.get("available")])
+            render_provider_tree(scanned, note=_tr("已扫描", 'Scanned'))
             if changed:
                 persist_providers(refresh=True, force_fetch=True)
+                render_provider_tree(note=_tr("已扫描", 'Scanned'))
             else:
                 refresh_async(force=True)
-            render_provider_tree(scanned, note=_tr("已扫描", 'Scanned'))
 
         def on_balance_columns() -> None:
             combined = list(left_col_items) + [
@@ -13089,26 +13379,41 @@ def run_ui() -> None:
         def seed_provider_scan() -> None:
             """Fill the board from what is already known, so opening never waits on credential checks.
 
-            The last scan (this process) is reused as is; before any scan an account counts as
-            detected when it already has a reading. scan_in_background then corrects both.
+            The last scan of this process is reused as is. Without one, the saved rows show until
+            scan_in_background answers; a live reading shows its account either way.
             """
             last = state.get("provider_scan_cache") or {}
-            read = {p.provider_id for p in state.get("providers") or [] if p.windows or p.summary}
-            for pid in dict.fromkeys([*left_col_items, *right_col_items, *provider_order]):
-                row = last.get(pid)
-                scanned_cache[pid] = dict(row) if isinstance(row, dict) else {
-                    "id": pid,
-                    "label": provider_label(pid),
-                    "available": provider_fetch_id(pid) in read,
-                }
+            for pid, row in last.items():
+                if isinstance(row, dict):
+                    scanned_cache[pid] = dict(row)
+            scan_state["answered"] = bool(scanned_cache)
+            scan_state["seen"] = reading_times() if scanned_cache else {}
+
+        def scan_failed() -> None:
+            # Logged by the caller; the page forgets the old answer and shows the saved rows again.
+            scanned_cache.clear()
+            state["provider_scan_cache"] = {}
+            scan_state["answered"] = False
+            scan_state["seen"] = {}
+            render_provider_tree()
 
         def scan_in_background() -> None:
-            configured, order = list(enabled_providers), list(provider_order)
+            configured, order = list(cfg.get("providers") or []), list(cfg.get("provider_order") or [])
 
             def work() -> None:
                 try:
                     rows = scan_providers(configured, order)
                 except Exception:
+                    _log_exception("settings account scan")
+
+                    def failed() -> None:
+                        if state.get("settings_win") is win and win.winfo_exists():
+                            scan_failed()
+
+                    try:
+                        root.after(0, failed)
+                    except Exception:
+                        pass
                     return
 
                 def deliver() -> None:
@@ -16280,11 +16585,10 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "once":
         once_cfg = load_config()
         providers = refresh_usage(
-            active_providers(list(once_cfg.get("providers") or DEFAULT_PROVIDERS), include_discovered=True, disabled=list(once_cfg.get("disabled_providers") or [])),
+            active_providers(list(once_cfg.get("providers") or []), include_discovered=True, disabled=list(once_cfg.get("disabled_providers") or [])),
         )
-        for row in iter_display_rows(
-            providers, list(once_cfg.get("providers") or DEFAULT_PROVIDERS)
-        ):
+        adopt_present_rows(once_cfg, [row for p in providers for row in provider_rows(p.provider_id)], whole_accounts=True)
+        for row in iter_display_rows(providers, list(once_cfg.get("providers") or [])):
             if row.failed:
                 print(_tr(f"{row.title}  更新失败", f'{row.title}  Update failed'))
                 continue

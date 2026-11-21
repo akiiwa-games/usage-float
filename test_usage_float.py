@@ -992,16 +992,20 @@ class CodexMultiAccountTests(unittest.TestCase):
             config_path.write_text(
                 json.dumps({"providers": ["claude", "codex", "grok"]}), encoding="utf-8"
             )
-            with patch.object(usage_float_module, "CONFIG_PATH", config_path):
+            with patch.object(usage_float_module, "CONFIG_PATH", config_path), \
+                    patch.object(usage_float_module, "discover_claude_homes", return_value={"claude": Path(temp_dir)}):
                 config = usage_float_module.load_config()
+                # The shipped list adds no row; the second account's rows join when it is present.
+                self.assertEqual(config["provider_order"], ["claude:fable", "claude:7d", "claude:5h", "codex:7d", "codex:5h", "grok"])
+                self.assertTrue(usage_float_module.adopt_present_rows(config, ["codex-2:7d", "codex-2:5h"]))
 
         self.assertEqual(
             config["providers"],
-            ["claude:fable", "claude:7d", "claude:5h", "codex:7d", "codex:5h", "codex-2:7d", "codex-2:5h", "grok", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS],
+            ["claude:fable", "claude:7d", "claude:5h", "codex:7d", "codex:5h", "codex-2:7d", "codex-2:5h", "grok"],
         )
         self.assertEqual(
             config["provider_order"],
-            ["claude:fable", "claude:7d", "claude:5h", "codex:7d", "codex:5h", "codex-2:7d", "codex-2:5h", "grok", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS],
+            ["claude:fable", "claude:7d", "claude:5h", "codex:7d", "codex:5h", "codex-2:7d", "codex-2:5h", "grok"],
         )
         self.assertEqual(config["disabled_providers"], [])
 
@@ -1674,15 +1678,17 @@ class MeteredUsdUsageTests(unittest.TestCase):
 
 
 class ProviderConfigTests(unittest.TestCase):
-    def test_new_defaults_are_enabled_unless_already_disabled(self) -> None:
+    def test_new_present_rows_are_enabled_unless_already_disabled(self) -> None:
+        present = ["codex-2:7d", "codex-2:5h", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS]
         order, enabled, disabled = usage_float_module.resolve_provider_config(
             ["claude", "codex", "grok"],
-            [],
+            ["antigravity:3p-5h"],
             ["claude", "codex", "grok"],
+            present=present,
         )
         self.assertEqual(order, ["claude:fable", "claude:7d", "claude:5h", "codex:7d", "codex:5h", "codex-2:7d", "codex-2:5h", "grok", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS])
-        self.assertEqual(enabled, ["claude:fable", "claude:7d", "claude:5h", "codex:7d", "codex:5h", "codex-2:7d", "codex-2:5h", "grok", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS])
-        self.assertEqual(disabled, [])
+        self.assertEqual(enabled, [pid for pid in order if pid != "antigravity:3p-5h"])
+        self.assertEqual(disabled, ["antigravity:3p-5h"])
 
     def test_disabled_providers_keep_order_and_stay_hidden(self) -> None:
         order, enabled, disabled = usage_float_module.resolve_provider_config(
@@ -1690,8 +1696,8 @@ class ProviderConfigTests(unittest.TestCase):
             ["claude"],
             ["grok", "codex", "claude"],
         )
-        self.assertEqual(order, ["grok", "codex:7d", "codex:5h", "codex-2:7d", "codex-2:5h", "claude:fable", "claude:7d", "claude:5h", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS])
-        self.assertEqual(enabled, ["grok", "codex:7d", "codex:5h", "codex-2:7d", "codex-2:5h", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS])
+        self.assertEqual(order, ["grok", "codex:7d", "codex:5h", "claude:fable", "claude:7d", "claude:5h"])
+        self.assertEqual(enabled, ["grok", "codex:7d", "codex:5h"])
         self.assertEqual(disabled, ["claude:fable", "claude:7d", "claude:5h"])
 
     def test_unchecking_every_row_stays_empty(self) -> None:
@@ -1736,9 +1742,9 @@ class ProviderConfigTests(unittest.TestCase):
 
         self.assertEqual(
             config["provider_order"],
-            ["grok", "codex:7d", "codex:5h", "codex-2:7d", "codex-2:5h", "claude:fable", "claude:7d", "claude:5h", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS],
+            ["grok", "codex:7d", "codex:5h", "claude:fable", "claude:7d", "claude:5h"],
         )
-        self.assertEqual(config["providers"], ["grok", "codex:7d", "codex:5h", "codex-2:7d", "codex-2:5h", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS])
+        self.assertEqual(config["providers"], ["grok", "codex:7d", "codex:5h"])
         self.assertEqual(config["disabled_providers"], ["claude:fable", "claude:7d", "claude:5h"])
 
     def test_scan_providers_reports_login_state_in_saved_order(self) -> None:
@@ -1764,17 +1770,18 @@ class ProviderConfigTests(unittest.TestCase):
                 ["grok", "codex", "claude"],
             )
 
+        # Saved rows in their order, then the rows discovery names.
         self.assertEqual(
             [row["id"] for row in rows],
-            ["grok", "codex:7d", "codex:5h", "codex-2:7d", "codex-2:5h", "claude:fable", "claude:7d", "claude:5h", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS],
+            ["grok", "codex:7d", "codex:5h", "claude:fable", "claude:7d", "claude:5h", "codex-2:7d", "codex-2:5h", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS],
         )
         self.assertEqual(rows[0]["label"], "Grok")
         self.assertEqual(rows[1]["label"], "Codex 7d")
-        self.assertEqual(rows[5]["label"], "fable 7d")
+        self.assertEqual(rows[3]["label"], "fable 7d")
         self.assertTrue(rows[0]["available"])
         self.assertTrue(rows[1]["available"])
         self.assertFalse(rows[3]["available"])
-        self.assertFalse(rows[5]["available"])
+        self.assertFalse(rows[6]["available"])
 
     def test_discover_metered_usd_from_accounts_override_and_pi_usage(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -3015,6 +3022,746 @@ class SettingsWindowStatusTests(unittest.TestCase):
         self.assertTrue(captured['closed'])
         self.assertEqual(captured['saved']['font_size'], 11)
         self.assertTrue(set(items) <= set(captured['saved']['providers']))
+
+
+class LocalAccountLayoutTests(unittest.TestCase):
+    """Settings -> Usage layout lists the rows of accounts this machine has. Saved choices outlive an absent account."""
+
+    CODEX = ["codex:7d", "codex:5h"]
+    CODEX_2 = ["codex-2:7d", "codex-2:5h"]
+    CLAUDE = ["claude:fable", "claude:7d", "claude:5h"]
+    CLAUDE_3 = ["claude-3:fable", "claude-3:7d", "claude-3:5h"]
+    AGY = list(usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS)
+
+    def fake_machine(self, accounts, *, extra_rows=(), calls=None):
+        """Discovery and the local credential check answer from ``accounts``; no real home is read."""
+        from contextlib import ExitStack
+
+        native = usage_float_module
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        temporary = Path(stack.enter_context(TemporaryDirectory()))
+        present = accounts  # a set the test may change in place
+
+        def available(pid):
+            account = native.provider_fetch_id(pid)
+            if calls is not None:
+                calls.append(account)
+            return account in present
+
+        def codex_accounts():
+            return {
+                pid: native.CodexAccount(pid, pid, temporary / pid)
+                for pid in present if pid == "codex" or pid.startswith("codex-")
+            }
+
+        def claude_homes():
+            homes = {"claude": temporary / "claude"}
+            homes.update({pid: temporary / pid for pid in present if pid.startswith("claude-")})
+            return homes
+
+        stack.enter_context(patch.object(native, "provider_available", side_effect=available))
+        stack.enter_context(patch.object(
+            native, "discovered_default_providers",
+            side_effect=lambda: [*DEFAULT_PROVIDERS, *extra_rows]))
+        stack.enter_context(patch.object(native, "discover_codex_accounts", side_effect=codex_accounts))
+        stack.enter_context(patch.object(native, "discover_claude_homes", side_effect=claude_homes))
+        stack.enter_context(patch.object(native, "_read_paseo_providers", return_value={}))
+        stack.enter_context(patch.dict(native.os.environ, {
+            "AGENTCOMPASS_ACCOUNTS_OVERRIDE": str(temporary / "accounts-override.json"),
+            "PASEO_CONFIG": str(temporary / "paseo.json"),
+        }))
+        stack.enter_context(patch.object(native, "CONFIG_PATH", temporary / "config.json"))
+        return temporary
+
+    # The shipped list orders rows; it puts none on the layout.
+
+    def test_shipped_list_adds_no_row_of_an_absent_account(self):
+        native = usage_float_module
+        self.fake_machine({"codex"})
+        self.assertEqual(native.resolve_provider_config([], [], []), ([], [], []))
+        order, enabled, disabled = native.resolve_provider_config(["codex"], [], ["codex"])
+        self.assertEqual(order, self.CODEX)
+        self.assertEqual(enabled, self.CODEX)
+        self.assertEqual(disabled, [])
+
+    def test_rows_of_a_present_account_join_in_shipped_order(self):
+        native = usage_float_module
+        self.fake_machine({"codex", "codex-2", "codex-3", "claude", "grok", "usd"})
+        # First run: nothing saved; detected accounts in the shipped order, then the accounts it does not name.
+        order, enabled, disabled = native.resolve_provider_config([], [], [], present=[
+            "usd", "grok", "claude:5h", "codex-3:7d", "claude:fable", "codex:5h", "claude:7d", "codex:7d",
+            "codex-3:5h",
+        ])
+        expected = [*self.CODEX, "codex-3:7d", "codex-3:5h", "grok", *self.CLAUDE, "usd"]
+        self.assertEqual(order, expected)
+        self.assertEqual(enabled, expected)
+        self.assertEqual(disabled, [])
+        # A second Codex account joins under the first.
+        order, enabled, disabled = native.resolve_provider_config(
+            ["claude", "codex", "grok"], [], ["claude", "codex", "grok"], present=[*self.CODEX_2],
+        )
+        self.assertEqual(order, [*self.CLAUDE, *self.CODEX, *self.CODEX_2, "grok"])
+        self.assertEqual(enabled, order)
+        # A saved row keeps its place and stays off; the account's other row joins it.
+        order, enabled, disabled = native.resolve_provider_config(
+            ["codex"], ["codex-2:5h"], ["codex", "codex-2:5h"], present=[*self.CODEX_2],
+        )
+        self.assertEqual(order, [*self.CODEX, *self.CODEX_2])
+        self.assertEqual(disabled, ["codex-2:5h"])
+
+    def test_first_run_adopts_detected_accounts_for_the_float(self):
+        native = usage_float_module
+        self.fake_machine({"codex", "claude", "grok"})
+        cfg = native.load_config()
+        self.assertEqual((cfg["providers"], cfg["provider_order"], cfg["disabled_providers"]), ([], [], []))
+        self.assertTrue(native.adopt_present_rows(cfg, ["grok", *self.CLAUDE, *self.CODEX]))
+        self.assertEqual(cfg["provider_order"], [*self.CODEX, "grok", *self.CLAUDE])
+        self.assertEqual(cfg["providers"], cfg["provider_order"])
+        self.assertEqual(sum(cfg["provider_columns"], []), cfg["provider_order"])
+        self.assertFalse(native.adopt_present_rows(cfg, [*self.CODEX]))
+        # Switched off, then seen again: still off.
+        cfg["providers"] = [pid for pid in cfg["providers"] if pid != "grok"]
+        cfg["disabled_providers"] = ["grok"]
+        self.assertFalse(native.adopt_present_rows(cfg, ["grok"]))
+        self.assertNotIn("grok", cfg["providers"])
+
+    def _readings(self, *accounts):
+        native = usage_float_module
+        reset = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+        windows = {
+            "codex": [native.UsageWindow("usage", "7d", 10, reset), native.UsageWindow("five_hour", "5h", 10, reset)],
+            "claude": [native.UsageWindow("weekly_fable", "fable", 10, reset),
+                       native.UsageWindow("seven_day", "7d", 10, reset),
+                       native.UsageWindow("five_hour", "5h", 10, reset)],
+            "grok": [native.UsageWindow("credits", "Quota", 10, reset)],
+        }
+        now = datetime.now(timezone.utc).isoformat()
+        return [native.ProviderUsage(pid, pid, fetched_at=now, windows=windows[pid]) for pid in accounts]
+
+    def test_first_run_float_shows_detected_accounts_in_shipped_order(self):
+        import ast
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        native = usage_float_module
+        self.fake_machine({"grok", "claude", "codex"})
+        cfg = native.load_config()
+        tree = ast.parse(Path(native.__file__).read_text(encoding="utf-8"))
+        run_ui = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run_ui")
+        callbacks = [n for n in run_ui.body if isinstance(n, ast.FunctionDef)
+                     and n.name in ("refresh_async", "apply_data", "shown_items")]
+        state = {"providers": [], "refreshing": False}
+        scope = dict(vars(native), state=state, cfg=cfg,
+                     root=SimpleNamespace(after=lambda delay, callback: callback()),
+                     render_footer=Mock(), render=Mock(),
+                     threading=SimpleNamespace(Thread=lambda target, **kw: SimpleNamespace(start=target)))
+        exec(compile(ast.Module(body=callbacks, type_ignores=[]), native.__file__, "exec"), scope)
+        with patch.object(native, "fetch_display_usage",
+                          side_effect=lambda selected, previous, force: self._readings("grok", "claude", "codex")):
+            scope["refresh_async"](force=True)
+        self.assertEqual(scope["shown_items"](), [*self.CODEX, "grok", *self.CLAUDE])
+        rows = native.iter_display_rows(state["providers"], scope["shown_items"]())
+        self.assertEqual(list(dict.fromkeys(row.provider_id for row in rows)), ["codex", "grok", "claude"])
+
+    def test_once_prints_detected_accounts_on_first_run(self):
+        import contextlib
+        import io
+
+        native = usage_float_module
+        self.fake_machine({"grok", "codex"})
+        out = io.StringIO()
+        with patch.object(native, "refresh_usage", side_effect=lambda selected: self._readings("grok", "codex")), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(native.main(["once"]), 0)
+        self.assertEqual([line.split("  ")[0] for line in out.getvalue().splitlines()],
+                         ["codex 7d", "codex 5h", "grok"])
+
+    def test_the_float_turns_on_a_new_account_but_not_a_row_switched_off(self):
+        native = usage_float_module
+        self.fake_machine({"codex", "codex-2"})
+        active = native.active_providers(
+            ["codex:7d", "codex:5h"], include_discovered=True, disabled=["codex-2:5h"])
+        self.assertEqual(active, [*self.CODEX, "codex-2:7d"])
+
+    # Hidden rows keep their place.
+
+    def test_hidden_rows_follow_the_row_they_followed(self):
+        merge = usage_float_module.merge_hidden_rows
+        full = (["a", "h1", "b"], ["h0", "c", "h2"])
+        # "b" moves to the top of the right column; "h1" stays after "a", "h0" at the top of the right column.
+        self.assertEqual(merge(*full, ["a"], ["b", "c"]), (["a", "h1"], ["h0", "b", "c", "h2"]))
+        # "a" moves to the end of the right column; the hidden row after it goes with it.
+        self.assertEqual(merge(*full, ["b"], ["c", "a"]), (["b"], ["h0", "c", "h2", "a", "h1"]))
+        # Nothing moved: nothing changes.
+        self.assertEqual(merge(*full, ["a", "b"], ["c"]), full)
+
+    # A row no account kind can have.
+
+    def test_rows_of_no_kind_are_named_from_the_registries(self):
+        native = usage_float_module
+        temporary = self.fake_machine(set())
+        rows = [
+            *self.CODEX_2, "codex-5:7d", *self.CLAUDE_3, *self.AGY, "grok", "pi", "opencode", "codex-5",
+            "work:7d", "usd", "llmproxy", "grok:7d", "codex-2:fable", "antigravity:other", "gone:5h",
+        ]
+        dropped = ["llmproxy", "grok:7d", "codex-2:fable", "antigravity:other", "gone:5h"]
+        (temporary / "paseo.json").write_text(json.dumps({"agents": {"providers": {
+            "work": {"extends": "codex", "enabled": False},
+        }}}), encoding="utf-8")
+        (temporary / "accounts-override.json").write_text(json.dumps({"accounts": {
+            "usd": {"billing": "metered", "disabled": True},
+            "llmproxy": {"billing": "subscription"},
+        }}), encoding="utf-8")
+        self.assertEqual(native.rows_of_no_kind(rows), dropped)
+        # A registry that cannot be read decides nothing: its rows stay.
+        (temporary / "accounts-override.json").write_text("{", encoding="utf-8")
+        (temporary / "paseo.json").write_text("{", encoding="utf-8")
+        self.assertEqual(native.rows_of_no_kind(rows), ["grok:7d", "codex-2:fable", "antigravity:other"])
+
+    def test_save_drops_rows_of_no_kind_and_keeps_an_absent_account(self):
+        native = usage_float_module
+        temporary = self.fake_machine({"codex"})
+        (temporary / "accounts-override.json").write_text(json.dumps({"accounts": {}}), encoding="utf-8")
+        (temporary / "config.json").write_text(json.dumps({
+            "language": "zh",
+            "llm_proxy_provider_id": "llmproxy",
+            "provider_order": [*self.CODEX, *self.CODEX_2, "llmproxy"],
+            "providers": [*self.CODEX, "codex-2:7d", "llmproxy"],
+            "disabled_providers": ["codex-2:5h"],
+            "provider_columns": [[*self.CODEX, "llmproxy"], [*self.CODEX_2]],
+        }), encoding="utf-8")
+        try:
+            cfg = native.load_config()
+            self.assertTrue(native.float_status_line())
+            native.save_config(cfg)
+            saved = json.loads((temporary / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(native.float_status_line(), "")
+        finally:
+            native._OBSOLETE_SETTINGS_KEYS = []
+            native._OBSOLETE_SETTINGS_PROVIDER = None
+        self.assertNotIn("llm_proxy_provider_id", saved)
+        self.assertEqual(saved["provider_order"], [*self.CODEX, *self.CODEX_2])
+        self.assertEqual(saved["providers"], [*self.CODEX, "codex-2:7d"])
+        self.assertEqual(saved["disabled_providers"], ["codex-2:5h"])
+        self.assertEqual(saved["provider_columns"], [[*self.CODEX], [*self.CODEX_2]])
+
+    # The scan.
+
+    def test_scan_checks_each_account_once(self):
+        native = usage_float_module
+        calls: list[str] = []
+        self.fake_machine({"codex", "claude"}, calls=calls)
+        rows = native.scan_providers(["codex:7d"], ["codex:7d", "claude:7d"])
+        self.assertEqual(len(calls), len(set(calls)))
+        self.assertEqual(set(calls), {native.provider_fetch_id(row["id"]) for row in rows})
+        self.assertEqual([row["id"] for row in rows if row["available"]],
+                         ["codex:7d", "claude:7d", "codex:5h", "claude:fable", "claude:5h"])
+
+    # The page.
+
+    def _run_settings(self, actions, *, before_open=None, background_scan=False):
+        """Open Settings -> Usage in a run_ui whose window is never shown, then run ``actions(page)``.
+
+        ``before_open(scope)`` runs first. With ``background_scan`` the scan Settings starts at open runs at once
+        on this thread and delivers at once; other threads still do not start.
+        """
+        import tkinter as tk
+        from unittest import mock
+
+        native = usage_float_module
+        errors: list[object] = []
+        roots: list[object] = []
+
+        def start(thread):
+            if not background_scan or thread.name != "settings-provider-scan":
+                return
+            root = roots[-1]
+            root.after = lambda _ms, func=None, *args: func(*args)
+            try:
+                thread.run()
+            finally:
+                del root.after
+
+        class Page:
+            def __init__(self, scope, win):
+                self.scope, self.state, self.win = scope, scope["state"], win
+
+            def widgets(self, kind):
+                out, stack = [], [self.win]
+                while stack:
+                    widget = stack.pop()
+                    stack.extend(widget.winfo_children())
+                    if isinstance(widget, kind):
+                        out.append(widget)
+                return out
+
+            def _bars(self):
+                for frame in self.widgets(tk.Frame):
+                    labels = [c for c in frame.winfo_children() if isinstance(c, tk.Label)]
+                    if len(labels) == 4 and frame.winfo_manager() == "grid":
+                        info = frame.grid_info()
+                        yield int(info["column"]), int(info["row"]), labels
+
+            def rows(self):
+                """(title, badge, checkbox) of the rows on the board, left column then right, top to bottom."""
+                placed = sorted(
+                    (column, row, str(labels[1].cget("text")), str(labels[3].cget("text")),
+                     str(labels[0].cget("text")))
+                    for column, row, labels in self._bars()
+                )
+                return [(title, badge, check) for _c, _r, title, badge, check in placed]
+
+            def columns(self):
+                cols: tuple[list, list] = ([], [])
+                for column, row, labels in self._bars():
+                    cols[column].append((row, str(labels[1].cget("text"))))
+                return [[title for _r, title in sorted(col)] for col in cols]
+
+            def header(self):
+                for label in self.widgets(tk.Label):
+                    text = str(label.cget("text"))
+                    if text.startswith("已启用"):
+                        return text
+                return None
+
+            def empty_text(self):
+                texts = []
+                for frame in self.widgets(tk.Frame):
+                    children = frame.winfo_children()
+                    if (frame.winfo_manager() == "grid" and len(children) == 1
+                            and isinstance(children[0], tk.Label)):
+                        texts.append(str(children[0].cget("text")))
+                return texts
+
+            def press(self, text):
+                for button in self.widgets(tk.Button):
+                    if str(button.cget("text")) == text:
+                        button.invoke()
+                        self.win.update_idletasks()
+                        return
+                raise AssertionError(f"no button {text!r}")
+
+            def saved(self):
+                return json.loads(native.CONFIG_PATH.read_text(encoding="utf-8"))
+
+        def fake_mainloop(root, *args, **kwargs):
+            scope = sys._getframe(1).f_locals
+            roots.append(root)
+            try:
+                with mock.patch.object(tk.Wm, "deiconify"), mock.patch.object(tk.Misc, "focus_set"), \
+                        mock.patch.object(tk.Misc, "lift"):
+                    if before_open is not None:
+                        before_open(scope)
+                    scope["open_settings"]()
+                    win = scope["state"]["settings_win"]
+                    win.update_idletasks()
+                    actions(Page(scope, win))
+            finally:
+                scope["do_quit"]()
+
+        with patch.object(native, "fetch_all", return_value=[]), \
+                patch.object(native, "_report_tk_callback_exception",
+                             side_effect=lambda *exc: errors.append(exc)), \
+                patch.object(native.threading.Thread, "start", autospec=True, side_effect=start), \
+                patch.object(tk.Tk, "mainloop", fake_mainloop):
+            native.run_ui()
+        self.assertEqual(errors, [])
+
+    def test_layout_page_lists_the_accounts_this_machine_has(self):
+        accounts = {"codex", "codex-2", "grok", "claude", "antigravity"}
+        calls: list[str] = []
+        temporary = self.fake_machine(accounts, extra_rows=self.CLAUDE_3, calls=calls)
+        (temporary / "accounts-override.json").write_text(json.dumps({"accounts": {}}), encoding="utf-8")
+        (temporary / "config.json").write_text(json.dumps({
+            "language": "zh",
+            "provider_order": [*self.CODEX, *self.CODEX_2, "grok", *self.CLAUDE, "llmproxy"],
+            "providers": [*self.CODEX, "codex-2:7d", "grok", "claude:7d", "claude:5h", "llmproxy"],
+            "disabled_providers": ["codex-2:5h", "claude:fable"],
+            "provider_columns": [
+                ["codex:7d", "codex-2:7d", "codex-2:5h", "codex:5h", "llmproxy"],
+                ["grok", *self.CLAUDE],
+            ],
+        }), encoding="utf-8")
+        seen: dict[str, object] = {}
+
+        def actions(page):
+            # Every account of the shipped list is here; Antigravity is new and joins at the scan.
+            page.press("⟳ 扫描可用账号")
+            seen["all"] = page.rows()
+            seen["all_header"] = page.header()
+            seen["all_saved"] = page.saved()
+            calls.clear()
+            page.state["settings_readings_changed"]()
+            seen["redraw_checks"] = list(calls)
+
+            # One Codex account only.
+            accounts.clear()
+            accounts.add("codex")
+            page.press("⟳ 扫描可用账号")
+            seen["codex"] = page.rows()
+            seen["codex_header"] = page.header()
+            page.press("⇄ 自动均分两列")
+            seen["codex_columns"] = page.columns()
+            seen["codex_saved"] = page.saved()
+
+            # No account at all.
+            accounts.clear()
+            page.press("⟳ 扫描可用账号")
+            seen["none"] = page.rows()
+            seen["none_header"] = page.header()
+            seen["none_empty"] = page.empty_text()
+
+            # The second Codex account is back and a new Claude account was added while the page is open.
+            accounts.update({"codex", "codex-2", "claude-3"})
+            page.press("⟳ 扫描可用账号")
+            seen["back"] = page.rows()
+            seen["back_columns"] = page.columns()
+            seen["back_saved"] = page.saved()
+
+        self._run_settings(actions)
+
+        agy = ["agy gemini 7d", "agy gemini 5h", "agy claude 7d", "agy claude 5h"]
+        titles = [title for title, _badge, _check in seen["all"]]
+        self.assertEqual(sorted(titles), sorted([
+            "Codex 7d", "Codex 5h", "Codex 2 7d", "Codex 2 5h", "Grok", "fable 7d", "claude 7d", "claude 5h", *agy]))
+        self.assertNotIn("llmproxy", titles)
+        self.assertTrue(all(badge == "" for _title, badge, _check in seen["all"]))
+        self.assertEqual(seen["all_header"], "已启用 10 / 12（左 7 · 右 3） · 已扫描")
+        self.assertTrue(set(self.AGY) <= set(seen["all_saved"]["providers"]))
+        self.assertEqual(seen["redraw_checks"], [])
+
+        self.assertEqual(seen["codex"], [("Codex 7d", "", "☑"), ("Codex 5h", "", "☑")])
+        self.assertEqual(seen["codex_header"], "已启用 2 / 2（左 2 · 右 0） · 已扫描")
+        self.assertEqual(seen["codex_columns"], [["Codex 7d"], ["Codex 5h"]])
+        saved = seen["codex_saved"]
+        # The absent accounts keep their rows, their on/off and their places; the row of no kind is gone.
+        for key in ("provider_order", "providers", "disabled_providers"):
+            self.assertNotIn("llmproxy", saved[key])
+        self.assertNotIn("llmproxy", sum(saved["provider_columns"], []))
+        self.assertEqual(saved["disabled_providers"], ["codex-2:5h", "claude:fable"])
+        self.assertTrue({"codex-2:7d", "grok", "claude:7d", "claude:5h", *self.AGY} <= set(saved["providers"]))
+        left, right = saved["provider_columns"]
+        self.assertEqual(left[:3], ["codex:7d", "codex-2:7d", "codex-2:5h"])
+        # Hidden rows that followed "Codex 5h" moved with it to the right column.
+        self.assertEqual(right, ["grok", *self.CLAUDE, "codex:5h", *self.AGY])
+
+        self.assertEqual(seen["none"], [])
+        self.assertEqual(seen["none_header"], "已启用 0 / 0（左 0 · 右 0） · 已扫描")
+        self.assertEqual(seen["none_empty"], ["暂无数据"])
+
+        self.assertEqual(seen["back_columns"][0][:3], ["Codex 7d", "Codex 2 7d", "Codex 2 5h"])
+        self.assertIn(("Codex 2 5h", "", "☐"), seen["back"])
+        back_titles = [title for title, _badge, _check in seen["back"]]
+        self.assertTrue({"Claude 3 fable 7d", "Claude 3 7d", "Claude 3 5h"} <= set(back_titles))
+        self.assertNotIn("Grok", back_titles)
+        self.assertTrue(set(self.CLAUDE_3) <= set(seen["back_saved"]["providers"]))
+        self.assertIn("grok", seen["back_saved"]["providers"])
+        self.assertEqual(seen["back_saved"]["disabled_providers"], ["codex-2:5h", "claude:fable"])
+
+    def test_first_run_page_lists_detected_accounts_in_shipped_order(self):
+        accounts = {"grok", "claude", "codex"}
+        self.fake_machine(accounts)
+        seen: dict[str, object] = {}
+
+        def actions(page):
+            seen["before_scan"] = page.empty_text()
+            page.press("⟳ 扫描可用账号")
+            seen["some"] = page.columns()
+
+        self._run_settings(actions)
+        # Nothing saved and no scan delivered yet: not "暂无数据" (the empty state is for a scan that found nothing).
+        self.assertEqual(seen["before_scan"], ["加载中…"])
+        self.assertEqual(seen["some"], [["Codex 7d", "Codex 5h", "Grok"], ["fable 7d", "claude 7d", "claude 5h"]])
+
+    def test_first_run_page_with_every_account_reads_in_shipped_order(self):
+        self.fake_machine({"codex", "codex-2", "grok", "claude", "antigravity"})
+        seen: dict[str, object] = {}
+
+        def actions(page):
+            page.press("⟳ 扫描可用账号")
+            seen["columns"] = page.columns()
+
+        self._run_settings(actions)
+        self.assertEqual(seen["columns"], [
+            ["Codex 7d", "Codex 5h", "Codex 2 7d", "Codex 2 5h", "Grok", "fable 7d"],
+            ["claude 7d", "claude 5h", "agy gemini 7d", "agy gemini 5h", "agy claude 7d", "agy claude 5h"],
+        ])
+
+    # Review follow-up.
+
+    def _float_scope(self, cfg):
+        """refresh_async, apply_data and shown_items of run_ui, run without a window or threads."""
+        import ast
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        native = usage_float_module
+        tree = ast.parse(Path(native.__file__).read_text(encoding="utf-8"))
+        run_ui = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run_ui")
+        callbacks = [n for n in run_ui.body if isinstance(n, ast.FunctionDef)
+                     and n.name in ("refresh_async", "apply_data", "shown_items")]
+        scope = dict(vars(native), state={"providers": [], "refreshing": False}, cfg=cfg,
+                     root=SimpleNamespace(after=lambda delay, callback: callback()),
+                     render_footer=Mock(), render=Mock(),
+                     threading=SimpleNamespace(Thread=lambda target, **kw: SimpleNamespace(start=target)))
+        exec(compile(ast.Module(body=callbacks, type_ignores=[]), native.__file__, "exec"), scope)
+        return scope
+
+    def _paseo_account(self, temporary, pid):
+        """A Claude account under its own name, as Paseo declares it; its rows are registered for this test only."""
+        native = usage_float_module
+        for patcher in (patch.dict(native.PROVIDER_DISPLAY_ITEMS), patch.dict(native.PROVIDER_LABELS)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        native._register_claude_display_items(pid)
+        homes = native.discover_claude_homes.side_effect
+        native.discover_claude_homes.side_effect = lambda: {**homes(), pid: temporary / pid}
+        return list(native.PROVIDER_DISPLAY_ITEMS[pid])
+
+    def test_a_registry_that_is_not_there_removes_nothing(self):
+        native = usage_float_module
+        temporary = self.fake_machine(set())
+        paseo, override = temporary / "paseo.json", temporary / "accounts-override.json"
+        rows = ["work:7d", "wclaude:fable", "usd", "llmproxy", "grok:7d"]
+        declared_paseo = {"agents": {"providers": {
+            "work": {"extends": "codex"}, "wclaude": {"extends": "claude", "enabled": False}}}}
+        declared_override = {"accounts": {"usd": {"billing": "metered"}}}
+        other_paseo = {"agents": {"providers": {"other": {"extends": "codex"}}}}
+        other_override = {"accounts": {"other": {"billing": "metered"}}}
+        cases = [
+            ("both missing", None, None, ["grok:7d"]),
+            ("both unreadable", "{", "{", ["grok:7d"]),
+            ("both of a shape this program cannot read", {"agents": []}, {"accounts": []}, ["grok:7d"]),
+            ("both an empty object", {}, {}, rows[:]),
+            ("both without the entries", other_paseo, other_override, rows[:]),
+            ("both with the entries", declared_paseo, declared_override, ["llmproxy", "grok:7d"]),
+            ("Paseo missing, override without usd", None, other_override, ["usd", "llmproxy", "grok:7d"]),
+            ("override missing, Paseo without work", other_paseo, None, ["work:7d", "wclaude:fable", "grok:7d"]),
+        ]
+        for label, paseo_doc, override_doc, dropped in cases:
+            with self.subTest(label):
+                for path, doc in ((paseo, paseo_doc), (override, override_doc)):
+                    path.unlink(missing_ok=True)
+                    if doc is not None:
+                        path.write_text(doc if isinstance(doc, str) else json.dumps(doc), encoding="utf-8")
+                self.assertEqual(native.rows_of_no_kind(rows), dropped)
+
+    def test_a_save_without_registries_keeps_every_account_row(self):
+        native = usage_float_module
+        temporary = self.fake_machine({"codex"})
+        order = [*self.CODEX, "work:7d", "work:5h", "usd", "llmproxy"]
+        native.save_config({"provider_order": order, "providers": [*self.CODEX, "work:7d", "usd", "llmproxy"],
+                            "disabled_providers": ["work:5h"],
+                            "provider_columns": [[*self.CODEX, "work:7d"], ["usd", "work:5h", "llmproxy"]]})
+        saved = json.loads((temporary / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["provider_order"], order)
+        self.assertEqual(saved["disabled_providers"], ["work:5h"])
+        self.assertEqual(saved["provider_columns"], [[*self.CODEX, "work:7d"], ["usd", "work:5h", "llmproxy"]])
+
+    def test_the_float_adopts_accounts_not_rows(self):
+        native = usage_float_module
+        temporary = self.fake_machine({"codex", "claude", "grok", "team-backup"})
+        team = self._paseo_account(temporary, "team-backup")
+        base = [*self.CODEX, *self.CLAUDE]
+        two = [row for row in team if not row.endswith(":fable")]
+        # As another program writes it: the account's 7d and 5h rows only, no columns.
+        (temporary / "config.json").write_text(json.dumps({
+            "language": "zh", "provider_order": base + two, "providers": base + two, "disabled_providers": []}),
+            encoding="utf-8")
+        cfg = native.load_config()
+        reset = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+        team_reading = native.ProviderUsage("team-backup", "team-backup", fetched_at=datetime.now(timezone.utc).isoformat(),
+                                            windows=[native.UsageWindow("weekly_fable", "fable", 10, reset)])
+        scope = self._float_scope(cfg)
+        with patch.object(native, "fetch_display_usage", side_effect=lambda selected, previous, force: [
+                *self._readings("codex", "claude", "grok"), team_reading]):
+            scope["refresh_async"](force=True)
+        self.assertEqual([row for row in cfg["provider_order"] if row.startswith("team-backup")], two)
+        self.assertIn("grok", cfg["providers"])  # an account none of whose rows was saved joins
+        # once: the same.
+        cfg = native.load_config()
+        with patch.object(native, "load_config", return_value=cfg), \
+                patch.object(native, "refresh_usage", side_effect=lambda selected: [
+                    *self._readings("codex", "grok"), team_reading]), \
+                patch("sys.stdout"):
+            native.main(["once"])
+        self.assertEqual([row for row in cfg["provider_order"] if row.startswith("team-backup")], two)
+        self.assertIn("grok", cfg["providers"])
+
+    def test_the_scan_button_completes_a_partly_saved_account_and_the_background_scan_does_not(self):
+        native = usage_float_module
+        accounts = {"codex", "team-backup"}
+        temporary = self.fake_machine(accounts)
+        team = self._paseo_account(temporary, "team-backup")
+        native.discovered_default_providers.side_effect = lambda: [*DEFAULT_PROVIDERS, *team]
+        two = [row for row in team if not row.endswith(":fable")]
+        order = [*self.CODEX, *two]
+        (temporary / "config.json").write_text(json.dumps({
+            "language": "zh", "provider_order": order, "providers": order, "disabled_providers": []}),
+            encoding="utf-8")
+        seen: dict[str, object] = {}
+
+        def actions(page):
+            seen["opened"] = [row for row in page.scope["cfg"]["provider_order"] if row.startswith("team-backup")]
+            page.press("⟳ 扫描可用账号")
+            seen["scanned"] = page.saved()
+
+        self._run_settings(actions, background_scan=True)
+        self.assertEqual(seen["opened"], two)
+        saved = seen["scanned"]
+        self.assertEqual([row for row in saved["provider_order"] if row.startswith("team-backup")], team)
+        self.assertIn(team[0], saved["providers"])
+
+    def test_a_reading_shows_an_account_the_last_scan_missed(self):
+        native = usage_float_module
+        accounts = {"codex"}
+        temporary = self.fake_machine(accounts)
+        (temporary / "config.json").write_text(json.dumps({
+            "language": "zh", "provider_order": self.CODEX, "providers": self.CODEX, "disabled_providers": [],
+            "provider_columns": [self.CODEX, []]}), encoding="utf-8")
+        seen: dict[str, object] = {}
+
+        def actions(page):
+            page.press("⟳ 扫描可用账号")
+            accounts.add("claude")  # signs in while Settings is open; the cached scan still says no
+            cfg = page.scope["cfg"]
+            before = native.layout_lists(cfg)
+            after = dict(before)
+            self.assertTrue(native.adopt_present_rows(after, [*self.CODEX, *self.CLAUDE]))
+            page.scope["apply_data"](self._readings("codex", "claude"), after, before)
+            page.win.update_idletasks()
+            seen["rows"] = [title for title, _badge, _check in page.rows()]
+
+        self._run_settings(actions)
+        self.assertEqual(sorted(seen["rows"]), sorted(["Codex 7d", "Codex 5h", "fable 7d", "claude 7d", "claude 5h"]))
+
+    def _saved_six(self, temporary):
+        left, right = ["codex:7d", "codex:5h", "grok"], list(self.CLAUDE)
+        (temporary / "config.json").write_text(json.dumps({
+            "language": "zh", "provider_order": left + right, "providers": left + right, "disabled_providers": [],
+            "provider_columns": [left, right]}), encoding="utf-8")
+        return ["Codex 7d", "Codex 5h", "Grok", "fable 7d", "claude 7d", "claude 5h"]
+
+    def test_before_its_first_scan_the_page_shows_the_saved_rows(self):
+        temporary = self.fake_machine({"codex", "grok", "claude"})
+        titles = self._saved_six(temporary)
+        seen: dict[str, object] = {}
+
+        def actions(page):
+            seen["rows"] = [title for title, _badge, _check in page.rows()]
+            seen["header"] = page.header()
+            seen["empty"] = page.empty_text()
+
+        self._run_settings(actions)  # no reading, and the background scan has not delivered
+        self.assertEqual(seen["rows"], titles)
+        self.assertEqual(seen["header"], "已启用 6 / 6（左 3 · 右 3）")
+        self.assertNotIn("暂无数据", seen["empty"])
+
+    def test_a_failed_background_scan_is_logged_and_the_saved_rows_shown(self):
+        native = usage_float_module
+        temporary = self.fake_machine({"codex", "grok", "claude"})
+        titles = self._saved_six(temporary)
+        seen: dict[str, object] = {}
+
+        def before_open(scope):
+            # An earlier scan of this process said none of these accounts was there.
+            scope["state"]["provider_scan_cache"] = {
+                pid: {"id": pid, "label": pid, "available": False}
+                for pid in ["codex:7d", "codex:5h", "grok", *self.CLAUDE]}
+
+        def actions(page):
+            seen["rows"] = [title for title, _badge, _check in page.rows()]
+
+        with patch.object(native, "scan_providers", side_effect=OSError("discovery failed")):
+            self._run_settings(actions, before_open=before_open, background_scan=True)
+        self.assertEqual(seen["rows"], titles)
+        log = (temporary / "error.log").read_text(encoding="utf-8")
+        self.assertIn("discovery failed", log)
+        self.assertIn("settings account scan", log)
+
+    def test_a_new_account_joins_the_column_shorter_on_the_page(self):
+        native = usage_float_module
+        self.fake_machine({"codex", "claude", "grok"})
+        hidden = ["claude-2:fable", "claude-2:7d", "claude-2:5h", *self.CODEX_2, *self.AGY[:2]]
+        left, right = [*self.CODEX, *hidden], list(self.CLAUDE)
+        cfg = {"provider_order": left + right, "providers": left + right, "disabled_providers": [],
+               "provider_columns": [left, right]}
+        self.assertTrue(native.adopt_present_rows(cfg, [*self.CODEX, *self.CLAUDE, "grok"]))
+        new_left, new_right = cfg["provider_columns"]
+        # Two rows show on the left and three on the right; the hidden rows on the left do not count.
+        self.assertEqual(new_left, [*left, "grok"])
+        self.assertEqual(new_right, right)
+
+    def test_adoption_keeps_a_disabled_row_and_a_hidden_row(self):
+        native = usage_float_module
+        self.fake_machine({"codex", "grok"})
+        order = [*self.CODEX, *self.CODEX_2]
+        cfg = {"provider_order": order, "providers": ["codex:7d", "codex-2:7d"],
+               "disabled_providers": ["codex:5h", "codex-2:5h"], "provider_columns": [order[:2], order[2:]]}
+        self.assertTrue(native.adopt_present_rows(cfg, [*self.CODEX, "grok"]))
+        self.assertEqual(cfg["provider_order"][:4], order)
+        self.assertEqual(cfg["providers"], ["codex:7d", "codex-2:7d", "grok"])
+        self.assertEqual(cfg["disabled_providers"], ["codex:5h", "codex-2:5h"])
+        self.assertEqual(cfg["provider_columns"][0][:2], order[:2])
+        self.assertEqual(cfg["provider_columns"][1][:2], order[2:])
+
+    def test_a_scan_and_an_adoption_during_a_drag_lose_nothing(self):
+        native = usage_float_module
+        accounts = {"codex", "codex-2"}
+        temporary = self.fake_machine(accounts)
+        order = [*self.CODEX, *self.CODEX_2]
+        (temporary / "config.json").write_text(json.dumps({
+            "language": "zh", "provider_order": order, "providers": order, "disabled_providers": ["codex-2:5h"],
+            "provider_columns": [order[:2], order[2:]]}), encoding="utf-8")
+        seen: dict[str, object] = {}
+
+        def actions(page):
+            page.press("⟳ 扫描可用账号")
+            bar = next(labels for _c, _r, labels in page._bars() if labels[1].cget("text") == "Codex 5h")
+            bar[1].event_generate("<ButtonPress-1>", rootx=0, rooty=0)
+            bar[1].event_generate("<B1-Motion>", rootx=100000, rooty=100000)
+            accounts.discard("codex-2")
+            accounts.add("claude")
+            page.press("⟳ 扫描可用账号")  # during the drag: Codex 2 leaves, Claude joins
+            cfg = page.scope["cfg"]
+            before = native.layout_lists(cfg)
+            after = dict(before)
+            accounts.add("grok")
+            self.assertTrue(native.adopt_present_rows(after, [*self.CODEX, *self.CLAUDE, "grok"]))
+            page.scope["apply_data"](self._readings("codex", "claude", "grok"), after, before)
+            bar[1].event_generate("<ButtonRelease-1>", rootx=100000, rooty=100000)
+            page.win.update_idletasks()
+            seen["saved"] = page.saved()
+            seen["rows"] = [title for title, _badge, _check in page.rows()]
+
+        self._run_settings(actions)
+        saved = seen["saved"]
+        rows = saved["provider_order"]
+        self.assertEqual(len(rows), len(set(rows)))
+        self.assertEqual(sorted(rows), sorted(sum(saved["provider_columns"], [])))
+        self.assertTrue({*order, *self.CLAUDE, "grok"} <= set(rows))
+        self.assertEqual(saved["disabled_providers"], ["codex-2:5h"])
+        self.assertIn("Codex 5h", seen["rows"])
+        self.assertNotIn("Codex 2 7d", seen["rows"])
+
+    def test_a_grok_saved_only_under_its_retired_name_keeps_its_row(self):
+        native = usage_float_module
+        temporary = self.fake_machine({"codex", "grok"})
+        (temporary / "accounts-override.json").write_text(json.dumps({"accounts": {}}), encoding="utf-8")
+        (temporary / "config.json").write_text(json.dumps({
+            "language": "zh", "provider_order": ["codex:7d", "grok-bot", "codex:5h"],
+            "providers": ["codex:7d", "grok-bot", "codex:5h"], "disabled_providers": [],
+            "provider_columns": [["codex:7d", "grok-bot"], ["codex:5h"]]}), encoding="utf-8")
+        cfg = native.load_config()
+        loaded = native.layout_lists(cfg)
+        native.save_config(cfg)
+        saved = native.layout_lists(json.loads((temporary / "config.json").read_text(encoding="utf-8")))
+        for lists in (loaded, saved):
+            self.assertEqual(lists["provider_order"], ["codex:7d", "grok", "codex:5h"])
+            self.assertEqual(lists["providers"], ["codex:7d", "grok", "codex:5h"])
+            self.assertEqual(lists["disabled_providers"], [])
+            self.assertEqual(lists["provider_columns"], [["codex:7d", "grok"], ["codex:5h"]])
 
 
 if __name__ == "__main__":
