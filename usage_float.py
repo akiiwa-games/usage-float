@@ -4616,6 +4616,8 @@ def resolve_provider_config(
         if 'grok' not in enabled_in:
             enabled_in.append('grok')
         disabled_list = [pid for pid in disabled_list if pid != 'grok']
+        # The retired name's place is Grok's place.
+        order = ['grok' if pid == 'grok-bot' else pid for pid in (order or [])]
     disabled_in = set(disabled_list)
     known = _unique_provider_ids(list(order or []) + enabled_in + disabled_list)
     joining = [pid for pid in _unique_provider_ids(present) if pid not in known]
@@ -4639,23 +4641,40 @@ def layout_lists(cfg: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def adopt_present_rows(cfg: dict[str, Any], present: Iterable[str]) -> bool:
+def _row_account(row: str) -> str:
+    """The account a row is read from, without discovery ("claude:5h" -> "claude")."""
+    return "grok" if row == "grok-bot" else row.partition(":")[0]
+
+
+def adopt_present_rows(cfg: dict[str, Any], present: Iterable[str], *, whole_accounts: bool = False) -> bool:
     """Add rows of present accounts that no saved list holds to ``cfg`` in memory. True when one was added.
 
-    A row a list already holds keeps its place and its on/off, so a row switched off stays off. When every
-    row is already held nothing is read.
+    ``present`` is every row of the accounts this machine has now. A row a list already holds keeps its place
+    and its on/off, so a row switched off stays off. With ``whole_accounts`` (the float, ``once`` and the scan
+    Settings starts by itself) only an account none of whose rows is saved joins: an account another program
+    or the user saved with some of its rows gets no row added unasked; the scan button adds the rest. A new
+    row that goes to the shorter column counts only rows of present accounts. When nothing is new nothing is read.
     """
     present = list(present)
+    columns = cfg.get("provider_columns")
     saved = {*(cfg.get("provider_order") or []), *(cfg.get("providers") or []), *(cfg.get("disabled_providers") or [])}
-    if all(pid in saved for pid in present):
+    if isinstance(columns, (list, tuple)):
+        saved.update(pid for col in columns if isinstance(col, (list, tuple)) for pid in col)
+    joining = present
+    if whole_accounts:
+        held = {_row_account(pid) for pid in saved if isinstance(pid, str)}
+        joining = [pid for pid in present if _row_account(pid) not in held]
+    if all(pid in saved for pid in joining):
         return False
     saved = set(_unique_provider_ids(list(saved)))
-    if all(pid in saved for pid in _unique_provider_ids(present)):
+    if all(pid in saved for pid in _unique_provider_ids(joining)):
         return False
     order, enabled, disabled = resolve_provider_config(
-        cfg.get("providers"), cfg.get("disabled_providers"), cfg.get("provider_order"), present=present,
+        cfg.get("providers"), cfg.get("disabled_providers"), cfg.get("provider_order"), present=joining,
     )
-    left, right = resolve_provider_columns(enabled, disabled, order, cfg.get("provider_columns"))
+    accounts = {_row_account(pid) for pid in present}
+    left, right = resolve_provider_columns(
+        enabled, disabled, order, columns, counted=[pid for pid in order if _row_account(pid) in accounts])
     cfg["provider_order"] = order
     cfg["providers"] = enabled
     cfg["disabled_providers"] = disabled
@@ -4705,18 +4724,17 @@ def merge_hidden_rows(
 # is absent today: the row's id names its kind (an Antigravity window, Grok, Pi, OpenCode, a Claude home's
 # fable/7d/5h, a Codex home's 7d/5h); an id of any other name is looked up where such accounts are declared
 # (Paseo for a Claude or Codex home under its own name, accounts-override.json for a metered account), whether
-# enabled there or not. A registry that cannot be read decides nothing, so its rows stay.
+# enabled there or not. Only a registry file that exists, can be read and lacks the entry decides "no kind": a
+# missing file, like one that cannot be read, decides nothing and its rows stay (hidden while absent).
 _CLAUDE_ROW_WINDOWS: tuple[str, ...] = tuple(item.partition(":")[2] for item in CLAUDE_DISPLAY_ITEMS)
 _CODEX_ROW_WINDOWS: tuple[str, ...] = tuple(CODEX_WINDOW_SUFFIXES.values())
 _SINGLE_ROW_ACCOUNTS: tuple[str, ...] = ("grok", "pi", "opencode")
 
 
 def _read_registry(path: Path) -> dict[str, Any] | None:
-    """A JSON registry; {} when the file is missing, None when it exists but cannot be read."""
+    """A JSON registry object, or None when the file is missing or cannot be read: then it decides nothing."""
     try:
         doc = json.loads(path.read_text(encoding="utf-8-sig"))
-    except FileNotFoundError:
-        return {}
     except (OSError, ValueError):
         return None
     return doc if isinstance(doc, dict) else None
@@ -4726,9 +4744,12 @@ def _declared_paseo_kinds() -> dict[str, str] | None:
     doc = _read_registry(Path(os.environ.get("PASEO_CONFIG") or HOME / ".paseo" / "config.json"))
     if doc is None:
         return None
-    providers = (doc.get("agents") or {}).get("providers") if isinstance(doc.get("agents"), dict) else None
+    agents = doc.get("agents", {})
+    providers = agents.get("providers", {}) if isinstance(agents, dict) else None
+    if not isinstance(providers, dict):
+        return None  # a shape this program cannot read
     kinds: dict[str, str] = {}
-    for pid, spec in (providers or {}).items() if isinstance(providers, dict) else ():
+    for pid, spec in providers.items():
         if isinstance(pid, str) and isinstance(spec, dict):
             extends = str(spec.get("extends") or "").strip().lower()
             if extends in ("claude", "codex"):
@@ -4740,9 +4761,11 @@ def _declared_metered_accounts() -> set[str] | None:
     doc = _read_registry(_accounts_override_path())
     if doc is None:
         return None
-    accounts = doc.get("accounts")
+    accounts = doc.get("accounts", {})
+    if not isinstance(accounts, dict):
+        return None  # a shape this program cannot read
     return {
-        pid for pid, spec in (accounts.items() if isinstance(accounts, dict) else ())
+        pid for pid, spec in accounts.items()
         if isinstance(spec, dict) and str(spec.get("billing") or "").strip().lower() == "metered"
     }
 
@@ -4819,13 +4842,15 @@ def resolve_provider_columns(
     disabled: Any = None,
     order: Any = None,
     columns: Any = None,
+    counted: Any = None,
 ) -> tuple[list[str], list[str]]:
     """Return (left_column, right_column) for the two-column usage layout.
 
     When ``columns`` was already persisted, keep every item's column and row
     position (including unchecked gray items, and rows of absent accounts). A row
     the saved columns do not hold joins the row before it in ``order`` when that
-    row is of the same account or kind, else the shorter column. Otherwise seed
+    row is of the same account or kind, else the shorter column, counting only
+    ``counted`` rows when given (the rows the page shows). Otherwise seed
     the two columns so enabled items match the panel's left/right split and
     disabled items balance the remaining slots.
     """
@@ -4841,6 +4866,8 @@ def resolve_provider_columns(
 
     # Saved columns with no row (a first run) are seeded like no columns.
     if isinstance(raw_left, (list, tuple)) and isinstance(raw_right, (list, tuple)) and (raw_left or raw_right):
+        if "grok-bot" in [*raw_left, *raw_right] and "grok" not in [*raw_left, *raw_right]:
+            raw_left, raw_right = (["grok" if pid == "grok-bot" else pid for pid in col] for col in (raw_left, raw_right))
         left = [pid for pid in _unique_provider_ids(raw_left) if pid in valid]
         left_set = set(left)
         right = [
@@ -4849,6 +4876,11 @@ def resolve_provider_columns(
             if pid in valid and pid not in left_set
         ]
         placed = left_set | set(right)
+        shown = set(counted) if counted is not None else None
+
+        def size(column: list[str]) -> int:
+            return len(column) if shown is None else sum(1 for item in column if item in shown)
+
         for index, pid in enumerate(known):
             if pid in placed:
                 continue
@@ -4857,7 +4889,7 @@ def resolve_provider_columns(
             if before in placed and _account_family(str(before).partition(":")[0]) == family:
                 column = left if before in left else right
                 column.insert(column.index(before) + 1, pid)
-            elif len(left) <= len(right):
+            elif size(left) <= size(right):
                 left.append(pid)
             else:
                 right.append(pid)
@@ -11941,7 +11973,8 @@ def run_ui() -> None:
             # worked out here, off the Tk thread, and applied there.
             before = layout_lists(cfg)
             after = dict(before)
-            adopted = after if adopt_present_rows(after, [row for p in providers for row in provider_rows(p.provider_id)]) else None
+            adopted = after if adopt_present_rows(
+                after, [row for p in providers for row in provider_rows(p.provider_id)], whole_accounts=True) else None
             root.after(0, lambda p=providers, a=adopted, b=before: apply_data(p, a, b))
 
         threading.Thread(target=work, daemon=True).start()
@@ -11973,7 +12006,8 @@ def run_ui() -> None:
         # Avoid SetWindowPos(...SWP_SHOWWINDOW) on every refresh; it needlessly
         # invalidates the full-screen surface on mixed-DPI monitor layouts.
         render(relayout=not state.get("panel_active"))
-        # An open Settings window re-checks which rows the new readings can show.
+        # An open Settings window redraws: a new reading shows an account its last scan missed, and "无此窗口"
+        # follows the readings. It does not re-run the scan.
         on_readings = state.get("settings_readings_changed")
         if callable(on_readings):
             try:
@@ -12662,6 +12696,15 @@ def run_ui() -> None:
         provider_order: list[str] = []
         enabled_providers: list[str] = []
         scanned_cache: dict[str, dict[str, Any]] = {}
+        # answered: a scan has said which accounts are here (until then a saved row with no answer shows).
+        # seen: each account's reading time when that scan delivered; a later live reading is news to it.
+        scan_state: dict[str, Any] = {"answered": False, "seen": {}}
+
+        def reading_times() -> dict[str, Any]:
+            return {
+                p.provider_id: p.fetched_at for p in state.get("providers") or []
+                if p.available and not p.stale and (p.windows or p.summary)
+            }
 
         def saved_layout() -> tuple[list[str], list[str], list[str]]:
             """The saved columns, already normalized by load_config, persist and adoption; read, not resolved."""
@@ -12678,14 +12721,18 @@ def run_ui() -> None:
                     placed.add(pid)
             return left, right, list(cfg.get("providers") or [])
 
-        def row_shown(pid: str) -> bool:
-            row = scanned_cache.get(pid)
-            if row is not None:
-                return bool(row.get("available"))
-            # Not in the last scan (a row a reading just added): shown when its account has a reading.
-            return any(p.provider_id == provider_fetch_id(pid) for p in state.get("providers") or [])
-
         def sync_shown_rows() -> None:
+            seen = scan_state["seen"]
+            news = {account for account, at in reading_times().items() if seen.get(account) != at}
+
+            def row_shown(pid: str) -> bool:
+                row = scanned_cache.get(pid)
+                if row is not None and row.get("available"):
+                    return True
+                if _row_account(pid) in news:  # signed in after the scan: its reading says it is here
+                    return True
+                return row is None and not scan_state["answered"]
+
             left, right, enabled = saved_layout()
             left_col_items[:] = [pid for pid in left if row_shown(pid)]
             right_col_items[:] = [pid for pid in right if row_shown(pid)]
@@ -12797,7 +12844,7 @@ def run_ui() -> None:
         bar_widgets_by_id: dict[str, tk.Frame] = {}
         bar_records: dict[str, dict[str, Any]] = {}
         slot_bounds: dict[str, tuple[int, int]] = {}
-        last_packed_cols: list[tuple[str, ...] | None] = [None, None]
+        last_packed_cols: list[Any] = [None, None, None]
         empty_boxes: list[tk.Frame] = []
         empty_texts: list[tk.Label] = []
         for col_idx in range(2):
@@ -13128,8 +13175,12 @@ def run_ui() -> None:
                     if rid:
                         scanned_cache[rid] = row
                 state["provider_scan_cache"] = dict(scanned_cache)
-                # A scan's new accounts join the layout in memory, like the float's readings do.
-                adopt_present_rows(cfg, [rid for rid, row in scanned_cache.items() if row.get("available")])
+                scan_state["answered"] = True
+                scan_state["seen"] = reading_times()
+                # A scan's new accounts join the layout in memory, like the float's readings do. The scan
+                # button has already added the missing rows of partly saved accounts (on_scan_providers).
+                adopt_present_rows(cfg, [rid for rid, row in scanned_cache.items() if row.get("available")],
+                                   whole_accounts=True)
             if not provider_drag.get("item"):
                 sync_shown_rows()
 
@@ -13217,19 +13268,23 @@ def run_ui() -> None:
                         if no_window and checked and not is_dragging else ""
                     )
 
-            cols_now = (tuple(left_col_items), tuple(right_col_items))
-            if (last_packed_cols[0], last_packed_cols[1]) != cols_now:
+            cols_now = (tuple(left_col_items), tuple(right_col_items), bool(scan_state["answered"]))
+            if (last_packed_cols[0], last_packed_cols[1], last_packed_cols[2]) != cols_now:
                 last_packed_cols[0] = cols_now[0]
                 last_packed_cols[1] = cols_now[1]
+                last_packed_cols[2] = cols_now[2]
                 active_ids = set(left_col_items) | set(right_col_items)
                 with _freeze_redraw(board_inner):
                     for pid, rec in bar_records.items():
                         if pid not in active_ids and rec.get("cell") is not None:
                             rec["bar"].grid_forget()
                             rec["cell"] = None
-                    # No account at all: one box across both columns says there is no data yet.
+                    # No row: one box across both columns. "暂无数据" once a scan found no account,
+                    # "加载中…" while no scan has answered yet.
                     nothing = not left_col_items and not right_col_items
-                    empty_texts[0].configure(text=_tr("暂无数据", 'No data yet') if nothing else empty_texts[1].cget("text"))
+                    empty_texts[0].configure(text=(
+                        (_tr("暂无数据", 'No data yet') if scan_state["answered"] else _tr("加载中…", 'Loading…'))
+                        if nothing else empty_texts[1].cget("text")))
                     for col_idx, col_list in enumerate((left_col_items, right_col_items)):
                         if nothing and col_idx:
                             empty_boxes[col_idx].grid_forget()
@@ -13324,19 +13379,23 @@ def run_ui() -> None:
         def seed_provider_scan() -> None:
             """Fill the board from what is already known, so opening never waits on credential checks.
 
-            The last scan (this process) is reused as is; before any scan an account counts as
-            detected when it already has a reading. scan_in_background then corrects both.
+            The last scan of this process is reused as is. Without one, the saved rows show until
+            scan_in_background answers; a live reading shows its account either way.
             """
             last = state.get("provider_scan_cache") or {}
-            read = {p.provider_id for p in state.get("providers") or [] if p.windows or p.summary}
-            left, right, _enabled = saved_layout()
-            for pid in dict.fromkeys([*left, *right, *last]):
-                row = last.get(pid)
-                scanned_cache[pid] = dict(row) if isinstance(row, dict) else {
-                    "id": pid,
-                    "label": provider_label(pid),
-                    "available": provider_fetch_id(pid) in read,
-                }
+            for pid, row in last.items():
+                if isinstance(row, dict):
+                    scanned_cache[pid] = dict(row)
+            scan_state["answered"] = bool(scanned_cache)
+            scan_state["seen"] = reading_times() if scanned_cache else {}
+
+        def scan_failed() -> None:
+            # Logged by the caller; the page forgets the old answer and shows the saved rows again.
+            scanned_cache.clear()
+            state["provider_scan_cache"] = {}
+            scan_state["answered"] = False
+            scan_state["seen"] = {}
+            render_provider_tree()
 
         def scan_in_background() -> None:
             configured, order = list(cfg.get("providers") or []), list(cfg.get("provider_order") or [])
@@ -13345,6 +13404,16 @@ def run_ui() -> None:
                 try:
                     rows = scan_providers(configured, order)
                 except Exception:
+                    _log_exception("settings account scan")
+
+                    def failed() -> None:
+                        if state.get("settings_win") is win and win.winfo_exists():
+                            scan_failed()
+
+                    try:
+                        root.after(0, failed)
+                    except Exception:
+                        pass
                     return
 
                 def deliver() -> None:
@@ -16518,7 +16587,7 @@ def main(argv: list[str] | None = None) -> int:
         providers = refresh_usage(
             active_providers(list(once_cfg.get("providers") or []), include_discovered=True, disabled=list(once_cfg.get("disabled_providers") or [])),
         )
-        adopt_present_rows(once_cfg, [row for p in providers for row in provider_rows(p.provider_id)])
+        adopt_present_rows(once_cfg, [row for p in providers for row in provider_rows(p.provider_id)], whole_accounts=True)
         for row in iter_display_rows(providers, list(once_cfg.get("providers") or [])):
             if row.failed:
                 print(_tr(f"{row.title}  更新失败", f'{row.title}  Update failed'))
