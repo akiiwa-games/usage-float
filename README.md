@@ -149,8 +149,9 @@ Use the **Language** selector at the top of Settings to switch between Simplifie
 
 ### Usage Tab
 
-- **Two-Column Drag-and-Drop Layout**: Drag any provider row freely between the left and right columns to arrange the auxiliary-screen dashboard; unchecked rows remain visible and dimmed in place.
-- **Scan Available Accounts**: Automatically discovers local Claude/Codex homes, Paseo provider directories, Magpie gateways, Grok, and Antigravity, reporting `Ready`, `Disabled`, or `Not Detected`.
+- **Two-Column Drag-and-Drop Layout**: Drag any provider row freely between the left and right columns to arrange the auxiliary-screen dashboard; unchecked rows remain visible and dimmed in place. The layout lists the rows of accounts this machine has, the same accounts the float shows. A machine with one Codex account and no Grok lists no `Codex 2` or `Grok` row.
+- **Absent Accounts Keep Their Place**: While an account is signed out, its rows are not listed, and their column, position and on/off stay in the config. A hidden row stays after the row it followed and moves with that row. When the account is back, its rows return where they were.
+- **Scan Available Accounts**: Discovers local Claude/Codex homes, Paseo provider directories, Magpie gateways, Grok, Antigravity, metered accounts and Pi. Rows of a new account join next to rows of the same kind and are switched on. Rows of an account that is gone leave the page at the scan and stay in the config.
 - **Quick Toggle & Auto-Balance**: Click the checkbox or double-click any row to toggle it on/off, or click **Auto-Balance Columns** to split enabled rows evenly across both columns.
 - **Granular Provider Windows**:
   - Each Claude account splits into independent `fable 7d`, `claude 7d`, and `claude 5h` rows (e.g., `Claude 2 fable 7d`, `Claude 2 7d`, `Claude 2 5h`).
@@ -260,6 +261,7 @@ Set `"language": "en"` for English or `"language": "zh"` for Simplified Chinese.
 }
 ```
 
+- **Layout Lists**: `provider_order`, `providers`, `disabled_providers` and `provider_columns` hold the rows of every account seen, including accounts absent for now. Without a config, the rows of detected accounts appear in the shipped order. Saving settings removes a row that no kind of account can have. The row's id decides: an Antigravity window, Grok, Pi, OpenCode, a Claude home's `fable`/`7d`/`5h`, a Codex home's `7d`/`5h`. Any other name must be declared as a Claude or Codex home in Paseo or as a metered account in `accounts-override.json`. An old proxy row with neither is removed.
 - **Minimum Refresh Interval**: `refresh_seconds` has a 300-second floor.
 - **Activity-Aware Cadence & 429 Backoff**: Active accounts poll roughly every 5 minutes, idle accounts every 30 minutes, and accounts with unknown activity every 15 minutes. Failed probes respect the same cadence and per-credential `429` backoff; reopening the window never forces an upstream call.
 - **Read-Only Credential Safety & Fingerprint Binding**: Snapshots in `~/.usage-float/usage-cache.json` are bound to a one-way SHA-256 fingerprint of their local credential and directory and written under a cross-process file lock (`usage_lock.py`) via atomic replacement. `usage-float` never rotates or writes CLI OAuth tokens; if a request fails with `401`, it re-reads the disk credential at most once in case the CLI refreshed it, and never replays a rate-limit reset `POST`.
