@@ -171,7 +171,7 @@ APP_DIR = (
     if _OWN_FROZEN_BUILD
     else Path(__file__).resolve().parent
 )
-VERSION = "1.3.5"
+VERSION = "1.3.6"
 CLAUDE_HOME = Path(os.environ.get("CLAUDE_HOME", HOME / ".claude"))
 CLAUDE_HOME_2 = Path(os.environ.get("CLAUDE_HOME_2", HOME / ".claude-2"))
 # Default Codex uses ~/.codex, not an inherited worker session CODEX_HOME.
