@@ -336,6 +336,87 @@ class WallpaperBackendTests(unittest.TestCase):
                 cleanup()
             root.destroy()
 
+    def test_first_drop_target_still_delivers_after_a_second_install(self) -> None:
+        """The panel installs on the root and the background layer; a drop on the root must still deliver."""
+        if sys.platform != "win32":
+            self.skipTest("Windows only")
+        import ctypes
+        from ctypes import wintypes
+        import tkinter as tk
+
+        shell32 = ctypes.WinDLL("shell32")
+        shell32.SHParseDisplayName.argtypes = [
+            wintypes.LPCWSTR, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+            wintypes.ULONG, ctypes.POINTER(wintypes.ULONG),
+        ]
+        shell32.SHParseDisplayName.restype = ctypes.c_long
+        shell32.ILClone.argtypes = [ctypes.c_void_p]
+        shell32.ILClone.restype = ctypes.c_void_p
+        shell32.ILRemoveLastID.argtypes = [ctypes.c_void_p]
+        shell32.ILFindLastID.argtypes = [ctypes.c_void_p]
+        shell32.ILFindLastID.restype = ctypes.c_void_p
+        shell32.ILFree.argtypes = [ctypes.c_void_p]
+        shell32.SHCreateDataObject.argtypes = [
+            ctypes.c_void_p, wintypes.UINT, ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+        ]
+        shell32.SHCreateDataObject.restype = ctypes.c_long
+        iid_data_object =(ctypes.c_ubyte * 16).from_buffer_copy(
+            (0x0000010E).to_bytes(4, "little") + bytes(4) + bytes((0xC0, 0, 0, 0, 0, 0, 0, 0x46))
+        )
+
+        root = tk.Tk()
+        root.withdraw()
+        layer = tk.Toplevel(root)
+        layer.withdraw()
+        cleanups = []
+        delivered: list[list[str]] = []
+        full = parent = data = None
+        with TemporaryDirectory() as temp_dir:
+            clip = Path(temp_dir) / "clip.mp4"
+            clip.write_bytes(b"\x00")
+            try:
+                root.update_idletasks()
+                cleanups.append(_install_windows_file_drop(root, delivered.append))
+                cleanups.append(_install_windows_file_drop(layer, lambda _files: None))
+                self.assertTrue(all(getattr(c, "_registered", False) for c in cleanups))
+
+                full = ctypes.c_void_p()
+                self.assertEqual(shell32.SHParseDisplayName(str(clip), None, ctypes.byref(full), 0, None), 0)
+                parent = shell32.ILClone(full)
+                shell32.ILRemoveLastID(parent)
+                child = ctypes.c_void_p(shell32.ILFindLastID(full))
+                data = ctypes.c_void_p()
+                self.assertEqual(
+                    shell32.SHCreateDataObject(
+                        parent, 1, ctypes.byref(child), None, ctypes.byref(iid_data_object), ctypes.byref(data)
+                    ),
+                    0,
+                )
+
+                state = cleanups[0]._drop_state
+                target_ptr, pending, drop = state[2], state[3], state[-1]
+                effect = wintypes.DWORD(1)
+                hr = drop(target_ptr.value, data.value, 0, 0, ctypes.pointer(effect))
+                pending.drain()
+
+                self.assertEqual(hr, 0)
+                self.assertEqual(delivered, [[str(clip)]])
+            finally:
+                if data:
+                    release = ctypes.WINFUNCTYPE(wintypes.ULONG, ctypes.c_void_p)(
+                        ctypes.c_void_p.from_address(
+                            ctypes.c_void_p.from_address(data.value).value + 2 * ctypes.sizeof(ctypes.c_void_p)
+                        ).value
+                    )
+                    release(data.value)
+                for pidl in (parent, full.value if full else None):
+                    if pidl:
+                        shell32.ILFree(pidl)
+                for cleanup in reversed(cleanups):
+                    cleanup()
+                root.destroy()
+
     def test_drop_install_failure_returns_a_safe_cleanup(self) -> None:
         class BrokenWidget:
             def update_idletasks(self) -> None:

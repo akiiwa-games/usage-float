@@ -2522,7 +2522,11 @@ def _install_windows_file_drop(
             (0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46),
         )
 
-        ole32 = ctypes.windll.ole32
+        # Private DLL handles: a prototype set on the shared ``ctypes.windll``
+        # functions would be replaced by the next install (root, then the
+        # background layer), and ReleaseStgMedium would then refuse this
+        # install's own STGMEDIUM, so its Drop fails and nothing plays.
+        ole32 = ctypes.WinDLL("ole32")
         ole32.OleInitialize.argtypes = [ctypes.c_void_p]
         ole32.OleInitialize.restype = HRESULT
         ole32.OleUninitialize.argtypes = []
@@ -2533,7 +2537,7 @@ def _install_windows_file_drop(
         ole32.RevokeDragDrop.restype = HRESULT
         ole32.ReleaseStgMedium.argtypes = [ctypes.POINTER(STGMEDIUM)]
         ole32.ReleaseStgMedium.restype = None
-        drag_query_file = ctypes.windll.shell32.DragQueryFileW
+        drag_query_file = ctypes.WinDLL("shell32").DragQueryFileW
         drag_query_file.argtypes = [
             wintypes.HANDLE,
             wintypes.UINT,
@@ -2541,10 +2545,10 @@ def _install_windows_file_drop(
             wintypes.UINT,
         ]
         drag_query_file.restype = wintypes.UINT
-        user32 = ctypes.windll.user32
+        user32 = ctypes.WinDLL("user32")
         user32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
         user32.RegisterClipboardFormatW.restype = wintypes.UINT
-        kernel32 = ctypes.windll.kernel32
+        kernel32 = ctypes.WinDLL("kernel32")
         kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
         kernel32.GlobalLock.restype = ctypes.c_void_p
         kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
